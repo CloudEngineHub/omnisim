@@ -100,13 +100,15 @@ def verify(frame_dir: Path, log: Path, world: Path, out: Path) -> dict:
     for marker in REQUIRED_WORLD_MARKERS:
         if marker not in world_text:
             failures.append(f"world missing high-fidelity authoring marker: {marker}")
-    # Both reviewed appearance PROTOs carry a real normal map.  Asphalt also
-    # carries base-colour, roughness, and occlusion maps; requiring its caller
-    # to restate the internal ``normalMap`` token in the world would reject a
-    # genuinely textured surface merely because it is packaged as a PROTO.
-    if not ("Roughcast" in world_text or "Asphalt" in world_text or "normalMap" in world_text):
+    # These reviewed appearance PROTOs carry real texture stacks.  Requiring a
+    # caller to restate their internal ``normalMap`` / ``baseColorMap`` tokens
+    # in the world would reject a genuinely textured surface merely because it
+    # is packaged as a PROTO.
+    reviewed_normal_mapped = ("Roughcast", "Asphalt", "DryMud")
+    reviewed_textured_pbr = ("Asphalt", "DryMud")
+    if not (any(name in world_text for name in reviewed_normal_mapped) or "normalMap" in world_text):
         failures.append("world has no reviewed normal-mapped surface")
-    if not ("Asphalt" in world_text or "baseColorMap" in world_text):
+    if not (any(name in world_text for name in reviewed_textured_pbr) or "baseColorMap" in world_text):
         failures.append("world has no reviewed textured PBR floor/surface")
     for sample in samples:
         if sample["width"] < 1280 or sample["height"] < 720:

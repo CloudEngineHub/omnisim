@@ -55,6 +55,8 @@ This is the complete text of every row of the **First moves by task type** table
 
 **Your first move:** Harness on `:6789` + poll `GET /sim/events?since=...&log_since=...`. Branch on `controller.log` (the controller's own stdout/stderr), `joint.limit_hit`, `contact.began`, `damage.*`. Event taxonomy: §5.
 
+If the symptom is *the loaded motion fails while the unloaded one is fine* (drives straight but will not pivot; a wheel spins free and stalls under load), check [agents-hard-won-rules.md § Wheel stall torque](agents-hard-won-rules.md#wheel-stall-torque) before blaming friction or the controller.
+
 ## Inspect a scene
 
 **User asks for:** **Inspect a running scene**

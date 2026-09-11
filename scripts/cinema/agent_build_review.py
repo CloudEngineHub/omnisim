@@ -160,7 +160,12 @@ def review_proxy(spec: AgentBuildSpec, base_out: Path | None = None) -> dict[str
     if abs(master_facts["fps"] - PROXY_PROFILE.fps) > 0.01:
         blockers.append("proxy delivery rate drifted from CFR 15 fps")
     expected_master_frames = round(spec.duration_s * PROXY_PROFILE.fps)
-    if master_facts["frames"] and master_facts["frames"] != expected_master_frames:
+    # Packet-level concat may land one CFR frame either side of the exact
+    # decimal duration; the renderer already treats that single-frame delta as
+    # valid and the proxy is never a release artifact.  Keep the review gate
+    # consistent with the renderer while still rejecting any material drift.
+    if (master_facts["frames"]
+            and abs(master_facts["frames"] - expected_master_frames) > 1):
         blockers.append(
             f"proxy master has {master_facts['frames']} frames, expected {expected_master_frames}"
         )

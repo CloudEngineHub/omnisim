@@ -37,9 +37,11 @@ SMOKE_FILE = Path(__file__).with_name("smoke_worlds.json")
 _CONTROLLER_RE = re.compile(r'controller\s+"([^"]+)"')
 
 # test_suite.py spawns its own "background OmniSim" on this port and then asserts
-# that each test instance falls back to 1235. A running GUI OmniSim on 1234 breaks
-# that assumption and the test workers crash with a confusing access violation
-# instead of a port error — so we detect and abort before launching anything.
+# that each test instance reports falling back from it to another port. A holder
+# of 1234 (a GUI, or a parallel headless run -- engines coexist by design and scan
+# [1234, 1294]) is no longer a reason to abort: the suite locates its background
+# engine wherever it lands (2026-08-23) and accepts whichever port the test
+# engines fall back to (2026-09-08). We still detect it, to say so up front.
 WEBOTS_EXTERN_PORT = 1234
 
 # Written by test_suite.py as the last line of tests/output.txt. Its absence
@@ -298,26 +300,13 @@ def main() -> int:
 
     if is_port_in_use(WEBOTS_EXTERN_PORT):
         print(
-            f"[smoke] ABORT: TCP port {WEBOTS_EXTERN_PORT} is already in use — "
-            "likely a running Webots/OmniSim GUI.",
+            f"[smoke] NOTE: TCP port {WEBOTS_EXTERN_PORT} is already in use (another "
+            "OmniSim engine, most likely a parallel headless run). The suite's "
+            "background engine and its test engines scan up from it, exactly as "
+            "any engine does, and the port-fallback check accepts whichever port "
+            "they land on. Until 2026-09-08 this was a hard abort.",
             file=sys.stderr,
         )
-        print(
-            "[smoke] The smoke runner spawns its own background OmniSim on this "
-            "port and asserts test instances fall back to 1235; a pre-existing "
-            "process on 1234 makes the test workers crash with a misleading "
-            "access violation.",
-            file=sys.stderr,
-        )
-        print(
-            "[smoke] Fix: close the running OmniSim window, or bypass with "
-            "OMNISIM_SKIP_PUSH_CHECK=1 git push. If no OmniSim is visibly "
-            "running, look for a zombie omnisim-bin still holding the port "
-            "(Get-NetTCPConnection -LocalPort 1234) — an unkillable one "
-            "needs a reboot to clear.",
-            file=sys.stderr,
-        )
-        return 2
 
     # encoding is EXPLICIT: read_text() defaults to the locale codec, which on
     # Windows is cp1252 and raises UnicodeDecodeError the moment a skip_reason
@@ -382,7 +371,8 @@ def main() -> int:
 
     # A missing controller binary surfaces only as a 30s "results file not
     # written" timeout, so self-heal here before launching the suite. Treat a
-    # build failure as an environment problem (exit 2) like the port check.
+    # build failure as an environment problem (exit 2), as the retired port-1234
+    # abort once did.
     if not ensure_controllers_built(active_worlds, env):
         print(
             "[smoke] Could not compile required controllers. Build them manually "

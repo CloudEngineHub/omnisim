@@ -353,6 +353,22 @@ resources/fonts/Courier New*.ttf
 **/.scratch_*.omniworld
 **/_scratch_*/
 
+# Open-loop diff-drive stall-torque probe rig (2026-09-11): sibling copies of
+# three chat worlds with probe_diffdrive in place of the bridge, controllerArgs
+# pointing at a session scratchpad. They are the measurement behind the wheel
+# armature change in omnisim_newton_runtime.py; drop these two lines if the
+# probe ships with that change.
+/projects/samples/demos/worlds/chat/probe_*.omniworld
+/projects/samples/demos/controllers/probe_diffdrive/
+
+# The Franka Panda was archived 2026-09-02 (docs/ARCHIVE.md; git show
+# f79b19a70:projects/robots/franka_emika/panda/...) and restored locally on
+# 2026-09-11 for an outreach evaluation. Whether to un-archive it properly is
+# an open decision; until it is taken the 11 MB restore stays a local file.
+# Un-archiving means deleting this rule, a world that names the robot, a
+# PROVENANCE.md, and removing its rows from docs/ARCHIVE.md.
+/projects/robots/franka_emika/panda/
+
 # Local scaffolding directory at the repo root (fleet_cam.py writes fleet_frames/ into it).
 /youtube_videos/
 
@@ -412,3 +428,42 @@ packages/*/dist/
 
 # Warp JIT kernel caches left next to pilot evaluation runs.
 /social/launch/pilots/**/warp_cache_*/
+/social/launch/pilots/**/warp_cache/
+/social/launch/pilots/**/*_warp_cache/
+
+# Participants' CAD sources and the meshes step_to_urdf derives from them:
+# third-party geometry, rebuildable from the source_repository / source_commit
+# the evaluation's review JSON records. The URDF, omnisim.yaml and worlds we
+# generated from them stay tracked.
+/social/launch/pilots/**/*.step
+/social/launch/pilots/**/*.stp
+/social/launch/pilots/**/meshes/
+
+# base64 transport copies of attachment zips (the zip itself is *.zip above).
+/social/launch/pilots/**/*.b64
+
+# omnitug500_mcl_record writes its seeded MCL dataset (poses, 512-beam scans,
+# meta) next to the controller; a run regenerates it byte-for-byte.
+/projects/robots/omnisim/omnitug500/controllers/omnitug500_mcl_record/out/
+
+# Bounded reply-wave evaluation workspaces (social/launch/evaluations/<date>/):
+# the local virtualenv, pytest/zig caches and participants' upstream clones are
+# never sources -- same treatment as the pilots' equivalents above.
+/social/launch/evaluations/**/.venv/
+/social/launch/evaluations/**/tmp/
+/social/launch/evaluations/**/repos/
+# A vendored Python stack (scipy et al.) an evaluation copied next to its trace.
+/social/launch/evaluations/**/vendor/
+# Participants' derived meshes and a participant project's debug symbols left
+# beside its evaluation: third-party geometry and build products, rebuildable
+# from the source_repository / source_commit the review JSON records.
+/social/launch/evaluations/**/*.stl
+/social/launch/evaluations/**/*.pdb
+# pnpm's content-addressable store, left at the repo root by one of those evaluations.
+/.pnpm-store/
+
+# Hidden sibling copies of a world (.sweep_*.omniworld, .before_*.omniworld,
+# .<name>_shifted.omniworld ...): the scratch a run script writes next to the
+# world it varies (a copy must be a sibling for its relative URLs to resolve).
+# tests/physics/worlds/.h2diag.omniworld predates this rule and stays tracked.
+.*.omniworld

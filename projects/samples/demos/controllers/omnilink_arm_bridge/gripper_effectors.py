@@ -192,11 +192,25 @@ class ParallelFingerGripper(GripperEffector):
         self.close_q: List[float] = list(cfg.get("close_q") or [])
         # Physics (contact) grasp: stiffen the finger position control so the
         # pinch develops REAL clamping force. A position servo on a part it can
-        # never fully close around develops force = P x (target - actual); the
-        # URDF-imported default P is small, so the clamp is only a couple of
-        # newtons -- friction barely beats gravity and the part slowly creeps
-        # out of the grip. A high P saturates the actuator at its effort cap for
-        # a firm, non-creeping squeeze (still a real contact grasp, no weld).
+        # never fully close around develops a clamp force set by the joint's
+        # FORCE CEILING, and the lever for that is maxForce / availableForce
+        # (docs/guide/friction-grasp.md), which is what the block below sets.
+        #
+        # It used to also call setControlPID(5000, 0, 0) here, on the theory
+        # that a high proportional gain saturates the actuator for a firmer
+        # squeeze. That call does nothing on this engine: controlPID is
+        # parsed, validated, fed to the motor's PID computation and then
+        # dropped, because the ODE deletion removed the consumer. (The
+        # reason once given here -- "the MuJoCo actuator's gains are derived
+        # from the torque ceiling" -- was WRONG and is corrected in
+        # omnilink_mobile_bridge near its setControlPID note: the gains came
+        # from M_ii/dt, the joint's own inertia over the timestep. The
+        # no-op conclusion is unaffected.) Measured in this repo 2026-09-10,
+        # PRE commit 69b4b024b, from the other side of the same question: a
+        # Husky pivot delivered an identical 0.0058 of its commanded yaw rate
+        # at the default gain and at P=1000. Deleted
+        # rather than left in place, because a dead call reads like a lever
+        # and stops anyone looking for the real one.
         # The available force is the finger's OWN rated effort, read off the motor
         # (getMaxForce() == the URDF <limit effort=...>; the 2F-85 declares 50 N). We used to
         # ask for a flat 60 N, which is ABOVE that: the engine clamped it back to 50 N anyway
@@ -209,10 +223,6 @@ class ParallelFingerGripper(GripperEffector):
             for m in self.motors:
                 if m is None:
                     continue
-                try:
-                    m.setControlPID(5000.0, 0.0, 0.0)
-                except Exception:
-                    pass
                 try:
                     fmax = float(m.getMaxForce())
                 except Exception:

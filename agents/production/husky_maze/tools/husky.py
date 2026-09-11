@@ -828,8 +828,9 @@ def _impl_goto_cell(col: int = -1, row: int = -1, speed: float = 0.5,
 
     - **v1 (default, fire-and-forget):** call without `wait` and the
       bridge returns immediately. The agent must poll `get_state` until
-      `mode == "idle"` and call `snap_to_cell` after each move to
-      re-anchor.
+      `mode == "idle"`, then verify the pose against the cell centre and
+      re-issue the residual. (`snap_to_cell` used to re-anchor here by
+      teleporting; it is removed and returns 410.)
     - **v2 (blocking + auto-snap):** pass `wait=True` and optionally
       `auto_snap_threshold_m=0.30` plus `prev_cell=[c,r]`. The bridge
       blocks until the husky has arrived (or faulted), pre-snaps to
@@ -1397,16 +1398,14 @@ SPECS = [
         tier=GUARDED,
         surface=ALWAYS,
         description=(
-            "Teleport the husky to the centre of cell (col, row) with "
-            "the given cardinal yaw (0=east, +pi/2=north, +/-pi=west, "
-            "-pi/2=south). DELIBERATE DEMO CONCESSION: skid-steer pivots "
-            "in OmniSim accumulate ~0.5 m of drift per 90 deg turn, which "
-            "compounds across cells in tight maze corridors. Call this "
-            "after each successful goto_cell / drive_forward to re-anchor "
-            "to the grid so subsequent steps don't wedge against walls. "
-            "Use it the same way the standalone solver does — verify with "
-            "get_state that you actually reached the cell first; never "
-            "snap to a cell you didn't earn by driving there."
+            "REMOVED — DO NOT CALL. Teleport-snapping is gone: the bridge "
+            "answers this verb with HTTP 410 and does nothing. It is listed "
+            "only so that a call is recognised and refused loudly instead of "
+            "failing in some confusing way. The husky now navigates entirely "
+            "under wheel control. To keep a cell move accurate, verify it: "
+            "read get_state after the move, compare the pose against the "
+            "cell centre, and re-issue the residual with goto_cell or "
+            "drive_to_waypoint."
         ),
         parameters={
             "type": "object",
@@ -1428,14 +1427,27 @@ SPECS = [
             "Command an open-loop body twist: linear m/s along the husky's "
             "+x heading, angular rad/s around z (positive = left turn). "
             "Bridge clamps to {max_linear_m_s, max_angular_r_s}. Holds "
-            "until the next action. Prefer goto_cell for maze navigation; "
-            "use this only to escape stuck states or for fine adjustments."
+            "until the next action. Linear tracks the command closely. "
+            "ANGULAR DOES NOT: the clamp is a kinematic ceiling derived from "
+            "wheel speed and track width, and a skid-steer pivot has to "
+            "scrub all four tyres, so the chassis delivers only a fraction "
+            "of the commanded yaw rate. Never assume the commanded rate is "
+            "the achieved one — read yaw back from get_state and correct. "
+            "Prefer goto_cell for maze navigation; use this only to escape "
+            "stuck states or for fine adjustments."
         ),
         parameters={
             "type": "object",
             "properties": {
-                "linear": {"type": "number", "description": "m/s, ~[-0.99, 0.99]"},
-                "angular": {"type": "number", "description": "rad/s, ~[-3.47, 3.47]"},
+                "linear": {"type": "number", "description": "m/s, ~[-0.99, 0.99]; tracks the command closely"},
+                "angular": {
+                    "type": "number",
+                    "description": (
+                        "rad/s around z. The bridge clamps to ~[-3.47, 3.47], but that is "
+                        "the KINEMATIC ceiling, not an achievable rate: a skid-steer pivot "
+                        "delivers a fraction of it. Measure the result with get_state."
+                    ),
+                },
             },
         },
         impl=_impl_set_velocity,
@@ -1494,8 +1506,10 @@ SPECS = [
             "Drive to the centre of cell (col, row). Three modes, one per "
             "husky_maze variant: "
             "(v1) fire-and-forget — call with no `wait` and the bridge "
-            "returns immediately; the agent must poll `get_state` and call "
-            "`snap_to_cell` after each move. "
+            "returns immediately; the agent must poll `get_state` until the "
+            "move finishes and then verify the pose against the cell centre, "
+            "re-issuing the residual if it is off. (`snap_to_cell` used to "
+            "close that gap by teleporting; it is removed and returns 410.) "
             "(v2) blocking + auto-snap — pass `wait=true`, `prev_cell=[c,r]`, "
             "and `auto_snap_threshold_m=0.30`; the bridge pre-snaps to the "
             "previous cell with the upcoming cardinal yaw, drives, and "

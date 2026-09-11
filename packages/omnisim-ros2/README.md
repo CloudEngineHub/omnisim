@@ -447,7 +447,12 @@ $ ros2 topic list -t
 Reading that honestly: the IMU is **correct** to stay at identity through the
 straight drive (`y` never left `0.0000`), and it tracks the turn to 4 decimals
 against the bridge's own yaw — `+0.1300` vs `0.1300`, with `z=0.0650` giving
-`2·asin(0.0650) = 0.1301 rad`. The lidar responds to both translation and
+`2·asin(0.0650) = 0.1301 rad`. ⚠️ The **0.130 rad delivered on a commanded
+0.9** is pre-`69b4b024b` (2026-09-11), which lifted a solver cap on wheel
+stall torque, and will not reproduce — a rerun should turn considerably
+further. The IMU claim is untouched by that: it compares the IMU against the
+**bridge's own yaw**, whatever the base delivered, so the agreement holds at
+any rotation. The lidar responds to both translation and
 rotation. The `-1` covariances in that transcript are the gyro and
 accelerometer being declared absent, every tick — correct **on that date**:
 the capture predates the 2026-09-01 engine fix (`bde550489`) and the

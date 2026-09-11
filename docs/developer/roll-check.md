@@ -45,9 +45,19 @@ Both sides are measured. Neither is predicted.
 > wrong. The failing rover had `maxTorque 0.4` on each of four wheels against
 > 3.6 kg, i.e. roughly 5.6 m/s² of nominally available traction, which should
 > have been ample — and it slid anyway. Worse, the same 0.4 N·m **rolls
-> perfectly** on the gate world (§5). The failure is not a torque threshold at
-> all; it is an interaction between the torque budget and the integration step,
-> and no friction algebra predicts that.
+> perfectly** on the gate world (§5). No friction algebra written against the
+> *declared* torque predicts that, which is why the assertion stays measured on
+> both sides.
+>
+> The mechanism is now known, and it **is** a torque law — just not the declared
+> one. A pure-velocity motor's gain was bounded at `kv <= M_ii / sub_dt`, so the
+> torque a wheel could actually produce was set by its own rotational inertia
+> and the integration step, not by `maxTorque`. That is the interaction this
+> section bracketed: see §7's root-cause entry for the formula, the substep
+> sweep and the fix. Knowing it does not license a predicted right-hand side
+> here — the check's whole value is that both sides are measured — but it does
+> mean "the declared torque was ample" is never on its own an argument that
+> torque is not the problem.
 
 ### Directions and signs
 
@@ -130,7 +140,7 @@ groups separated by two empty bands:
 |---|---|---|
 | 0.0004 – 0.3018 | 16 | healthy: rovers, huskies, e-pucks, battlebots; the gate world at 0.0004 |
 | *empty: 0.302 – 0.359* | | |
-| 0.3586 – 0.4206 | 3 | **marginal — and all three are MyBots in worlds running the engine's default 32 ms step with one substep**, i.e. early cases of the defect, not healthy robots. Re-graded after that world's timestep was fixed they read 0.142 / 0.169 / 0.249. |
+| 0.3586 – 0.4206 | 3 | **marginal — and all three are MyBots in worlds running the engine's default 32 ms step with one substep**, i.e. early cases of the defect, not healthy robots. Re-graded after that world's timestep was fixed they read 0.142 / 0.169 / 0.249. (Why a coarse step alone does this is §7's root cause: the step set the wheel's torque ceiling.) |
 | *empty: 0.421 – 0.786* | | |
 | 0.7863 – 15.7 | 44 | broken: sliding, wheelspin, launched |
 
@@ -259,6 +269,14 @@ dt = 8 ms with 4 substeps, and a 16 ms single-substep integration is fine at
 12 N·m. The failure is the **interaction** — a torque budget too small to
 correct the contact error a coarse integration accumulates in one step.
 
+✅ **Root-caused 2026-09-11 (`69b4b024b`) — and the two factors were never
+independent.** The coarse step is what under-powered the motor:
+`_clamp_velocity_servo_gains` bounded a pure-velocity motor at
+`kv <= M_ii / sub_dt`, and a velocity servo's peak torque is `kv * (cmd - w)`,
+so halving `sub_dt` doubled the torque the wheel could deliver. That is why
+the third row rolls: removing the substeps and lengthening the step did not
+merely coarsen the integration, it divided the actuator's budget. See §7.
+
 This also explains, in retrospect, why the fix to the original world changed
 `basicTimeStep 16 → 8` and added `newtonSubsteps 4` *alongside* the torque: all
 three mattered.
@@ -315,8 +333,14 @@ wall) becomes `ROLLING` for five more. The residual is arena length, not wheels.
 
 Two worlds still fail after the fix and are recorded as such:
 `projects/languages/{cpp,python}/worlds/example.wbt`, where the launch is gone
-(12.6 → 0.14 m/s) but the wheels now barely turn at all (0.01 rad/s). Not
-root-caused.
+(12.6 → 0.14 m/s) but the wheels now barely turn at all (0.01 rad/s).
+
+⚠️ **"Wheels barely turn at all" is the stall-torque signature exactly** — the
+pre-fix Husky wheel-rate ratio at a stalled command was 0.0128, the same order.
+These two worlds are therefore a strong candidate for §7's root cause and are
+due for re-grading on the post-`69b4b024b` engine. **They have not been re-run,
+so this is a hypothesis, not a fix** — do not mark them resolved without a
+measurement.
 
 **Multi-robot combat arenas are inconclusive by construction.** The sweep drives
 every robot forward simultaneously, so in `robot_combat` worlds they reach each
@@ -375,9 +399,52 @@ does not exist yet.
 * **`mujoco_warp`.** Every measurement is CPU `mj_step`. The GPU path is
   known non-deterministic (`docs/benchmarks/determinism-scope.md`) and was not
   swept.
-* **Turning.** The check drives straight. Skid-steer *turning* legitimately
-  produces large slip and is out of scope; a future `--turn` mode would need its
-  own tolerance derived from track width.
-* **The mechanism of the interaction in §5.** It is reproduced and bracketed,
-  not root-caused. Nothing here should be read as an explanation of *why* a
-  coarse step plus a small torque budget produces sliding.
+* **Turning.** The check drives straight; a `--turn` mode does not exist yet.
+  ⚠️ **The reasoning that scoped turning out was contaminated.** It ran: a
+  skid-steer *turn* legitimately produces large slip, so grading it is not
+  worth the trouble. That was written while every skid-steer pivot in the tree
+  was stalling against the gain clamp — the "legitimate large slip" was mostly
+  the defect §7 root-causes. With that lifted, turning is no longer dominated
+  by it and a `--turn` mode is worth adding (the root-cause entry below says so
+  too; this bullet used to contradict it).
+
+  A `--turn` tolerance must be anchored to **measured** chassis yaw ratios, not
+  derived from track width. Post-fix, open loop: **Husky 0.532, ROSbot XL
+  0.525, TurtleBot3 Burger 0.958.** A two-wheel differential drive scrubs
+  nothing and belongs near 1.0; a four-tyre skid-steer must scrub every tyre
+  and belongs near ~0.55 (a Coulomb moment balance for the Husky's geometry
+  predicts 0.55 against the 0.532 measured). **Both are healthy**, and no single
+  tolerance covers both — the mode needs a per-geometry expectation, the way §3
+  built its tolerance from a measured distribution rather than from algebra.
+* **The mechanism of the interaction in §5.** ✅ **ROOT-CAUSED 2026-09-11.**
+  It was `_clamp_velocity_servo_gains` in
+  [`omnisim_newton_runtime.py`](../../src/omnisim/physics/omnisim_newton_runtime.py):
+  a pure-velocity motor's gain is bounded by `kv <= M_ii / dt`, and a velocity
+  servo's peak torque is `kv * (cmd - w)`, so **the wheel's available torque is
+  inversely proportional to the substep dt**. A coarse step divides the torque
+  budget directly, the wheel cannot generate the traction force it needs, and
+  it slides instead of rolling — which is exactly the "coarse step plus a small
+  torque budget produces sliding" interaction this section bracketed.
+
+  Measured on the shipped `omnilink_husky.omniworld` (open loop, no bridge,
+  `basicTimeStep 16`, commanded pivot), sweeping `OMNISIM_NEWTON_SUBSTEPS` with
+  everything else fixed — wheel-rate ratio at the smallest command, where the
+  wheel is fully stalled and the response is linear in the torque ceiling:
+
+  | substeps | sub_dt | wheel-rate ratio | chassis yaw ratio |
+  |---|---|---|---|
+  | 1 | 16 ms | 0.0128 | 0.0069 |
+  | 2 | 8 ms  | 0.0172 | 0.0093 |
+  | 4 | 4 ms  | 0.0337 | 0.0183 |
+  | 8 | 2 ms  | 0.0678 | 0.0360 |
+
+  From 2 substeps on it is a clean ×2 per halving of `sub_dt`, i.e. exactly
+  `kv_max = M_ii / sub_dt`. At larger commands the curve saturates as the
+  friction budget, not the torque ceiling, becomes the binding constraint.
+
+  The fix is in the same function: the bound `dt*kv <= M_eff` is now held by
+  **raising `M_eff` with real rotor armature** rather than by starving `kv`
+  (`OMNISIM_NEWTON_WHEEL_ARMATURE_RATIO`, default 100). That buys the torque
+  back at one substep and at an unchanged inertia-inflation ratio — the Husky
+  pivot goes 0.0069 → 0.532 with straight-line tracking unchanged at 0.999.
+  A `--turn` mode is now worth adding: turning is no longer dominated by this.

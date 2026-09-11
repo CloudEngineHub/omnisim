@@ -88,6 +88,10 @@ DEFAULT_TUNING = {
     "victory_speed":    0.15,
     "victory_min_m":    1.0,
     "victory_grace_s":  6.0,
+    # Spin-mode weapon throttle while backing off / pivoting (REVERSE, PIVOT).
+    # 0.5 lets the spinner sag between charges; a real driver holds the bar at
+    # full speed the whole match, so heavyweight worlds override this to 1.0.
+    "weapon_hold":      0.5,
 }
 
 STRATEGY_OVERRIDES = {
@@ -116,9 +120,11 @@ STRATEGY_OVERRIDES = {
 }
 
 
-def merge_tuning(strategy: str) -> dict:
+def merge_tuning(strategy: str, overrides: dict | None = None) -> dict:
     tuning = dict(DEFAULT_TUNING)
     tuning.update(STRATEGY_OVERRIDES.get(strategy, {}))
+    if overrides:
+        tuning.update(overrides)
     return tuning
 
 
@@ -140,6 +146,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--pulse-range", type=float, default=1.0,
                     help="When weapon-mode=pulse, opponent distance "
                          "(metres) below which the weapon fires.")
+    ap.add_argument("--tune", action="append", default=[], metavar="KEY=VALUE",
+                    help="Override one tuning value for THIS bot (repeatable), "
+                         "e.g. --tune charge_speed=40. Keys are DEFAULT_TUNING "
+                         "keys, so a world can size its bots' drive and weapon "
+                         "policy without touching the shared brain.")
     ap.add_argument("--debug", action="store_true")
     # Be permissive: OmniSim sometimes passes extras.
     return ap.parse_known_args(argv)[0]
@@ -220,7 +231,16 @@ def _find_target(supervisor, self_name: str, opponent_name: str | None):
 
 def main() -> int:
     args = parse_args(sys.argv[1:])
-    tuning = merge_tuning(args.strategy)
+    overrides = {}
+    for item in args.tune:
+        key, _, val = item.partition("=")
+        key = key.strip()
+        if key in DEFAULT_TUNING and val.strip():
+            try:
+                overrides[key] = float(val)
+            except ValueError:
+                pass
+    tuning = merge_tuning(args.strategy, overrides)
 
     robot = _RobotImpl()
     time_step = int(robot.getBasicTimeStep())
@@ -254,6 +274,8 @@ def main() -> int:
             log_f.write(line + "\n")
 
     log(f"start; opponent={args.opponent or 'auto'} weapon_spin={args.weapon_spin:.2f}")
+    if overrides:
+        log(f"tuning overrides: {overrides}")
 
     # Bind wheel motors.
     motors = {}
@@ -488,9 +510,20 @@ def main() -> int:
         #   - If yaw_err is large (>= pivot_threshold), do a pure
         #     in-place pivot. The previous "forward - spin / forward +
         #     spin" formula tried to translate and rotate at the same
-        #     time; once yaw_err exceeds ~30°, the differential
-        #     swamps the forward term and the bot stalls in a slow
-        #     curve. A clean pivot is faster.
+        #     time, and past a yaw_err of ~30° the bot stalled in a slow
+        #     curve. That was described here as "the differential swamps
+        #     the forward term", which is the symptom seen from outside:
+        #     the differential was never DELIVERED. The solver bounded a
+        #     velocity motor's gain at kv <= M_ii/sub_dt, capping a
+        #     wheel's stall torque at its own rotational inertia instead
+        #     of the declared effort, so the mixed command asked for a
+        #     turn the wheels had no torque to produce and the bot just
+        #     ploughed forward. Fixed 2026-09-11 (69b4b024b); see
+        #     docs/developer/agents-hard-won-rules.md#wheel-stall-torque.
+        #     pivot_threshold is LEFT AS IS: a clean pivot still works
+        #     and nothing here has been re-measured. A lower threshold
+        #     (more mixed motion, fewer full stops) is now worth trying
+        #     — try it with a measurement, not on this comment's say-so.
         #   - Once aligned, drive forward symmetrically. Small residual
         #     yaw_err is corrected by a proportional differential bias.
         #
@@ -519,7 +552,7 @@ def main() -> int:
                 return (args.weapon_spin
                         if dist < tuning["disengage_m"] else 0.3)
             if curr_state in ("REVERSE", "PIVOT"):
-                return args.weapon_spin * 0.5
+                return args.weapon_spin * tuning["weapon_hold"]
             return 0.0  # VICTORY / unknown
 
         if state == "VICTORY":

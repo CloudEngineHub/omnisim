@@ -239,6 +239,12 @@
           "name": "Smart house",
           "world": "projects/samples/demos/worlds/flagship/omnilink_smart_house.omniworld",
           "blurb": "A physics-backed home run by an OmniLink agent - lights, thermostat, security, energy."
+        },
+        {
+          "id": "blockworld",
+          "name": "Blockworld (agent block world)",
+          "world": "projects/samples/demos/worlds/environments/blockworld.omniworld",
+          "blurb": "A Minecraft-style field of 2,666 addressable one-metre blocks. No robot: an agent mines and builds it over the harness (/scene/delete, /scene/spawn with physics rebuild)."
         }
       ]
     },

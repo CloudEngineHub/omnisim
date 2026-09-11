@@ -156,7 +156,7 @@ def _cmd_agent_build_validate(args: argparse.Namespace) -> int:
         "simulator_footage_ratio": round(spec.simulator_footage_ratio, 3),
         "locked_intro": {"disclosure_s": [0, 5], "story_signature_s": [5, 10],
                            "voiceover": False},
-        "locked_outro": agent_build.GITHUB_DESTINATION,
+        "outro": False,
     }, indent=2))
     return 0
 

@@ -66,6 +66,7 @@ from omnisim.mouse import Mouse                             # noqa
 from omnisim.mouse import MouseState                        # noqa
 from omnisim.joystick import Joystick                       # noqa
 from omnisim.motion import Motion                           # noqa
+from omnisim.wrench import Wrench, apply_wrench            # noqa
 
 __all__ = [
     "Accelerometer", "Altimeter", "AnsiCodes", "Brake", "Camera",
@@ -74,6 +75,6 @@ __all__ = [
     "InertialUnit", "Joystick", "Keyboard", "LED", "Lidar", "LidarPoint",
     "LightSensor", "Motion", "Motor", "Mouse", "MouseState", "Node",
     "PositionSensor", "Proto", "Radar", "RadarTarget", "RangeFinder",
-    "Receiver", "Robot", "Skin", "Speaker", "Supervisor", "TouchSensor",
+    "Receiver", "Robot", "Skin", "Speaker", "Supervisor", "TouchSensor", "Wrench", "apply_wrench",
     "VacuumGripper",
 ]

@@ -20,6 +20,7 @@
 
 import sys
 import os
+import re
 import shutil
 import platform
 import datetime
@@ -300,23 +301,34 @@ def runGroupTest(groupName, firstSimulation, worldsCount, failures):
             appendToOutputFile('- number of worlds actually tested: %s)\n' % (counterString))
         else:
             lines = open(webotsStdErrFilename, 'r').readlines()
-            # There should be a warning about needing to use port 1235 instead of 1234
-            # because we started another webots in the background.
-            foundWarning = False
+            # The background engine started above holds the default port, so every test
+            # engine must report falling back from 1234 to SOME other port. Until 2026-09-08
+            # this demanded the literal pair 1234 -> 1235, which only holds when nothing else
+            # on the machine listens on 1235: a parallel headless run (engines coexist by
+            # design and scan [1234, 1294]) pushed the fallback to 1236+ and the suite reported
+            # "listened on a port that was in use" for an engine that had done exactly the
+            # right thing. Match the engine's own message instead (OmTcpServer::start:
+            # "Could not listen to ... on port 1234. ... Using port N instead.").
+            fallbackPort = None
             # The parser tests clear the stderr file, so don't try to find the warning in them.
             if groupName == "parser":
-                foundWarning = True
+                fallbackPort = 1235
             for line in lines:
                 if 'Failure' in line:
                     # check if it should be ignored
                     if not any(item in line for item in whitelist):
                         failures += 1
                         systemFailures.append(line)
-                if '1234' in line and '1235' in line:
-                    foundWarning = True
-            if not foundWarning:
+                fallback = re.search(r'port 1234\b.*Using port (\d+) instead', line)
+                if fallback and fallback.group(1) != '1234':
+                    fallbackPort = int(fallback.group(1))
+                elif '1234' in line and '1235' in line:
+                    fallbackPort = 1235
+            if fallbackPort is None:
                 failures += 1
-                appendToOutputFile("FAILURE: OmniSim listened on a port that was in use.\n")
+                appendToOutputFile("FAILURE: OmniSim did not report falling back from port 1234 "
+                                   "(the background engine holds it; expected "
+                                   "'Using port N instead' on stderr).\n")
                 if backgroundWebots.poll() is not None:
                     appendToOutputFile(
                         f'Background webots process has unexpectedly stopped with status code {backgroundWebots.returncode}!\n')

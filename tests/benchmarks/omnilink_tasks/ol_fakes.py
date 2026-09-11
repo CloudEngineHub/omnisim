@@ -342,7 +342,10 @@ def _good_cap_goto_xy(w: FakeWorld, p: str) -> Episode:
 
 
 def _good_cap_turn_then_drive(w: FakeWorld, p: str) -> Episode:
-    w.rotate("husky_nw", math.radians(52.0))    # the real bridge undershoots
+    # 52 deg on a commanded 90 was the bridge's PRE-69b4b024b undershoot
+    # (2026-07-25); kept because it still clears the grader's 30 deg gate and
+    # exercises the loose-tolerance path. Not a current measurement.
+    w.rotate("husky_nw", math.radians(52.0))
     w.advance("husky_nw", 1.45)
     return _ep(p, "Turned husky_nw and drove it forward 1.45 m.",
                tools=[_tc("turn_husky", husky="husky_nw", angle_deg=90),

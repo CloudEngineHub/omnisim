@@ -5,7 +5,7 @@ Total work: about 50 lines of new code and 30 lines of new world file.
 
 Prerequisites:
 - the robot's URDF (and any meshes it references) somewhere under [`projects/robots/`](../../projects/robots/)
-- a clear answer to one question — which **bridge class** does your robot belong to? It determines which bridge you'll piggy-back on. (Quadrupeds also have a bridge, but it's OmniQuad-specific.)
+- a clear answer to one question — which **bridge class** does your robot belong to? It determines which bridge you'll piggy-back on. (Quadrupeds have a config-driven bridge too — see the table.)
 
 The whole recipe assumes you've read [the beginner guide](omnilink-chat-demos.md) and have one of the existing demos working.
 
@@ -17,7 +17,7 @@ The whole recipe assumes you've read [the beginner guide](omnilink-chat-demos.md
 |---|---|---|---|
 | Mobile base (wheels) | `omnilink_mobile_bridge` | Husky, Jackal, TB3 family, Rosbot/XL | [`_mobile_configs.py`](../../projects/samples/demos/controllers/omnilink_mobile_bridge/_mobile_configs.py) |
 | Arm / manipulator | `omnilink_arm_bridge` | UR3e, UR5e, UR10e | [`_arm_configs.py`](../../projects/samples/demos/controllers/omnilink_arm_bridge/_arm_configs.py) |
-| Quadruped | `omnilink_quadruped_bridge` | OmniQuad | hard-coded |
+| Quadruped (legged or wheeled-legged) | `omnilink_quadruped_bridge` | OmniQuad, Deep Robotics Lite3 / X30 / M20 / M20S / M20 Piper | [`_quadruped_configs.py`](../../projects/samples/demos/controllers/omnilink_quadruped_bridge/_quadruped_configs.py) — leg motor names, stand / sit poses, per-leg sign conventions, `walk` = `gait` / `wheels` / `march`, `body_lock` |
 | Aerial | `mavic_omnilink_bridge` | DJI Mavic 2 Pro | hard-coded |
 
 Bridge classes are not interchangeable. A mobile config cannot make an arm or
@@ -45,6 +45,7 @@ MY_ROVER = {
     "max_wheel_speed_radps": 6.0,
     "cruise_frac": 0.55,
     "spin_speed": 0.8,
+    "yaw_rate_gain": 1.0,               # MEASURE THIS -- see below
 }
 
 MOBILE_CONFIGS = {
@@ -60,6 +61,24 @@ That's it. The bridge's generic differential / skid-steer driver + intent router
 - **`max_wheel_speed_radps`** — ceiling on rad/s for each wheel. The bridge clamps every command against it.
 - **`cruise_frac`** — fraction of the ceiling used as the default forward speed for `drive_forward`.
 - **`spin_speed`** — rad/s used by the "spin in place" intent preset.
+- **`yaw_rate_gain`** — **the one field here that is not geometry, and the one you have to measure.** It is the fraction of the ideal kinematic yaw ceiling your base actually holds at full command, and it sets `max_angular_rad_s` — the ceiling published to callers, the clamp on `set_velocity`, and whether `turn` accepts a rotation or refuses it. **Omitting it defaults to 1.0, i.e. "assume the ideal kinematics", which for a four-wheel skid-steer is about 2x optimistic**: an agent then plans turns your base cannot finish in the time it budgeted. Measured values for the shipped bases run from 0.49 (Clearpath Jackal) to 0.96 (TurtleBot3 Waffle) — a two-wheel differential drive pivots about its own axle and scrubs almost nothing, while a four-wheel skid-steer has to drag all four tyres sideways and loses about half.
+
+  To measure it, run your world with the servo off and the gain forced to 1.0 so the bridge commands the raw kinematic differential:
+
+  ```bash
+  OMNISIM_MOBILE_YAW_SERVO=0 OMNISIM_MOBILE_YAW_GAIN=1.0       python -m omnisim run-headless <your world> --duration 60
+  ```
+
+  Then hold a pure yaw command at your base's kinematic ceiling
+  (`max_wheel_speed_radps * wheel_radius_m / half_track_m`) with
+  `POST /set_velocity {"linear": 0, "angular": <ceiling>}`, and divide the
+  settled yaw rate you measure by that ceiling. Set
+  `OMNISIM_MOBILE_TRACE_PATH=<file>` to get a per-tick JSONL trace with
+  `pose.yaw_rad` and `sim_time_s` so the rate is differenced in sim time.
+  Sweep a few rates below the ceiling too: the shipped skid-steers droop
+  20-35% at very low commands, and the bridge's yaw servo is what closes
+  that. The full recipe and the current measured table live in the
+  `_mobile_configs.py` module docstring.
 
 The URDF importer turns a `<joint name="foo">` into a motor named `foo_motor`; the bridge tries that first and falls back to the bare name. Which names it looks for is exactly what `layout` selects.
 

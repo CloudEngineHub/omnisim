@@ -157,8 +157,24 @@ public:
   // dynamic-body shapes in the contact phase. Returns the body's
   // index (>= 0) on success, -1 on error. See
   // docs/developer/physics-p8-statics-design.md §4.
+  //
+  // `plainCollider` (2026-09-07, world-body statics): TRUE means the caller
+  // vouches that nothing will ever need this static as a BODY -- no joint
+  // hangs off it, it is not a TouchSensor, no Connector / VacuumGripper
+  // child, no cloth coupling. The runtime then attaches its shapes straight
+  // to Newton's world body and returns an opaque VIRTUAL index (>= 1<<24,
+  // never a Newton body index) that stays valid for contacts, raycasts and
+  // setKinematicPose. Why: every static as its own MuJoCo body sizes
+  // mj_broadphase's nbody*(nbody-1)/2 pair buffer -- 2000 blocks overflowed
+  // the arena ("mj_stackAlloc: out of memory") and 5000 never finalised,
+  // while the same geoms on the world body compile in well under a second.
+  // OMNISIM_NEWTON_STATICS_ON_WORLD=0 (value-parsed) reverts to a body each.
+  // First virtual index the runtime hands out for a world-body static; the
+  // engine only ever compares against it (the census line), never indexes.
+  static constexpr int kWorldStaticIndexBase = 1 << 24;
   int addStaticBody(double x, double y, double z,
-                    double qx, double qy, double qz, double qw);
+                    double qx, double qy, double qz, double qw,
+                    bool plainCollider = false);
   // Kernel blocker #4 (_scratch/design_kinematic_inertia.md Part 1): adds a
   // KINEMATIC body -- a movable static obstacle. Build recipe identical to
   // addStaticBody (zero-mass link pinned to the world by a 0-DOF FIXED joint
@@ -602,7 +618,13 @@ public:
                        double limitLower = 0.0, double limitUpper = 0.0,
                        double effortLimit = 0.0, double velocityLimit = 0.0,
                        double childRotX = 0.0, double childRotY = 0.0,
-                       double childRotZ = 0.0, double childRotW = 1.0);
+                       double childRotZ = 0.0, double childRotW = 1.0,
+                       double initialPosition = 0.0);
+  // initialPosition (both joints, 2026-09-08): the joint's authored
+  // `position`. The caller registers the frame at the child's ZERO pose and
+  // the runtime seeds newton's joint coordinate with this value, so the joint
+  // starts the first physics step at its authored angle / travel instead of
+  // at 0 (OmBasicJoint::flushPendingNewtonRegistrations).
   // Prismatic (linear/slider) joint -- e.g. parallel-gripper fingers. Same
   // queue/topo-sort/gain path as addJointRevolute; the slot it returns is
   // used with setJointTarget{Position,Velocity} exactly like a revolute.
@@ -612,7 +634,8 @@ public:
                         double childAnchorX, double childAnchorY, double childAnchorZ,
                         double targetKe = 0.0, double targetKd = 0.0,
                         double limitLower = 0.0, double limitUpper = 0.0,
-                        double effortLimit = 0.0, double velocityLimit = 0.0);
+                        double effortLimit = 0.0, double velocityLimit = 0.0,
+                        double initialPosition = 0.0);
   // Hinge2 / universal joint -- 2-DoF rotation about two axes sharing one anchor (a caster's steer + roll,
   // or a car front wheel). Built natively as a Newton d6 joint with two FREE angular DoF (passive); the
   // capability gate admits it alongside Hinge/Slider (newton-ode-replacement-plan.md W2).

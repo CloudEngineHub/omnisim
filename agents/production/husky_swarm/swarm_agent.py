@@ -1970,8 +1970,9 @@ TOOLS: Dict[str, Dict[str, Any]] = {
         "tags": ["motion", "essential"],
         "description": (
             "Closed-loop relative rotation in degrees. Positive=counter-clockwise. "
-            "Corrects actuator undershoot, blocks until idle, and returns the "
-            "measured angle, residual error and final pose. "
+            "It measures the achieved yaw against supervisor ground truth, "
+            "re-issues whatever residual is left, blocks until idle, and returns "
+            "the measured angle, residual error and final pose. "
             "angle_achieved_deg and residual_error_deg are UNWRAPPED, so a "
             "request beyond +/-180 deg (or a full 360) is expressible and "
             "verifiable; large rotations are delivered as several bounded "
@@ -2022,7 +2023,8 @@ TOOLS: Dict[str, Dict[str, Any]] = {
             "computes the bearing from live pose, turns, drives, and repeats "
             "until it arrives. PREFER THIS over turn_husky+drive_husky whenever "
             "you know where you want a robot to END UP -- it does the geometry "
-            "for you and corrects the open-loop undershoot."
+            "for you and verifies arrival against ground truth instead of "
+            "assuming an open-loop command landed."
         ),
         "parameters": {"type": "object", "properties": {
             "husky": {"type": "string"},

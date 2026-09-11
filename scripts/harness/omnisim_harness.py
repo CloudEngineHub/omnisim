@@ -1673,6 +1673,15 @@ def infer_omnisim_home() -> Path:
 
 
 def resolve_omnisim_binary(omnisim_home: Path) -> Path:
+    # OMNISIM_BINARY: an explicit engine path wins, exactly as it does for
+    # run-headless (scripts/dev/headless_runner.py find_binary) -- so a scratch
+    # build (make ... TARGET=...) can be driven without touching the live one.
+    override = os.environ.get("OMNISIM_BINARY")
+    if override:
+        binary = Path(override)
+        if not binary.exists():
+            raise RuntimeError(f"OMNISIM_BINARY does not exist: {binary}")
+        return binary
     if sys.platform == "win32":
         candidates = [
             omnisim_home / "msys64" / "mingw64" / "bin" / "omnisim-bin.exe",

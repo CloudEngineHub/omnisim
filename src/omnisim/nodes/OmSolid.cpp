@@ -2847,6 +2847,15 @@ static QString addNewtonPrimitive(OmNewtonBackend *newton, int idx,
 // value-parse. Now value-parsed and shared, so the collider choice and the
 // inertia choice can never disagree (internal parity plan, item W1.6).
 //
+// Value-parsed boolean env hatch with an explicit default. `=0`/`false`/`off`/
+// `no` turns it OFF; anything else turns it ON; unset takes `defaultOn`.
+static bool newtonEnvFlag(const char *name, bool defaultOn) {
+  const QString v = QString::fromUtf8(qgetenv(name)).trimmed().toLower();
+  if (v.isEmpty())
+    return defaultOn;
+  return v != "0" && v != "false" && v != "off" && v != "no";
+}
+
 // Per-call (NOT static) so a world switched in via the launcher's worldReload
 // reads ITS OWN WorldInfo field. Precedence: env ON wins, else the world field.
 static bool newtonCompoundCollidersOn() {
@@ -3312,6 +3321,16 @@ void OmSolid::flushPendingNewtonRegistrations() {
   // bottom of this function. Without it the census re-fired on EVERY tick and
   // flooded the agent-facing controller.log stream on GET /sim/events.
   int registeredThisFlush = 0;
+  // Inertia provenance, reported in the registration census below. BOTH defects
+  // of 2026-09-10 (a URDF <inertia> that never arrived; a Robot root whose
+  // inertia was geometry-independent) were invisible from the log: the runtime's
+  // mass preset is a SILENT substitution, and a substituted body looks exactly
+  // like a correctly-specified one. Counting the three provenances turns "why is
+  // my pendulum the wrong weight?" into one line of the load log.
+  int inertiaFromField = 0;     // explicit Physics.inertiaMatrix (incl. URDF <inertia>)
+  int inertiaFromGeometry = 0;  // composed from the boundingObject
+  int inertiaFromPreset = 0;    // neither -> the runtime's mass-scaled preset
+  QStringList inertiaPresetNames;
 
   // Force-type TouchSensors exempted from the P3.10c fold this flush
   // (OMNISIM_NEWTON_TOUCH_FORCE) -- registered in a SECOND pass after the
@@ -3635,6 +3654,7 @@ void OmSolid::flushPendingNewtonRegistrations() {
       // own static body at its world pose.
       QVector<OmSolid *> staticColliders;
       QVector<OmNode *> walk;
+      bool subtreeHasJoint = false;
       walk.append(s);
       while (!walk.isEmpty()) {
         OmNode *const node = walk.takeLast();
@@ -3646,7 +3666,11 @@ void OmSolid::flushPendingNewtonRegistrations() {
           const OmMFNode &kids = g->children();
           for (int i = 0; i < kids.size(); ++i) {
             OmNode *const kid = kids.item(i);
-            if (kid != nullptr && dynamic_cast<OmBasicJoint *>(kid) == nullptr)
+            if (kid == nullptr)
+              continue;
+            if (dynamic_cast<OmBasicJoint *>(kid) != nullptr)
+              subtreeHasJoint = true;
+            else
               walk.append(kid);
           }
         }
@@ -3658,8 +3682,39 @@ void OmSolid::flushPendingNewtonRegistrations() {
       for (OmSolid *const sc : staticColliders) {
         const OmVector3 st = sc->matrix().translation();
         const OmQuaternion sq = OmRotation(sc->rotationMatrix()).toQuaternion();
+        // World-body statics (2026-09-07). A PLAIN collider -- no joint
+        // anywhere in this static's subtree, not itself a TouchSensor, no
+        // Connector / VacuumGripper beneath it, no cloth coupling -- has no
+        // reason to be a MuJoCo body of its own: the runtime attaches its
+        // shapes to Newton's world body and hands back an opaque virtual
+        // index. Anything a device, a weld or a joint must address as a
+        // body keeps the body path. (OmNewtonBackend.hpp, addStaticBody.)
+        bool plainCollider = !subtreeHasJoint && dynamic_cast<OmTouchSensor *>(sc) == nullptr &&
+                             (sc->mNewtonClothCoupling == nullptr || sc->mNewtonClothCoupling->value() == 0);
+        if (plainCollider) {
+          QVector<OmNode *> dwalk;
+          dwalk.append(sc);
+          while (plainCollider && !dwalk.isEmpty()) {
+            OmNode *const dn = dwalk.takeLast();
+            if (dynamic_cast<OmConnector *>(dn) != nullptr || dynamic_cast<OmVacuumGripper *>(dn) != nullptr ||
+                (dn != sc && dynamic_cast<OmTouchSensor *>(dn) != nullptr)) {
+              plainCollider = false;
+              break;
+            }
+            if (const OmGroup *const dg = dynamic_cast<const OmGroup *>(dn)) {
+              const OmMFNode &dkids = dg->children();
+              for (int i = 0; i < dkids.size(); ++i) {
+                OmNode *const dk = dkids.item(i);
+                // A nested Solid registers as its own collider (it is in
+                // staticColliders too) and decides for itself.
+                if (dk != nullptr && (dn == sc || dynamic_cast<OmSolid *>(dk) == nullptr))
+                  dwalk.append(dk);
+              }
+            }
+          }
+        }
         const int sidx = newton->addStaticBody(st.x(), st.y(), st.z(),
-                                               sq.x(), sq.y(), sq.z(), sq.w());
+                                               sq.x(), sq.y(), sq.z(), sq.w(), plainCollider);
         if (sidx >= 0) {
           attachNewtonShapeFromBoundingObject(
               newton, sidx, dynamic_cast<OmBaseNode *>(sc->mBoundingObject->value()),
@@ -3717,13 +3772,33 @@ void OmSolid::flushPendingNewtonRegistrations() {
         const OmVector3 &off = im.item(1);
         ixy = off.x(); ixz = off.y(); iyz = off.z();
       }
-      // OMNISIM_NEWTON_USE_LINK_COM (default off): opt-in true link COM; off =
-      // COM at link origin (legacy, every existing Newton robot validated
-      // against this). Rebuild-gated. When on, pass the Solid's centerOfMass
-      // (OmPhysics, link/body frame) so the Newton body's COM matches the URDF
-      // inertial origin -- the inertia tensor above is already about the COM
-      // frame, so the pairing is physically correct.
-      if (!qEnvironmentVariableIsEmpty("OMNISIM_NEWTON_USE_LINK_COM")) {
+      // COM. Two independent gates, because the two cases are not the same
+      // question.
+      //
+      // (a) An EXPLICIT inertiaMatrix is BY DEFINITION about the Solid's
+      //     centerOfMass -- docs/reference/physics.md says so, and URDF's
+      //     <inertia> means the same thing about its <inertial><origin>. So a
+      //     declared tensor and its declared COM are ONE fact and must travel
+      //     together. Passing the tensor while pinning the COM at the link
+      //     origin does not merely lose the offset: it silently reinterprets
+      //     I_com as I_origin, which understates the body's inertia about every
+      //     joint by m*d^2 AND zeroes the gravity torque on any pendulum-shaped
+      //     link (a 2 m pole with its COM 1 m out integrated at 0.0667 kg.m^2
+      //     about the hinge instead of 0.2667, and never fell). Default ON;
+      //     OMNISIM_NEWTON_INERTIA_COM=0 reverts (value-parsed). Nothing that
+      //     does not declare an inertiaMatrix is touched by this.
+      //
+      // (b) OMNISIM_NEWTON_USE_LINK_COM (default OFF, unchanged): the COM for
+      //     the GEOMETRY-DERIVED case. That tensor is composed about the Solid
+      //     ORIGIN, not about the COM, so moving the COM without also shifting
+      //     the tensor would be inconsistent -- and every existing Newton robot
+      //     (Spot, the huskies, the combat bots) was validated with the COM at
+      //     the link origin. Left opt-in; only re-spelled value-parsed, so `=0`
+      //     now means OFF as the engine's convention requires (it used to be
+      //     presence-gated, where `=0` meant ON).
+      const bool explicitTensor = ixx > 0.0 && iyy > 0.0 && izz > 0.0;
+      if ((explicitTensor && newtonEnvFlag("OMNISIM_NEWTON_INERTIA_COM", true)) ||
+          newtonEnvFlag("OMNISIM_NEWTON_USE_LINK_COM", false)) {
         const OmMFVector3 &com = phys->centerOfMass();
         if (com.size() >= 1) {
           const OmVector3 &c = com.item(0);
@@ -3732,6 +3807,11 @@ void OmSolid::flushPendingNewtonRegistrations() {
         }
       }
     }
+
+    // Provenance snapshot for the census below: was the tensor DECLARED (a
+    // Physics.inertiaMatrix field, which is where a URDF <inertia> lands), or
+    // is it still zeros at this point?
+    const bool inertiaWasDeclared = ixx > 0.0 && iyy > 0.0 && izz > 0.0;
 
     // OMNISIM_NEWTON_COMPOSITE_INERTIA (opt-in, default OFF): override the
     // leader-only mass/inertia/COM with the PHYSICALLY CORRECT composite over
@@ -3775,16 +3855,34 @@ void OmSolid::flushPendingNewtonRegistrations() {
       // diag(0.0094m, 0.0167m, 0.0094m) -- a m=1 r=0.1 sphere got Iyy 4.18x too
       // large (rolling accel 47.6% low). createOdeMass() has already integrated
       // the CORRECT tensor from the bounding object into odeMass()->I; feed it
-      // whenever OMNISIM_NEWTON_LEGACY_INERTIA_PRESET is unset. OmRobot wrapper
-      // bodies are EXCLUDED: their mass is a fixed-child rollup over an envelope
-      // boundingObject and every wheeled-robot result was validated against the
-      // preset -- they stay byte-identical. URDF links ship an explicit
-      // inertiaMatrix (OmUrdfImporter) so robot links never reach this branch.
+      // whenever OMNISIM_NEWTON_LEGACY_INERTIA_PRESET is unset.
       // Scale by k = mass / om->mass: rolledUpMass may exceed the Solid's own
       // mass that odeMass() integrated.
+      //
+      // ⚠️ OmRobot WRAPPER BODIES used to be EXCLUDED here, and that exclusion
+      // was defect 2 of 2026-09-10: with no explicit inertiaMatrix and no
+      // geometry feed, a Robot root had NOTHING left but the runtime's preset,
+      // so its rotational inertia was GEOMETRY-INDEPENDENT. Measured: a
+      // 0.20x0.16x0.10 m robot and a 1.60x1.20x0.80 m robot -- 8x in length,
+      // 64x in inertia -- both reported the identical tensor
+      // m*(0.0167, 0.0094, 0.0094). A robot's SIZE did not enter its dynamics.
+      //
+      // The exclusion is often described as a consequence of
+      // WorldInfo.newtonRobotColliders defaulting FALSE (a wrapper's own
+      // boundingObject is not registered as a collider, because a chassis
+      // envelope pins the body and starves the wheels). That COLLISION policy
+      // is deliberate and stays exactly as it is; what was wrong is that it
+      // also took the wrapper's inertia away. mNativeInertia is composed from
+      // the boundingObject independently of whether that object is ever
+      // registered as a shape, so the two can be decoupled -- and are, here.
+      // Default ON; OMNISIM_NEWTON_ROBOT_GEOM_INERTIA=0 restores the preset
+      // (value-parsed). URDF robot roots that declare an <inertial> tensor take
+      // the explicit branch above and never reach this one.
       const int nPrims = countNewtonCompoundPrimitives(
           dynamic_cast<OmBaseNode *>(s->mBoundingObject->value()));
-      if (dynamic_cast<const OmRobot *>(s) == nullptr && nPrims >= 1) {
+      const bool isRobotBody = dynamic_cast<const OmRobot *>(s) != nullptr;
+      if ((!isRobotBody || newtonEnvFlag("OMNISIM_NEWTON_ROBOT_GEOM_INERTIA", true)) &&
+          nPrims >= 1) {
         // ODE-RETIREMENT: the geometry-derived tensor now comes from the
         // ODE-free native composer (OmSolidUtilities::addInertia mirrored in
         // createOdeMass), parity-proven against the dMass pipeline it
@@ -3817,7 +3915,16 @@ void OmSolid::flushPendingNewtonRegistrations() {
           // RE-GATED to the compound opt-in + >=2 colliders: exactly-isotropic
           // single-primitive tensors (sphere/cube) must reach add_body as the
           // explicit diagonal with identity iquat, NOT be perturbed.
-          if (compoundOn && nPrims >= 2 &&
+          // ⚠️ AND NEVER ON A ROBOT WRAPPER (2026-09-10). Sorting the diagonal
+          // descending RELABELS the principal axes, and that is only harmless
+          // for the symmetric, controller-pinned bins this was written for. A
+          // Husky chassis composes to (Ixx, Iyy, Izz) = (1.98, 3.94, 4.46);
+          // sorting it would hand the solver (4.46, 3.94, 1.98) and swap the
+          // robot's roll and yaw inertia. Robot bodies only started reaching
+          // this branch at all when the wrapper exclusion above was lifted, so
+          // this guard closes a hole that opened with that fix rather than
+          // changing anything that shipped.
+          if (compoundOn && nPrims >= 2 && !isRobotBody &&
               ixy > -1e-9 && ixy < 1e-9 && ixz > -1e-9 && ixz < 1e-9 &&
               iyz > -1e-9 && iyz < 1e-9) {
             double hi = ixx, mid = iyy, lo = izz;
@@ -3830,6 +3937,16 @@ void OmSolid::flushPendingNewtonRegistrations() {
           }
         }
       }
+    }
+
+    if (inertiaWasDeclared)
+      ++inertiaFromField;
+    else if (ixx > 0.0 && iyy > 0.0 && izz > 0.0)
+      ++inertiaFromGeometry;
+    else {
+      ++inertiaFromPreset;
+      if (inertiaPresetNames.size() < 8)
+        inertiaPresetNames.append(s->name());
     }
 
     QString shapeDesc;
@@ -4084,13 +4201,15 @@ void OmSolid::flushPendingNewtonRegistrations() {
   // fresh OmSolids with mNewtonBodyIndex = -1, so they re-register and re-census.
   // No static/global flag to leak or forget to reset.
   if (registeredThisFlush > 0) {
-    int nStatic = 0, nDynamic = 0;
+    int nStatic = 0, nDynamic = 0, nWorldStatic = 0;
     QStringList staticNames;
     for (const OmSolid *const cs : cSolids) {
       if (cs == nullptr || cs->mNewtonBodyIndex < 0)
         continue;
       if (cs->mNewtonBodyIsStatic) {
         ++nStatic;
+        if (cs->mNewtonBodyIndex >= OmNewtonBackend::kWorldStaticIndexBase)
+          ++nWorldStatic;
         if (staticNames.size() < 8)
           staticNames.append(cs->name());
       } else {
@@ -4115,8 +4234,23 @@ void OmSolid::flushPendingNewtonRegistrations() {
     }
     if (nStatic > 0 || nDynamic > 0)
       OmLog::info(QString("[OmNewtonBackend] registered %1 dynamic + %2 static "
-                          "Newton bodies (+%4 this pass) (statics: %3)")
-                      .arg(nDynamic).arg(nStatic).arg(staticNames.join(", ")).arg(registeredThisFlush));
+                          "Newton bodies (%5 of the statics on the world body) (+%4 this pass) "
+                          "(statics: %3)")
+                      .arg(nDynamic).arg(nStatic).arg(staticNames.join(", ")).arg(registeredThisFlush)
+                      .arg(nWorldStatic));
+
+    // Inertia provenance. `preset` is the one to read: those bodies have a
+    // rotational inertia that no line of the world declares and no geometry
+    // implies -- it is m*(0.0094, 0.0167, 0.0094) (or the >=10 kg row) and it
+    // does not change when the robot does. Reported, never suppressed, because
+    // a silent substitution is exactly how it went unnoticed.
+    if (inertiaFromField + inertiaFromGeometry + inertiaFromPreset > 0)
+      OmLog::info(QString("[OmNewtonBackend] inertia provenance: %1 declared, %2 from geometry, "
+                          "%3 from the mass preset%4")
+                      .arg(inertiaFromField).arg(inertiaFromGeometry).arg(inertiaFromPreset)
+                      .arg(inertiaPresetNames.isEmpty()
+                             ? QString()
+                             : QString(" (preset: %1)").arg(inertiaPresetNames.join(", "))));
 
     // ⚠ THE FLOOR MIGHT NOT BE IN THE SCENE. Newton opens every world with an
     // implicit ground plane at z=0, added before any Solid is known and never

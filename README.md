@@ -191,8 +191,10 @@ vendor-claim: [docs/developer/simulator-comparison.md](docs/developer/simulator-
   `SystemInterface`** — but that last one is verified for **velocity-commanded bases only**
   (`diff_drive_controller` on the Husky). **MoveIt is still out of reach**, because OmniSim's arm
   bridge treats a joint command as a goal and answers `409 busy` to a setpoint arriving while the
-  previous one is still interpolating — a trajectory would land in pieces. **Nav2 has never been
-  brought up against OmniSim**, and OmniSim is not in the `ros2_control` simulator registry. Sensor
+  previous one is still interpolating — a trajectory would land in pieces. **Nav2 now runs
+  end-to-end on the Husky for planning and goal execution**, but the verified case uses
+  ground-truth odometry and is not a SLAM, AMCL, or obstacle-avoidance benchmark. OmniSim is not in
+  the `ros2_control` simulator registry. Sensor
   coverage is partial by measurement, not by omission: OmniSim's `Gyro` and `Accelerometer` produce
   no usable data, so `Imu` ships a real orientation and declares those two components absent, and no
   robot in the tree has a camera. For a lab whose stack *is* ROS 2 end to end, Gazebo remains better
@@ -269,6 +271,7 @@ the [validation harness](scripts/harness/). For runtime control of robots in a l
 |---|---|
 | **OmniSim** | OmniArm 6 cobot · OmniArm 7 cobot · OmniTug 500 warehouse tug |
 | **Unitree** | Go2 · B2 quadrupeds · G1 · H1 humanoids |
+| **Deep Robotics** | Lite3 · X30 quadrupeds · M20 · M20S · M20 + Piper wheeled-legged · DR02 Standard · DR02 Pro humanoids |
 | **OmniLink** | OmniQuad quadruped |
 | **Clearpath** | Husky · Jackal |
 | **Universal Robots** | UR3e · UR5e · UR10e |

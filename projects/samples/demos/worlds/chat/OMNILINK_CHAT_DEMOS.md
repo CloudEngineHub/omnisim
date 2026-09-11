@@ -1,6 +1,6 @@
 # OmniLink chat demos — index
 
-This folder contains 15 `omnilink_<robot>.omniworld` chat-driven demos (one
+This folder contains 20 `omnilink_<robot>.omniworld` chat-driven demos (one
 per URDF robot in the repo), plus the 3-arm `omnilink_multi_arm.omniworld`.
 Each opens a robot in
 a small arena with an **OmniLink robot console** side menu attached:
@@ -50,6 +50,11 @@ joint commands and presets.
 | World | Robot | Try saying |
 |---|---|---|
 | `omnilink_omniquad.omniworld` | OmniQuad (poses only) | "stand", "sit", "wave hello", "stop" |
+| `omnilink_lite3.omniworld` | Deep Robotics Lite3 (stands on its own physics) | "stand", "sit", "wave hello", "walk" (legs cycle in place), "stop" |
+| `omnilink_x30.omniworld` | Deep Robotics X30 | same as the Lite3 |
+| `omnilink_m20.omniworld` | Deep Robotics M20 (wheeled-legged; the wheels are real physics) | "stand", "sit", "wave hello", "drive forward", "stop" |
+| `omnilink_m20s.omniworld` | Deep Robotics M20S | same as the M20 |
+| `omnilink_m20_piper.omniworld` | Deep Robotics M20 + AgileX Piper arm (base only; the arm holds its zero pose) | same as the M20 |
 
 ### Aerial
 

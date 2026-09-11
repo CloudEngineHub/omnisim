@@ -67,17 +67,24 @@ Search the log for `URDF_DEBUG`.
 - Sensor noise / drift parameters from `<gazebo><plugin>` blocks are not propagated — only the device type and the link it attaches to. Tune noise on the Webots side once imported if it matters for your demo.
 - Multi-shape collision is supported via `Group`, but Webots auto-computes inertia from the *first* shape only unless an explicit `Physics.inertiaMatrix` is supplied.
 
+## Inertia import (ON by default since 2026-09-10)
+
+### `OMNISIM_URDF_USE_INERTIA` — emit `Physics.inertiaMatrix` from URDF `<inertia>` tensors **(default ON)**
+
+What it does: passes `<inertia ixx ixy ixz iyy iyz izz>` straight into `Physics.inertiaMatrix` (2-line MFVector3), together with the `<inertial><origin>` as `Physics.centerOfMass`, for any link with a physically admissible tensor.
+
+⚠️ **This used to be OFF by default, and the consequence was that a URDF's `<inertia>` NEVER reached the solver.** Measured 2026-09-10 on a two-link cart-pole: a pole declaring `iyy = 0.0666667` about its COM was integrated at `0.00334` — the Newton runtime's Husky-tuned mass preset `m*(0.0094, 0.0167, 0.0094)` — and *multiplying the URDF tensor by 4.5× produced a byte-identical `mjModel`*. The tensor was not merely ignored; it was masked by a number with no relation to the robot. The OFF default was an ODE-era workaround for a `dMassSetParameters` crash, and ODE was deleted on 2026-08-08 (`bdc02139`), so the reason had already outlived the code. **`OMNISIM_URDF_USE_INERTIA=0` restores the bounding-object-derived import** (value-parsed) for a bisect.
+
+Two guards remain, and both now WARN instead of dropping a tensor silently:
+
+- **Small-tensor clamp, re-derived at `1e-9`** (it was `1e-4`). The old value was the ODE crash threshold; MuJoCo's own floor is `mjMINVAL` (1e-15), so `1e-4` was a second silent mask — a 100 g gripper finger's real tensor is ~1e-5 and was being thrown away. `1e-9` is a numerical-sanity floor, not a crash guard.
+- **Triangle inequality on the principal moments (`a + b >= c`)**, mirroring `principal_moments()` in `scripts/dev/urdf_import.py`. A tensor can be positive definite and still describe no rigid body; MuJoCo's compiler REJECTS such a body, so — now that the tensor actually reaches the solver — an unchecked one would turn a sloppy URDF into a hard load failure. Such links fall back to bounding-object inertia with a named warning.
+
+Where the tensor lands is reported once per load: `[OmNewtonBackend] inertia provenance: N declared, M from geometry, K from the mass preset`. A non-zero `preset` count names bodies whose rotational inertia no line of the world declares and no geometry implies.
+
+Verified end-to-end: `python -m omnisim run-headless projects/samples/demos/worlds/physics/newton_husky_smoke_test.omniworld --duration 15` drives the Husky 12.53 m against 12.51 m with the tensors reverted (0.17%).
+
 ## Opt-in features
-
-Two importer features are gated behind environment variables. Both are now usable at runtime as of the small-tensor clamp / root-relocation fixes; they stay off by default because the surface area has not been swept across many URDFs yet.
-
-### `OMNISIM_URDF_USE_INERTIA=1` — emit `Physics.inertiaMatrix` from URDF `<inertia>` tensors **(usable)**
-
-What it does: passes `<inertia ixx ixy ixz iyy iyz izz>` straight into Webots' `Physics.inertiaMatrix` (2-line MFVector3) for any link with a positive-definite tensor whose principal moments are all >= `1e-4`.
-
-Tensors below that threshold are silently dropped. **The clamp's original justification was ODE-specific and no longer applies to any code that ships:** Webots/ODE's `dMassSetParameters` was observed to crash with `ACCESS_VIOLATION` on values smaller than `1e-4` even when the tensor satisfied positive-definiteness and the triangle inequality (Jackal wheels at 0.0013 are right on the threshold; many URDFs use 1e-9 placeholders on sensor-mount frames). ⚠ **2026-08-08: the ODE backend was deleted (`bdc02139`), so `dMassSetParameters` is gone and that crash cannot recur — the `1e-4` threshold is now UNJUSTIFIED, not validated.** It needs re-derivation against Newton/`SolverMuJoCo` (whose own MuJoCo-compiler tolerances are a different constraint entirely) and may be unnecessary, or may need a different value. Until someone measures it, treat `1e-4` as a legacy constant that is silently changing the dynamics of any URDF with small-tensor links. Links that hit the clamp fall back to bounding-object-derived inertia.
-
-Verified end-to-end: `OMNISIM_URDF_USE_INERTIA=1 python scripts/dev/headless_runner.py projects/samples/demos/worlds/showcase/jackal_drive.omniworld --duration 20` drives the Jackal 125+ m with the chassis tensor in effect.
 
 ### `OMNISIM_URDF_USE_SENSORS=1` — emit OmniSim devices from `<gazebo><sensor>` and `<plugin>` blocks **(works for short runs; long-run crash is in the engine, not the importer)**
 

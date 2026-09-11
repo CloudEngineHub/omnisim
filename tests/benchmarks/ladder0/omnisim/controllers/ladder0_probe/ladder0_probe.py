@@ -19,10 +19,9 @@ and no verdict appears in this file.  Reduction to physical quantities is
 ``ladder0/analysis.py`` and the ground truth is ``ladder0/rungs.py``, so every
 arm is scored by the same code from the same numbers.
 
-The import is ``from controller import ...`` rather than the preferred
-``from omnisim import ...`` on purpose: this file is meant to be readable as
-the reference implementation by the arms running other simulators, and
-``controller`` is the only spelling all of them export.
+The import uses OmniSim's supported ``omnisim`` module name.  The legacy
+``controller`` alias was removed in 8.x, so retaining it here makes every
+current OmniSim ladder run fail before the first simulation step.
 
 Scene constants and commanded rates come from ``rungs.py``, imported by
 absolute path, so a scene change cannot leave the driver commanding the old
@@ -73,7 +72,7 @@ def _breadcrumb(stage, extra=""):
 _breadcrumb("module-start", "python=%s cwd=%s"
             % (sys.version.split()[0], os.getcwd()))
 
-from controller import Supervisor  # noqa: E402  (after the breadcrumb)
+from omnisim import Supervisor  # noqa: E402  (after the breadcrumb)
 
 _breadcrumb("controller-imported")
 # .../ladder0/omnisim/controllers/ladder0_probe -> .../ladder0
@@ -135,7 +134,11 @@ def arg(name, default=None):
 def main():
     rung = int(arg("rung", "0"))
     fault = arg("fault", "none")
-    duration = rungs.DURATION[rung]
+    # Evaluation-only extension hook: preserves every commanded phase while
+    # allowing a longer plateau/hold to be measured without editing the
+    # benchmark contract.  Unset by normal ladder runs.
+    duration = float(os.environ.get("LADDER0_DURATION_OVERRIDE",
+                                    rungs.DURATION[rung]))
     # Multi-run rungs (CONTRACT.md amendment A): the arm passes the run's tag
     # and the fraction of the run this replica is to complete.  Both are the
     # CONTRACT's -- worldgen.run_specs reads them from rungs.py -- and the

@@ -55,7 +55,11 @@ HTTP surface (default port 6090, loopback only):
           target_altitude_m,            # commanded hover altitude
           gimbal_pitch_rad,             # current camera pitch (0=forward, pi/2=down)
           mode,                         # idle | takeoff | hover | goto | land | landed
-          fault,                        # null or short string
+          fault,                        # null | "no_progress" (advisory: no closer
+                                        #   by 0.25 m for 12 s of sim time; cleared on
+                                        #   progress or arrival) | "crashed" (hard: tipped
+                                        #   past 1.2 rad for 1 s in a flight mode; ends a
+                                        #   wait) | "goto_waypoint_timeout" (wait responses)
           sim_time, last_tick_at,       # seconds, wall-clock epoch
           target,                       # nullable: {x, y, altitude} for goto
           mission_complete              # agent-set via complete_mission
@@ -240,6 +244,18 @@ POS_HOLD_RADIUS_M = 3.0
 K_POS = 3.0        # input units per metre of position error
 K_XY_V = 8.0       # input units per m/s of velocity (always on)
 MAX_HOLD_TILT = 8.0  # clamp on the hold branch's roll/pitch command
+# Integral position hold (public issue #14, second round). The P+D hold above
+# parks the aircraft 0.2-0.6 m short of every target -- a constant body-frame
+# trim the P term can only balance with a standing error. The tester's course
+# has 0.5 m of standoff, so each leg started off-lane and cut the next corner
+# along a shelf face; a 0.6 m arrival tolerance hid it. Measured on that course,
+# three flights per arm, one engine per flight: without the integrator the
+# closest approach per waypoint was 0.17-0.60 m and the hull grazed the shelves
+# (min clearance 0.000-0.005 m); with it every waypoint is met on the lane and
+# the hull clears by 0.15-0.18 m. Body-frame, clamped, integrated only inside
+# POS_HOLD_RADIUS_M so a long transit cannot wind it up; reset with the pose.
+K_XY_I = 0.4        # input units per (m*s) of integrated body-frame position error
+XY_I_CLAMP = 3.0    # integrator clamp (input units); the trim it absorbs is ~1.5
 K_VERTICAL_OFFSET = 0.0    # was 0.6: a standing bias for the era when hover
                            # thrust was short of the weight; k_thrust is now
                            # calibrated so omega=68.5 hovers exactly, and the
@@ -267,6 +283,23 @@ STALL_PROGRESS_TOL_M = 0.25   # closer than this to the best-so-far is "no progr
 STALL_TIMEOUT_S = 12.0        # sim seconds without progress before reporting
 
 
+# Crash detection (public issue #14, second round). The stall probe that
+# reproduced the tester's case sat on its nose against a shelf -- z 0.19 m,
+# pitch -pi/2 -- for 85 s in mode=goto with fault=None, because the stall check
+# below lived inside the `altitude > 0.25` gate and a fallen aircraft never
+# reached it. An aircraft in a flight mode that is tipped past CRASH_TILT_RAD
+# for CRASH_HOLD_S of sim time is not flying and never will be on its own; that
+# is a HARD fault (it ends a `wait`), unlike the advisory no_progress.
+CRASH_TILT_RAD = 1.2      # ~69 degrees of roll or pitch
+CRASH_HOLD_S = 1.0        # sustained, so a hard bump is not a crash
+
+
+def crash_verdict(roll, pitch, tipped_since_s):
+    """(is_crashed, still_tipped) for one tick of a flight mode."""
+    tipped = abs(roll) > CRASH_TILT_RAD or abs(pitch) > CRASH_TILT_RAD
+    return (tipped and tipped_since_s >= CRASH_HOLD_S), tipped
+
+
 def stall_verdict(dist_xy, best_dist, since_progress_s):
     """(is_stalled, new_best) for one tick of a goto.
 
@@ -276,12 +309,41 @@ def stall_verdict(dist_xy, best_dist, since_progress_s):
     if best_dist is None or dist_xy < best_dist - STALL_PROGRESS_TOL_M:
         return False, dist_xy
     return since_progress_s >= STALL_TIMEOUT_S, best_dist
+
+
+def stall_step(best, since, fault, dist_xy, sim_time):
+    """One tick of the stall tracker, pure: (best, since, fault) -> (best, since, fault).
+
+    The v8.3.0 wiring decided "we just set a new best" with a float equality
+    (`state.stall_best == dist_xy`), which a distance that is bit-identical from
+    tick to tick satisfies on EVERY tick -- so an aircraft wedged at exact rest
+    reset its own clock forever and never reported. A tester's 197 s pin at
+    cruise moved by millimetres a few times a minute; each 60 s leg window saw
+    a constant distance and `no_progress` never fired. The clock now resets
+    only on actual progress.
+    """
+    if best is None or dist_xy < best - STALL_PROGRESS_TOL_M:
+        return dist_xy, sim_time, (None if fault == "no_progress" else fault)
+    if sim_time - since >= STALL_TIMEOUT_S and fault is None:
+        fault = "no_progress"
+    return best, since, fault
 ALTITUDE_REACH_TOL_M = 0.4
 
 # Gimbal pitch motor range (camera pitch). 0 = forward, pi/2 = down.
 GIMBAL_PITCH_MIN = -0.5
 GIMBAL_PITCH_MAX = 1.7
 GIMBAL_DOWN_RAD = math.pi / 2
+# Gimbal slew rate (public issue #14, the "spawn ejection"). Commanding the
+# pitch servo straight from 0 to pi/2 at init is a step of 1.57 rad against a
+# 5 N*m effort limit, and the reaction into the airframe kicks the parked
+# aircraft 1.15 m along its heading in under a second -- measured with the
+# engine's body-pose trace: HEAD and the v8.1.17 bridge eject byte-identically,
+# a bridge that never commands the gimbal does not move, and a ramped command
+# parks at the authored pose to the millimetre. Lowering the URDF effort to
+# 0.2 N*m only shrank the kick to 0.3 m, so the fix is to never present the
+# servo with a large error: the commanded position walks toward the target at
+# this rate, from wherever the joint is, at init and on every later change.
+GIMBAL_RATE_RAD_S = 1.0
 
 # Default takeoff / cruise altitude.
 DEFAULT_TAKEOFF_ALTITUDE = 12.0
@@ -307,6 +369,23 @@ BRIDGE_PORT = _parse_bridge_args()
 
 def clamp(value, low, high):
     return max(low, min(high, value))
+
+
+def yaw_from_axis_angle(rotation) -> float:
+    """Heading (rotation about +Z) of a VRML axis-angle rotation [ax, ay, az, angle].
+
+    Pure so it can be tested without an engine. Goes through the quaternion so
+    an axis that is not exactly +Z still yields the right heading.
+    """
+    ax, ay, az, angle = (float(v) for v in rotation)
+    norm = math.sqrt(ax * ax + ay * ay + az * az)
+    if norm < 1e-9:
+        return 0.0
+    ax, ay, az = ax / norm, ay / norm, az / norm
+    half = 0.5 * angle
+    sh = math.sin(half)
+    qw, qx, qy, qz = math.cos(half), ax * sh, ay * sh, az * sh
+    return math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
 
 
 def wrap_pi(angle: float) -> float:
@@ -502,12 +581,16 @@ class BridgeState:
         self.target_yaw: Optional[float] = None
         self.gimbal_pitch_target = GIMBAL_DOWN_RAD
         self.gimbal_pitch_actual = 0.0
+        self.gimbal_cmd = 0.0   # the angle currently commanded to the pitch servo (ramps)
+        self.xy_i_fwd = 0.0     # body-frame position-hold integrators (K_XY_I)
+        self.xy_i_right = 0.0
         self.mode = "idle"        # idle | takeoff | hover | goto | land | landed
         self.fault: Optional[str] = None
         # Stall detection (issue #14): closest approach to the live target and
         # the sim time at which it was achieved.
         self.stall_best: Optional[float] = None
         self.stall_since: float = 0.0
+        self.tipped_since: Optional[float] = None   # sim time the airframe tipped past CRASH_TILT_RAD
         self.sim_time = 0.0
         self.last_tick_at = time.time()
         self.tick_period_s = 0.008
@@ -534,6 +617,12 @@ class BridgeState:
         # separate from reset_request because the simulation thread clears that
         # queue while the HTTP thread may still be preparing the next action.
         self.reset_anchor: Optional[dict] = None
+        # The pose the world file authored for this robot, captured at init.
+        # `reset` returns here unless told otherwise (public issue #14: the
+        # old default was the omnilink_mavic spawn, hard-coded, which on any
+        # other world teleported the aircraft to a point that may not even be
+        # over the floor).
+        self.authored_pose = {"x": 0.0, "y": 0.0, "z": 0.1, "yaw": 0.0}
         # Ground-truth-able DEFs in the world (advertised in /capabilities).
         self.gt_def_names: list = []
         # wwi-chat outbox: lines the main loop should push to the robot
@@ -580,12 +669,21 @@ def _wait_until_arrived(state: BridgeState, target_x: float, target_y: float,
         with state.lock:
             f = state.fault
             x, y, z, yaw, st = state.x, state.y, state.z, state.yaw, state.sim_time
-        if f:
+        # `no_progress` is ADVISORY (issue #14): it is reported in /state and in
+        # this response, but it must not end the wait. The v8.3.0 wait returned
+        # on it after 12 s of sim time, which turned every slow, scraping leg
+        # that used to arrive inside the caller's timeout into a failed leg --
+        # the completion regression the same reporter then measured (14/17 on
+        # v8.1.17 -> 8/18). Only a hard fault ends the wait early.
+        if f and f != "no_progress":
             return {"done": False, "fault": f, "x": x, "y": y, "z": z, "yaw": yaw,
                     "sim_time": st, "distance_remaining_m": math.hypot(x - target_x, y - target_y)}
         d_xy = math.hypot(x - target_x, y - target_y)
         d_z = abs(z - target_alt)
         if d_xy < WAYPOINT_REACH_TOL_M and d_z < ALTITUDE_REACH_TOL_M:
+            with state.lock:
+                if state.fault == "no_progress":
+                    state.fault = None   # it got there; the advisory is stale
             return {"done": True, "fault": None, "x": x, "y": y, "z": z, "yaw": yaw,
                     "sim_time": st, "distance_remaining_m": d_xy}
         time.sleep(poll_s)
@@ -931,10 +1029,12 @@ def make_handler(state: BridgeState):
                 return
 
             if action == "reset":
-                reset_x = finite_number(body.get("x", 0.0), "x")
-                reset_y = finite_number(body.get("y", -12.0), "y")
-                reset_z = finite_number(body.get("z", 0.1), "z")
-                reset_yaw = finite_number(body.get("yaw", math.pi / 2), "yaw")
+                with state.lock:
+                    home = dict(state.authored_pose)
+                reset_x = finite_number(body.get("x", home["x"]), "x")
+                reset_y = finite_number(body.get("y", home["y"]), "y")
+                reset_z = finite_number(body.get("z", home["z"]), "z")
+                reset_yaw = finite_number(body.get("yaw", home["yaw"]), "yaw")
                 with state.lock:
                     state.target_x = None
                     state.target_y = None
@@ -948,6 +1048,8 @@ def make_handler(state: BridgeState):
                         "x": reset_x, "y": reset_y, "z": reset_z, "yaw": reset_yaw,
                     }
                     state.reset_anchor = dict(state.reset_request)
+                    state.xy_i_fwd = 0.0
+                    state.xy_i_right = 0.0
                 self._ok({"reset": True, "pose": dict(state.reset_request)})
                 return
 
@@ -978,6 +1080,7 @@ def make_handler(state: BridgeState):
                 with state.lock:
                     state.stall_best = None
                     state.stall_since = state.sim_time
+                    state.tipped_since = None
                     state.target_altitude = max(0.5, altitude)
                     anchor = state.reset_anchor
                     state.reset_anchor = None
@@ -1047,6 +1150,7 @@ def make_handler(state: BridgeState):
                     # previous target's best-approach must not leak into it.
                     state.stall_best = None
                     state.stall_since = state.sim_time
+                    state.tipped_since = None
                 if body.get("wait"):
                     timeout_s = finite_number(body.get("timeout_s", 60.0), "timeout_s")
                     res = _wait_until_arrived(state, tx, ty, target_alt, timeout_s)
@@ -1241,7 +1345,9 @@ def main():
     if gimbal_pitch_motor is None:
         print("[mavic_omnilink_bridge] WARN: no 'camera pitch' device — gimbal control disabled")
     else:
-        gimbal_pitch_motor.setPosition(GIMBAL_DOWN_RAD)
+        # Start where the joint is; the per-tick ramp below walks it down
+        # (GIMBAL_RATE_RAD_S) instead of slamming the airframe.
+        gimbal_pitch_motor.setPosition(0.0)
 
     # Pose-tracking field (translation/rotation) for reset_request.
     translation_field = self_node.getField("translation")
@@ -1257,12 +1363,14 @@ def main():
     state.camera_fov_h = cam_fov_h
     state.camera_fov_v = cam_fov_v
     state.gimbal_pitch_target = GIMBAL_DOWN_RAD
-    state.gimbal_pitch_actual = GIMBAL_DOWN_RAD
+    state.gimbal_pitch_actual = 0.0   # ramps to GIMBAL_DOWN_RAD over ~1.6 s
 
     # Seed pose so /state is sane before the first tick.
     state.x = initial_translation[0]
     state.y = initial_translation[1]
     state.z = initial_translation[2]
+    state.yaw = yaw_from_axis_angle(initial_rotation)
+    state.authored_pose = {"x": state.x, "y": state.y, "z": state.z, "yaw": state.yaw}
 
     # Mission brief / world title.
     title, brief = _read_world_brief(supervisor)
@@ -1355,6 +1463,29 @@ def main():
         # block and let trim tilt carry the craft ~6 m sideways on the way down
         # (measured in issue #10) -- the land action stores the touchdown point
         # in target_x/y, so keep holding it.
+        # Crash + stall checks run BEFORE the altitude gate below (issue #14): a
+        # wedged aircraft that has fallen to z 0.19 m is exactly the one that must
+        # be reported, and the gate used to hide it from both checks.
+        if mode in ("takeoff", "hover", "goto"):
+            with state.lock:
+                crashed, tipped = crash_verdict(
+                    roll, pitch, 0.0 if state.tipped_since is None else state.sim_time - state.tipped_since)
+                if tipped and state.tipped_since is None:
+                    state.tipped_since = state.sim_time
+                elif not tipped:
+                    state.tipped_since = None
+                if crashed and state.fault in (None, "no_progress"):
+                    state.fault = "crashed"
+            if mode == "goto" and target_x is not None and target_y is not None:
+                dist_goto = math.hypot(target_x - x_pos, target_y - y_pos)
+                # Stall check -- report only, never act. Skipped once the aircraft is
+                # within the reach tolerance: sitting still AT the target is not
+                # progress either, and holding a hover must never be a fault.
+                if dist_goto > WAYPOINT_REACH_TOL_M:
+                    with state.lock:
+                        state.stall_best, state.stall_since, state.fault = stall_step(
+                            state.stall_best, state.stall_since, state.fault, dist_goto, state.sim_time)
+
         if mode in ("takeoff", "hover", "goto", "land") and (target_altitude > 0.05 or mode == "land"):
             # Hold the authored launch point throughout the climb.  Deferring
             # xy control until the last metre of ascent let small trim errors
@@ -1372,27 +1503,18 @@ def main():
                 # error + velocity damping, clamped, and the clamp IS the cruise
                 # limit (MAX_HOLD_TILT / K_XY_V = ~1.0 m/s). Yaw steering stays
                 # only so the camera faces the direction of travel.
-                # Stall check (issue #14) -- report only, never act. Skipped once the
-                # aircraft is within the reach tolerance: sitting still AT the target
-                # is not progress either, and holding a hover must never be a fault.
-                if dist_xy > WAYPOINT_REACH_TOL_M:
-                    with state.lock:
-                        _stalled, state.stall_best = stall_verdict(
-                            dist_xy, state.stall_best, state.sim_time - state.stall_since)
-                        if state.stall_best == dist_xy:
-                            state.stall_since = state.sim_time
-                        if _stalled and state.fault is None:
-                            state.fault = "no_progress"
-                        elif not _stalled and state.fault == "no_progress":
-                            state.fault = None
-
                 e_fwd = dx * cy + dy * sy
                 e_right = dx * sy - dy * cy
                 # +pitch_input lifts the FRONT pair -> nose up -> backward.
-                pitch_disturbance = clamp(-K_POS * e_fwd + K_XY_V * v_fwd,
+                if dist_xy < POS_HOLD_RADIUS_M:
+                    state.xy_i_fwd = clamp(state.xy_i_fwd + K_XY_I * e_fwd * state.tick_period_s,
+                                           -XY_I_CLAMP, XY_I_CLAMP)
+                    state.xy_i_right = clamp(state.xy_i_right + K_XY_I * e_right * state.tick_period_s,
+                                             -XY_I_CLAMP, XY_I_CLAMP)
+                pitch_disturbance = clamp(-K_POS * e_fwd - state.xy_i_fwd + K_XY_V * v_fwd,
                                           -MAX_HOLD_TILT, MAX_HOLD_TILT)
                 # +roll_input lifts the RIGHT pair (FR/RR faster) -> rolls left.
-                roll_disturbance = clamp(-K_POS * e_right + K_XY_V * v_right,
+                roll_disturbance = clamp(-K_POS * e_right - state.xy_i_right + K_XY_V * v_right,
                                          -MAX_HOLD_TILT, MAX_HOLD_TILT)
                 if dist_xy > POS_HOLD_RADIUS_M:
                     desired_heading = math.atan2(dy, dx)
@@ -1464,13 +1586,17 @@ def main():
         # for thrust and uses pair asymmetry for yaw torque.
         dynamics.step(front_left_input, front_right_input, rear_left_input, rear_right_input)
 
-        # Gimbal: drive the pitch motor toward the current target.
+        # Gimbal: walk the commanded position toward the target at
+        # GIMBAL_RATE_RAD_S (issue #14 -- a step command ejects the parked
+        # airframe). `gimbal_pitch_actual` reports the commanded position.
         if gimbal_pitch_motor is not None:
             with state.lock:
                 tgt = state.gimbal_pitch_target
-            gimbal_pitch_motor.setPosition(tgt)
+            step_max = GIMBAL_RATE_RAD_S * state.tick_period_s
+            state.gimbal_cmd += clamp(tgt - state.gimbal_cmd, -step_max, step_max)
+            gimbal_pitch_motor.setPosition(state.gimbal_cmd)
             with state.lock:
-                state.gimbal_pitch_actual = tgt
+                state.gimbal_pitch_actual = state.gimbal_cmd
 
     while supervisor.step(time_step) != -1:
         # Honour a queued reset (only the main thread is allowed to teleport).
@@ -1479,7 +1605,7 @@ def main():
             state.reset_request = None
         if req and translation_field and rotation_field:
             translation_field.setSFVec3f([req["x"], req["y"], req.get("z", 0.1)])
-            rotation_field.setSFRotation([0.0, 0.0, 1.0, req.get("yaw", math.pi / 2)])
+            rotation_field.setSFRotation([0.0, 0.0, 1.0, req.get("yaw", state.authored_pose["yaw"])])
             # A pose reset must also clear the rigid body's accumulated linear
             # and angular velocity.  Capture sessions can leave the aircraft
             # landed or drifting before a new take starts; carrying that

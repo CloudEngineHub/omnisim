@@ -111,6 +111,14 @@ from _arm_configs import get_config                          # noqa: E402
 OUT = os.environ.get("PICK_OUT", os.path.join(_HERE, "_real_pick_result.json"))
 CONTROL_DROP = os.environ.get("PICK_CONTROL_DROP") == "1"
 DEBUG = os.environ.get("PICK_CONTACT_DEBUG") == "1"
+PHASE_TRACE_ENABLED = os.environ.get("PICK_PHASE_TRACE") == "1"
+phase_trace = []
+
+
+def mark_phase(name):
+    """Record simulation-time phase boundaries for bounded diagnostics."""
+    if PHASE_TRACE_ENABLED:
+        phase_trace.append({"phase": name, "sim_time_s": robot.getTime()})
 
 OZ = 0.25                       # flange -> finger throat (omniarm6_2f85_grip.urdf)
 BLOCK_HALF = 0.025              # 50 mm across the grasp axis
@@ -457,11 +465,14 @@ AX, AY = PX, PY + YBIAS
 
 open_fingers()
 step_for(1.0)
+mark_phase("ready")
 emit("[pick] start block_z=%.4f fingers=%s control_drop=%s ybias=%.4f"
      % (bz(), fingers(), CONTROL_DROP, YBIAS))
 
 emit("[pick] approach err=%.4f" % goto((AX, AY, GRASP_Z + 0.16), 2.0))
+mark_phase("approach_complete")
 emit("[pick] descend  err=%.4f" % goto((AX, AY, GRASP_Z), 2.0))
+mark_phase("pregrasp_complete")
 
 r = rel()
 emit("[pick] at block: lateral=%.1fmm vertical=%.1fmm"
@@ -497,6 +508,7 @@ else:
     step_for(0.8)
     emit("[pick] preclose -> %.4f (target %.4f)" % (fingers()[0], q_pre))
     squeeze()
+    mark_phase("grasp_commanded")
     emit("[pick] squeezed %.0f mm interference -> fingers=%s (~%.2f N/pad)"
          % (INTERFERENCE * 1000.0, fingers(), GRIP_KP * INTERFERENCE))
 
@@ -520,9 +532,11 @@ emit("[pick] pads after squeeze: %s" % pads())
 c_squeeze = census("squeezed")
 rel0 = rel()
 emit("[pick] lift     err=%.4f" % goto((gx, gy, GRASP_Z + 0.22), 2.0))
+mark_phase("lift_complete")
 emit("[pick] lifted  block_z=%.4f  %s" % (bz(), pads()))
 c_lift = census("lifted")
 emit("[pick] carry    err=%.4f" % goto((PLACE_X, PLACE_Y, GRASP_Z + 0.22), 3.0))
+mark_phase("carry_complete")
 emit("[pick] carried block_z=%.4f  %s" % (bz(), pads()))
 c_carry = census("carried")
 
@@ -551,8 +565,10 @@ emit("[contact] VERDICT pinched=%s palm_wedge=%s max_pad_penetration=%.2fmm"
 emit("[pick] lower    err=%.4f" % goto((PLACE_X, PLACE_Y, GRASP_Z + 0.005), 2.0))
 if not CONTROL_DROP:
     release()
+mark_phase("released")
 emit("[pick] retreat  err=%.4f" % goto((PLACE_X, PLACE_Y, GRASP_Z + 0.20), 1.6))
 step_for(1.5)
+mark_phase("settled")
 
 p = block.getPosition()
 placed = (math.hypot(p[0] - PLACE_X, p[1] - PLACE_Y) < 0.10
@@ -571,7 +587,7 @@ _result = {"control_drop": CONTROL_DROP, "carried": carried_ok,
            "drift_m": drift, "placed": placed, "ok": ok,
            "final": list(p), "hold_mechanism": "friction",
            "interference_m": INTERFERENCE, "grip_n_per_pad": GRIP_KP * INTERFERENCE,
-           "log": log}
+           "phase_trace": phase_trace, "log": log}
 # This is the demo README leads with, and the default Windows install lands in
 # C:\Program Files, which a normal shell cannot write -- so an unguarded write
 # here killed the controller with a PermissionError AFTER a successful pick and

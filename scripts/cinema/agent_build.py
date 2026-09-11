@@ -14,11 +14,11 @@
 
 """Manifest-driven editor for OmniSim Agent Build films.
 
-This is the reusable form of the approved v8 milestone.  Capture is handled by
+This is the reusable form of the approved v9 milestone.  Capture is handled by
 ``scripts/capture`` or ``omnisim cinema render``; this module turns those real
 captures into a simulator-first, three-act build story with the locked silent
 intro, purposeful direct-cut grammar, sparse information cards, natural
-narration mix, GitHub outro, edit-decision list, provenance manifest, and
+narration mix, clean story ending, edit-decision list, provenance manifest, and
 hash-bound receipt.
 """
 
@@ -46,12 +46,11 @@ PW, PH, PFPS = 1280, 720, 15
 SAFE = 72
 INTRO_DURATION_S = 10.0
 DISCLOSURE_DURATION_S = 5.0
-OUTRO_DURATION_S = 4.5
 DISCLOSURE = "This video was made end-to-end by an AI agent under human monitoring."
 SIGNATURE_LINES = ("A real build.", "The story of an agent.", "Told by an agent.")
 GITHUB_DESTINATION = "github.com/omnilink-tech/omnisim"
-STYLE_VERSION = "agent_build_v8"
-RENDER_CACHE_VERSION = 2
+STYLE_VERSION = "agent_build_v9"
+RENDER_CACHE_VERSION = 3
 INTRO_SCORE_GAIN = 0.08
 STORY_SCORE_GAIN = 0.32
 INTRO_MASTER_GAIN = 0.50
@@ -71,7 +70,6 @@ ACCENTS = {"cyan": CYAN, "blue": BLUE, "amber": AMBER,
 FONT_REG = REPO_ROOT / "resources" / "branding" / "omnilink" / "fonts" / "Montserrat-Regular.ttf"
 FONT_SEMI = REPO_ROOT / "resources" / "branding" / "omnilink" / "fonts" / "Montserrat-SemiBold.otf"
 FONT_BOLD = REPO_ROOT / "resources" / "branding" / "omnilink" / "fonts" / "Montserrat-Bold.ttf"
-ORB = REPO_ROOT / "resources" / "branding" / "omnisim" / "orb" / "orb_512.png"
 
 REQUIRED_BEATS = ("question", "attempt", "control", "evidence", "method", "boundary", "conclusion")
 ALLOWED_BEATS = set(REQUIRED_BEATS) | {"transfer"}
@@ -153,6 +151,11 @@ class AgentBuildSpec:
     fps: int = FPS
     width: int = W
     height: int = H
+    opening: str = "signature"
+
+    @property
+    def intro_duration_s(self) -> float:
+        return 0.0 if self.opening == "action" else INTRO_DURATION_S
 
     @property
     def content_duration_s(self) -> float:
@@ -160,7 +163,7 @@ class AgentBuildSpec:
 
     @property
     def duration_s(self) -> float:
-        return INTRO_DURATION_S + self.content_duration_s + OUTRO_DURATION_S
+        return self.intro_duration_s + self.content_duration_s
 
     @property
     def simulator_footage_ratio(self) -> float:
@@ -329,14 +332,25 @@ def parse(payload: dict[str, Any] | str | Path) -> AgentBuildSpec:
         raise ValueError("segment ids must be unique")
     if segments[0].beat != "question" or segments[0].kind != "clip":
         raise ValueError("the first post-intro segment must be real question/build footage")
+    editorial = data.get("editorial") or {}
+    opening = str(editorial.get("opening", "signature"))
+    if opening not in ("signature", "action"):
+        raise ValueError("editorial.opening must be 'signature' or 'action'")
+    intro_duration = 0.0 if opening == "action" else INTRO_DURATION_S
+    # In an action-led story, show the repair before revealing its result.
+    required_beats = (("question", "attempt", "control", "method", "evidence", "boundary", "conclusion")
+                      if opening == "action" else REQUIRED_BEATS)
     first_beat = {beat: next((i for i, s in enumerate(segments) if s.beat == beat), None)
-                  for beat in REQUIRED_BEATS}
+                  for beat in required_beats}
     missing = [beat for beat, index in first_beat.items() if index is None]
     if missing:
         raise ValueError(f"story is missing required beats: {', '.join(missing)}")
-    order = [int(first_beat[beat]) for beat in REQUIRED_BEATS]
+    # Action openings disclose scope when it first becomes relevant, instead
+    # of requiring a disclaimer scene after the successful climax.
+    ordered_beats = tuple(b for b in required_beats if b != "boundary") if opening == "action" else required_beats
+    order = [int(first_beat[beat]) for beat in ordered_beats]
     if order != sorted(order):
-        raise ValueError(f"required beats must first appear in order: {' -> '.join(REQUIRED_BEATS)}")
+        raise ValueError(f"required beats must first appear in order: {' -> '.join(required_beats)}")
     for beat in ("attempt", "control"):
         segment = segments[int(first_beat[beat])]
         if segment.kind != "clip":
@@ -435,8 +449,8 @@ def parse(payload: dict[str, Any] | str | Path) -> AgentBuildSpec:
         sentence_pause_s=float(item.get("sentence_pause_s", 0.55)),
         clause_pause_s=float(item.get("clause_pause_s", 0.22)),
     ) for item in voice_raw.get("blocks", []))
-    if not blocks or blocks[0].start_s != INTRO_DURATION_S:
-        raise ValueError("the first voice block must begin exactly at 10.0 seconds")
+    if not blocks or blocks[0].start_s != intro_duration:
+        raise ValueError(f"the first voice block must begin exactly at {intro_duration:.1f} seconds")
     if any(block.window_end_s <= block.start_s for block in blocks):
         raise ValueError("every voice block needs a positive editorial window")
     if any(not 0.90 <= block.speed <= 1.05 for block in blocks):
@@ -444,9 +458,9 @@ def parse(payload: dict[str, Any] | str | Path) -> AgentBuildSpec:
     for left, right in zip(blocks, blocks[1:]):
         if left.window_end_s > right.start_s:
             raise ValueError("voice editorial windows overlap")
-    content_end = INTRO_DURATION_S + sum(segment.duration_s for segment in segments)
-    if any(block.start_s < INTRO_DURATION_S or block.window_end_s > content_end for block in blocks):
-        raise ValueError("voice blocks must stay between second 10 and the locked outro")
+    content_end = intro_duration + sum(segment.duration_s for segment in segments)
+    if any(block.start_s < intro_duration or block.window_end_s > content_end for block in blocks):
+        raise ValueError("voice blocks must stay within the narrated story content")
 
     return AgentBuildSpec(
         source_path=source_path, title=title,
@@ -455,6 +469,7 @@ def parse(payload: dict[str, Any] | str | Path) -> AgentBuildSpec:
         voice=VoiceSpec(script=script, wav=wav,
                         voice=str(voice_raw.get("voice", "am_michael")), blocks=blocks),
         repository=repository,
+        opening=opening,
         structure=structure,
         simulator_footage_ratio_min=simulator_ratio_min,
         climax_segment=climax_segment,
@@ -717,7 +732,7 @@ def preflight(spec: AgentBuildSpec, *, require_captures: bool = True) -> dict[st
     media: dict[str, dict[str, Any]] = {}
     ranges: list[dict[str, Any]] = []
     for segment in spec.segments:
-        if segment.kind != "clip" or segment.source is None:
+        if segment.source is None:
             continue
         source = _resolve(spec, segment.source)
         if not source.exists():
@@ -921,28 +936,45 @@ def render_locked_intro(out_dir: Path, profile: RenderProfile,
 
 
 def _make_overlay(segment: Segment, out_path: Path,
-                  profile: RenderProfile) -> Path | None:
-    if segment.overlay is None and not segment.replay_label and not segment.claim_boundary:
+                  profile: RenderProfile, *, disclosure: bool = False,
+                  omnisim_brand: bool = False) -> Path | None:
+    if segment.overlay is None and not segment.replay_label and not segment.claim_boundary and not disclosure:
         return None
     image = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
+    ink = (246, 244, 239) if omnisim_brand else INK
+    panel = (10, 10, 6) if omnisim_brand else (10, 15, 21)
+    soft = (250, 246, 164)
+    def face(size: int, weight: str = "regular") -> ImageFont.FreeTypeFont:
+        brand_font = REPO_ROOT / "resources/branding/omnisim/fonts/SpaceGrotesk.ttf"
+        if omnisim_brand and brand_font.exists():
+            result = ImageFont.truetype(str(brand_font), size)
+            result.set_variation_by_axes([{"regular": 400, "semi": 600, "bold": 700}[weight]])
+            return result
+        return _font(size, weight)
+    if disclosure:
+        draw.rounded_rectangle((SAFE, H - SAFE - 48, 1070, H - SAFE), radius=12,
+                               fill=(*panel, 220))
+        draw.text((SAFE + 20, H - SAFE - 37),
+                  "AI-produced under human monitoring  /  OmniSim simulation",
+                  font=face(24, "semi"), fill=ink)
     if segment.overlay:
-        accent = _accent(segment.overlay.accent)
+        accent = soft if omnisim_brand else _accent(segment.overlay.accent)
         width, height = 720, 118
         x, y = W - SAFE - width, SAFE
         draw.rounded_rectangle((x + 8, y + 10, x + width, y + height), radius=17, fill=(0, 0, 0, 115))
         draw.rounded_rectangle((x, y, x + width - 14, y + 102), radius=16,
-                               fill=(10, 15, 21, 239), outline=(255, 255, 255, 30), width=2)
+                               fill=(*panel, 239), outline=(*ink, 30), width=2)
         draw.rounded_rectangle((x, y + 18, x + 5, y + 84), radius=3, fill=(*accent, 245))
-        draw.text((x + 29, y + 18), segment.overlay.eyebrow.upper(), font=_font(18, "semi"), fill=accent)
-        draw.text((x + 29, y + 50), segment.overlay.headline, font=_font(27, "bold"), fill=INK)
+        draw.text((x + 29, y + 18), segment.overlay.eyebrow.upper(), font=face(18, "semi"), fill=accent)
+        draw.text((x + 29, y + 50), segment.overlay.headline, font=face(27, "bold"), fill=ink)
     if segment.replay_label:
-        draw.text((W // 2, SAFE), segment.replay_label.upper(), font=_font(17, "semi"), fill=INK, anchor="ma")
+        draw.text((W // 2, SAFE), segment.replay_label.upper(), font=face(17, "semi"), fill=ink, anchor="ma")
     if segment.claim_boundary:
         draw.rounded_rectangle((SAFE, H - SAFE - 58, W - SAFE, H - SAFE), radius=13,
-                               fill=(10, 15, 21, 232), outline=RED, width=2)
+                               fill=(*panel, 232), outline=(66, 65, 51) if omnisim_brand else RED, width=2)
         draw.text((W // 2, H - SAFE - 29), segment.claim_boundary.upper(),
-                  font=_font(18, "semi"), fill=INK, anchor="mm")
+                  font=face(18, "semi"), fill=ink, anchor="mm")
     if (profile.width, profile.height) != (W, H):
         image = image.resize((profile.width, profile.height), Image.Resampling.LANCZOS)
     image.save(out_path)
@@ -956,20 +988,29 @@ def _render_clip(spec: AgentBuildSpec, segment: Segment, index: int, out_dir: Pa
     if not source.exists():
         raise FileNotFoundError(f"capture is missing for segment {segment.id}: {source}")
     output = out_dir / f"{index:03d}_{segment.id}.mp4"
+    brand_font = REPO_ROOT / "resources/branding/omnisim/fonts/SpaceGrotesk.ttf"
     key = cache.key("clip", {"source_sha256": _sha256(source),
-                             "segment": asdict(segment)})
+                             "segment": asdict(segment), "opening": spec.opening,
+                             "action_brand_version": 2 if spec.opening == "action" else None,
+                             "action_font_sha256": _sha256(brand_font)
+                             if spec.opening == "action" and brand_font.exists() else None})
     label = f"segment:{index:03d}:{segment.id}"
     if cache.hit(label, key, output):
         return output
     overlay = _make_overlay(
         segment, out_dir / f"{index:03d}_{segment.id}_overlay.png", profile,
+        disclosure=(spec.opening == "action" and index == 1),
+        omnisim_brand=spec.opening == "action",
     )
     tail_filter = (f"tpad=stop_mode=clone:stop_duration={segment.source_tail_hold_s:.3f},"
                    if segment.source_tail_hold_s > 0 else "")
     base_filter = tail_filter + (
         f"scale={profile.width}:{profile.height}:force_original_aspect_ratio=increase:flags=lanczos,"
         f"crop={profile.width}:{profile.height},"
-        "eq=contrast=1.025:saturation=0.94:gamma=0.99,format=yuv420p"
+        # Action edits carry a finished photographic grade and exact brand
+        # colors in their source graphics. Do not cool or desaturate them twice.
+        + ("setsar=1,format=yuv420p" if spec.opening == "action" else
+           "eq=contrast=1.025:saturation=0.94:gamma=0.99,format=yuv420p")
     )
     command = [
         _ffmpeg(), "-y", "-hide_banner", "-loglevel", "error",
@@ -1040,36 +1081,8 @@ def _render_plate(segment: Segment, index: int, out_dir: Path,
     return output
 
 
-def render_locked_outro(out_dir: Path, profile: RenderProfile,
-                        cache: ArtifactCache) -> Path:
-    def painter(_progress: float) -> Image.Image:
-        image = _plate_base().convert("RGBA")
-        glow = Image.new("RGBA", (PW, PH), (0, 0, 0, 0))
-        gd = ImageDraw.Draw(glow)
-        gd.ellipse((390, 36, 890, 536), fill=(*CYAN, 20))
-        image = Image.alpha_composite(image, glow.filter(ImageFilter.GaussianBlur(90)))
-        draw = ImageDraw.Draw(image)
-        draw.ellipse((574, 108, 706, 240), fill=(0, 0, 0), outline=(255, 255, 255, 34), width=2)
-        orb = Image.open(ORB).convert("RGBA").resize((108, 108), Image.Resampling.LANCZOS)
-        image.paste(orb, (586, 120), orb)
-        draw = ImageDraw.Draw(image)
-        _centered(draw, (PW // 2, 300), "OMNISIM", _font(60, "bold"), INK)
-        _centered(draw, (PW // 2, 369), "FROM EDIT TO EVIDENCE", _font(24, "semi"), CYAN)
-        draw.line((500, 430, 780, 430), fill=CYAN, width=3)
-        _centered(draw, (PW // 2, 490), GITHUB_DESTINATION, _font(21, "semi"), INK)
-        return image.convert("RGB")
-    output = out_dir / "locked_outro.mp4"
-    key = cache.key("locked_outro", {
-        "destination": GITHUB_DESTINATION, "duration_s": OUTRO_DURATION_S,
-    })
-    if not cache.hit("locked_outro", key, output):
-        _render_raw_frames(output, OUTRO_DURATION_S, painter, profile)
-        cache.store("locked_outro", key, output)
-    return output
-
-
 def build_edl(spec: AgentBuildSpec) -> dict[str, Any]:
-    """Return the complete direct-cut edit plan, including locked bookends."""
+    """Return the complete direct-cut edit plan, including the locked intro."""
     entries: list[dict[str, Any]] = [
         {"index": 1, "id": "disclaimer", "beat": "intro", "master_in_s": 0.0,
          "master_out_s": 5.0, "duration_s": 5.0,
@@ -1080,16 +1093,18 @@ def build_edl(spec: AgentBuildSpec) -> dict[str, Any]:
          "source": "MOTION_GRAPHIC:story_intro", "purpose": "Silent Agent Build story signature.",
          "transition": "direct_cut"},
     ]
-    cursor = INTRO_DURATION_S
+    if spec.opening == "action":
+        entries = []
+    cursor = spec.intro_duration_s
     for segment in spec.segments:
-        source = (f"MOTION_GRAPHIC:{segment.id}" if segment.kind == "plate" else segment.source)
+        source = segment.source or f"MOTION_GRAPHIC:{segment.id}"
         entries.append({
             "index": len(entries) + 1, "id": segment.id, "beat": segment.beat,
             "act": segment.act or None,
             "master_in_s": round(cursor, 3), "master_out_s": round(cursor + segment.duration_s, 3),
             "duration_s": segment.duration_s, "source": source,
-            "source_in_s": segment.source_in_s if segment.kind == "clip" else None,
-            "source_out_s": (segment.source_in_s + segment.duration_s if segment.kind == "clip" else None),
+            "source_in_s": segment.source_in_s if segment.source is not None else None,
+            "source_out_s": (segment.source_in_s + segment.duration_s if segment.source is not None else None),
             "source_tail_hold_s": (segment.source_tail_hold_s
                                    if segment.kind == "clip" else None),
             "purpose": segment.purpose, "transition": "direct_cut",
@@ -1097,12 +1112,6 @@ def build_edl(spec: AgentBuildSpec) -> dict[str, Any]:
             "claim_boundary": segment.claim_boundary,
         })
         cursor += segment.duration_s
-    entries.append({
-        "index": len(entries) + 1, "id": "outro", "beat": "outro",
-        "master_in_s": round(cursor, 3), "master_out_s": round(cursor + OUTRO_DURATION_S, 3),
-        "duration_s": OUTRO_DURATION_S, "source": "MOTION_GRAPHIC:locked_outro",
-        "purpose": "Locked GitHub-only OmniSim end slate.", "transition": "direct_cut",
-    })
     return {
         "version": 1, "style": STYLE_VERSION, "master_duration_s": spec.duration_s,
         "cuts_reviewed": len(entries) - 1, "transition_vocabulary": ["direct_cut"],
@@ -1122,12 +1131,20 @@ def _write_edl(spec: AgentBuildSpec, out_dir: Path) -> tuple[Path, list[dict[str
 
 def _concat(clips: list[Path], output: Path, profile: RenderProfile,
             cache: ArtifactCache, expected_duration_s: float) -> Path:
-    key = cache.key("picture", [{"path": str(path), "sha256": _sha256(path)}
-                                for path in clips])
+    key = cache.key("picture", {
+        "timing_version": 2,
+        "clips": [{"path": str(path), "sha256": _sha256(path)} for path in clips],
+    })
     if cache.hit("picture", key, output):
         return output
     listing = output.with_suffix(".txt")
-    listing.write_text("".join(f"file '{clip.resolve().as_posix()}'\n" for clip in clips), encoding="utf-8")
+    # MP4 container durations can be rounded to milliseconds. Letting concat
+    # infer those durations shifts every subsequent cut off the frame grid.
+    listing.write_text("".join(
+        f"file '{clip.resolve().as_posix()}'\n"
+        f"duration {probe_media(clip)['frames'] / profile.fps:.9f}\n"
+        for clip in clips
+    ), encoding="utf-8")
     partial = output.with_name(output.stem + ".partial" + output.suffix)
     # Every part is normalized to the same H.264 profile, geometry, and CFR.
     # A packet-level concat makes revisions nearly instant.  If a platform's
@@ -1139,9 +1156,9 @@ def _concat(clips: list[Path], output: Path, profile: RenderProfile,
     try:
         facts = probe_media(partial)
         duration_ok = abs(facts["duration_s"] - expected_duration_s) <= 1.1 / profile.fps
-        frames_ok = not facts["frames"] or abs(facts["frames"] - expected_frames) <= 1
+        frames_ok = facts["frames"] == expected_frames
         geometry_ok = (facts["width"], facts["height"]) == (profile.width, profile.height)
-        rate_ok = abs(facts["fps"] - profile.fps) < 0.01
+        rate_ok = abs(facts["fps"] - profile.fps) < 1e-9
     except Exception:
         duration_ok = frames_ok = geometry_ok = rate_ok = False
     if not all((duration_ok, frames_ok, geometry_ok, rate_ok)):
@@ -1164,6 +1181,8 @@ def _generate_score(spec: AgentBuildSpec, output: Path, cache: ArtifactCache,
                     sample_rate: int = 48000) -> Path:
     key = cache.key("score", {
         "duration_s": spec.duration_s,
+        "opening": spec.opening,
+        "action_score_version": 1,
         "segments": [{"id": segment.id, "duration_s": segment.duration_s}
                      for segment in spec.segments],
         "sample_rate": sample_rate,
@@ -1173,7 +1192,7 @@ def _generate_score(spec: AgentBuildSpec, output: Path, cache: ArtifactCache,
     t = np.arange(int(spec.duration_s * sample_rate), dtype=np.float64) / sample_rate
     score = np.zeros_like(t)
     cues = [0.0]
-    cursor = INTRO_DURATION_S
+    cursor = spec.intro_duration_s
     for segment in spec.segments:
         cues.append(cursor)
         cursor += segment.duration_s
@@ -1187,6 +1206,32 @@ def _generate_score(spec: AgentBuildSpec, output: Path, cache: ArtifactCache,
         pad = sum(np.sin(2 * np.pi * frequency * local + phase * 0.75)
                   for phase, frequency in enumerate(chords[index % len(chords)])) / 3.0
         score[mask] += env * pad * 0.020
+    if spec.opening == "action":
+        # Original, locally synthesized score: restrained harmonic bed and
+        # pulse, with more movement during the uninterrupted decisive run.
+        # Speech remains dominant through the mix's side-chain ducking.
+        score = np.zeros_like(t)
+        progression = [(130.81, 155.56, 196.0), (103.83, 130.81, 155.56),
+                       (116.54, 146.83, 174.61), (98.0, 130.81, 155.56)]
+        beat = 60.0 / 86.0
+        climax_start = sum(s.duration_s for s in spec.segments[:next(
+            (i for i, s in enumerate(spec.segments) if s.id == spec.climax_segment), 0)])
+        for bar_start in np.arange(0.0, spec.duration_s, beat * 8):
+            chord = progression[int(bar_start / (beat * 8)) % len(progression)]
+            mask = (t >= bar_start) & (t < bar_start + beat * 8 + 1.5)
+            local = t[mask] - bar_start
+            env = np.minimum(1.0, local / .8) * np.clip((beat * 8 + 1.5 - local) / 1.6, 0, 1)
+            score[mask] += .07 * env * sum(np.sin(2*np.pi*f*local) for f in chord) / 3
+        for n, onset in enumerate(np.arange(0.0, spec.duration_s, beat)):
+            mask = (t >= onset) & (t < onset + 1.2)
+            local = t[mask] - onset
+            chord = progression[int(onset / (beat * 8)) % len(progression)]
+            frequency = chord[n % 3] * (2 if n % 2 else 1)
+            strength = .055 if climax_start <= onset < spec.duration_s - 10 else .027
+            score[mask] += strength * (1 - np.exp(-local*180)) * np.exp(-local*5.5) * np.sin(2*np.pi*frequency*local)
+            if n % 2 == 0:
+                score[mask] += .035 * np.exp(-local*16) * np.sin(2*np.pi*(48*local + 9*(1-np.exp(-local*18))))
+        score *= np.clip((spec.duration_s - t) / 2.2, 0, 1)
     stereo = np.stack([score, np.roll(score, 1100) * 0.92], axis=1)
     pcm = (np.clip(stereo, -0.15, 0.15) * 32767).astype("<i2")
     with wave.open(str(output), "wb") as wav:
@@ -1198,14 +1243,14 @@ def _generate_score(spec: AgentBuildSpec, output: Path, cache: ArtifactCache,
     return output
 
 
-def _verify_voice_silence(path: Path) -> None:
+def _verify_voice_silence(path: Path, intro_duration_s: float = INTRO_DURATION_S) -> None:
     with wave.open(str(path), "rb") as wav:
         sample_rate = wav.getframerate()
         channels = wav.getnchannels()
         width = wav.getsampwidth()
         if width not in (2, 3, 4):
             raise ValueError("narration WAV must use integer PCM")
-        prefix = wav.readframes(round(INTRO_DURATION_S * sample_rate))
+        prefix = wav.readframes(round(intro_duration_s * sample_rate))
     if any(prefix):
         raise ValueError("narration WAV contains voice/sample activity during the locked 0–10 second intro")
     if channels != 1:
@@ -1214,22 +1259,23 @@ def _verify_voice_silence(path: Path) -> None:
 
 def _mix(spec: AgentBuildSpec, picture: Path, voice: Path, score: Path, output: Path,
          profile: RenderProfile, cache: ArtifactCache) -> Path:
-    _verify_voice_silence(voice)
+    _verify_voice_silence(voice, spec.intro_duration_s)
     key = cache.key("master_mix", {
         "picture_sha256": _sha256(picture), "voice_sha256": _sha256(voice),
         "score_sha256": _sha256(score), "intro_score_gain": INTRO_SCORE_GAIN,
         "story_score_gain": STORY_SCORE_GAIN, "intro_master_gain": INTRO_MASTER_GAIN,
+        "intro_duration_s": spec.intro_duration_s,
     })
     if cache.hit("master_mix", key, output):
         return output
     audio_filter = (
         "[1:a]highpass=f=65,lowpass=f=15500,acompressor=threshold=0.14:ratio=1.65:attack=25:release=300,"
         "volume=1.05,asplit=2[voice_sc][voice_mix];"
-        f"[2:a]volume='if(lt(t,{INTRO_DURATION_S:g}),{INTRO_SCORE_GAIN:.3f},"
+        f"[2:a]volume='if(lt(t,{spec.intro_duration_s:g}),{INTRO_SCORE_GAIN:.3f},"
         f"{STORY_SCORE_GAIN:.3f})':eval=frame[bed];"
         "[bed][voice_sc]sidechaincompress=threshold=0.020:ratio=7:attack=18:release=560[duck];"
         "[duck][voice_mix]amix=inputs=2:duration=longest:normalize=0,"
-        f"loudnorm=I=-15:TP=-1.5:LRA=8,volume='if(lt(t,{INTRO_DURATION_S:g}),"
+        f"loudnorm=I=-15:TP=-1.5:LRA=8,volume='if(lt(t,{spec.intro_duration_s:g}),"
         f"{INTRO_MASTER_GAIN:.3f},1.0)':eval=frame[aout]"
     )
     _run([
@@ -1257,15 +1303,15 @@ def render(spec: AgentBuildSpec, out_dir: Path | None = None, *,
     parts = out_dir / "parts"
     parts.mkdir(parents=True, exist_ok=True)
     cache = ArtifactCache(out_dir, profile)
-    disclosure, signature = render_locked_intro(parts, profile, cache)
-    clips = [disclosure, signature]
+    clips = list(render_locked_intro(parts, profile, cache)) if spec.opening == "signature" else []
     provenance_sources: list[dict[str, Any]] = []
     for index, segment in enumerate(spec.segments, 1):
-        if segment.kind == "clip":
+        if segment.kind == "clip" or segment.source is not None:
             rendered = _render_clip(spec, segment, index, parts, profile, cache)
             source = _resolve(spec, segment.source or "")
             provenance_sources.append({
                 "segment": segment.id, "source": str(source), "sha256": _sha256(source),
+                "kind": segment.kind,
                 "source_in_s": segment.source_in_s,
                 "source_out_s": segment.source_in_s + segment.duration_s,
                 "source_tail_hold_s": segment.source_tail_hold_s,
@@ -1273,8 +1319,6 @@ def render(spec: AgentBuildSpec, out_dir: Path | None = None, *,
         else:
             rendered = _render_plate(segment, index, parts, profile, cache)
         clips.append(rendered)
-    clips.append(render_locked_outro(parts, profile, cache))
-
     edl_path, _ = _write_edl(spec, out_dir)
     provenance_path = out_dir / "capture_provenance.json"
     evidence_records: list[dict[str, str]] = []
@@ -1324,10 +1368,13 @@ def render(spec: AgentBuildSpec, out_dir: Path | None = None, *,
         "version": 1, "style": STYLE_VERSION, "master_duration_s": spec.duration_s,
         "profile": asdict(profile),
         "video_frames": round(spec.duration_s * profile.fps),
-        "opening_contract": {
+        "opening_contract": ({
             "disclosure": [0.0, 5.0], "story_signature": [5.0, 10.0],
             "first_build_footage_s": 10.0, "voiceover_present_during_intro": False,
-        },
+        } if spec.opening == "signature" else {
+            "opening": "action", "first_build_footage_s": 0.0,
+            "disclosure": "Overlay on the first simulator shot", "story_signature": None,
+        }),
         "artifacts": {name: {"path": str(path), "sha256": _sha256(path)}
                       for name, path in artifacts.items()},
     }, indent=2) + "\n", encoding="utf-8")
@@ -1351,22 +1398,29 @@ def verify(spec: AgentBuildSpec, out_dir: Path | None = None) -> dict[str, Any]:
         ("disclaimer", "MOTION_GRAPHIC:disclaimer", 0.0, 5.0),
         ("story_intro", "MOTION_GRAPHIC:story_intro", 5.0, 10.0),
     ]
+    if spec.opening == "action":
+        expected = []
     for index, (clip_id, source, start, end) in enumerate(expected):
         entry = entries[index]
         if (entry.get("id"), entry.get("source"), float(entry.get("master_in_s")),
                 float(entry.get("master_out_s"))) != (clip_id, source, start, end):
             raise AssertionError(f"locked opening contract drifted at {clip_id}")
-    if entries[2].get("id") != spec.segments[0].id or float(entries[2]["master_in_s"]) != 10.0:
-        raise AssertionError("real build footage does not begin exactly at second 10")
-    if entries[-1].get("source") != "MOTION_GRAPHIC:locked_outro":
-        raise AssertionError("locked GitHub outro is missing")
+    first = entries[len(expected)]
+    if first.get("id") != spec.segments[0].id or float(first["master_in_s"]) != spec.intro_duration_s:
+        raise AssertionError("real build footage does not begin at the declared story start")
+    if any(entry.get("id") == "outro" or entry.get("source") == "MOTION_GRAPHIC:locked_outro"
+           for entry in entries):
+        raise AssertionError("Agent Build masters must not contain an outro")
+    if (entries[-1].get("id") != spec.segments[-1].id
+            or abs(float(entries[-1]["master_out_s"]) - spec.duration_s) > 0.001):
+        raise AssertionError("the final story segment must end the master")
 
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     for record in receipt.get("artifacts", {}).values():
         path = Path(record["path"])
         if not path.exists() or _sha256(path) != record["sha256"]:
             raise AssertionError(f"receipt-bound artifact changed: {path}")
-    _verify_voice_silence(_resolve(spec, spec.voice.wav))
+    _verify_voice_silence(_resolve(spec, spec.voice.wav), spec.intro_duration_s)
 
     probe = json.loads(subprocess.run([
         _ffprobe(), "-v", "error", "-show_entries",
@@ -1392,10 +1446,12 @@ def verify(spec: AgentBuildSpec, out_dir: Path | None = None) -> dict[str, Any]:
     report = {
         "approved": True, "style": STYLE_VERSION, "master": str(master),
         "master_sha256": _sha256(master), "duration_s": spec.duration_s,
-        "frames": round(spec.duration_s * FPS), "intro_voiceover": False,
-        "disclosure_s": [0.0, 5.0], "story_signature_s": [5.0, 10.0],
-        "first_build_footage_s": 10.0, "subtitle_streams": 0,
-        "cuts": len(entries) - 1,
+        "frames": round(spec.duration_s * FPS), "intro_voiceover": spec.opening == "action",
+        "opening": spec.opening,
+        "disclosure_s": [0.0, 5.0] if spec.opening == "signature" else [0.0, spec.segments[0].duration_s],
+        "story_signature_s": [5.0, 10.0] if spec.opening == "signature" else None,
+        "first_build_footage_s": spec.intro_duration_s, "subtitle_streams": 0,
+        "cuts": len(entries) - 1, "outro": False,
     }
     (out_dir / "verification.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     return report

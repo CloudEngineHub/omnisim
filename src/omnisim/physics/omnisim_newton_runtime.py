@@ -123,6 +123,71 @@ _LAUNCH_DBG = _os.environ.get("OMNISIM_DEBUG_LAUNCH")
 # Probe 6 (mini-husky) drove 4.05 m / 5 s = 98%; probe 7 (real husky URDF
 # geometry) drove 4.04 m / 10 s = 97.8% with this exact config.
 
+def _fast_find_shape_contact_pairs(builder, model, *, allow_filter_blocks, orig, static_bodies=()):
+    """Vectorised stand-in for newton's ModelBuilder._find_shape_contact_pairs.
+
+    newton 1.5.0 enumerates every colliding shape pair in a Python double
+    loop (builder.py, the general path): for 5002 shapes that is 12.5 M
+    iterations, which is where a 5000-static world sat silent past the
+    30 s headless ceiling on 2026-09-07. SolverMuJoCo never reads the list
+    (mj_step runs MuJoCo's own broadphase); model.collide() -- the contact
+    readback FALLBACK and the cloth coupling -- does.
+
+    Same pairs as the original for what can ever touch, computed with
+    numpy: dynamic x dynamic, dynamic x static. Pairs of two immovable
+    shapes (both on the world body, or on bodies in `static_bodies` --
+    the welded statics and the mocap kinematics) are the only ones
+    dropped: neither side responds, so no contact between them is
+    reported by newton's narrow phase in any path this engine reads.
+    Collision groups follow newton's test_group_pair exactly; any shape
+    with a non-global world (replicated builders) or an empty model falls
+    back to the original method untouched.
+    OMNISIM_NEWTON_FAST_PAIRS=0 (value-parsed) skips the stand-in.
+    """
+    import numpy as np
+    n = len(builder.shape_type)
+    if n == 0:
+        return orig(model, allow_filter_blocks=allow_filter_blocks)
+    try:
+        import newton._src.sim.builder as _nb
+        collide_flag = int(_nb.ShapeFlags.COLLIDE_SHAPES)
+    except Exception:
+        collide_flag = int(getattr(newton, "ShapeFlags").COLLIDE_SHAPES)
+    flags = np.asarray(builder.shape_flags, dtype=np.int64)
+    colliding = np.flatnonzero((flags & collide_flag) != 0)
+    world = np.asarray(builder.shape_world, dtype=np.int64)[colliding]
+    # One world (every shape global, or all in the same world) is the engine's
+    # case and the only one this stand-in claims; replicated builders keep
+    # newton's exact path (cross-world pairs never collide there).
+    if np.unique(world[world >= 0]).shape[0] > 1:
+        return orig(model, allow_filter_blocks=allow_filter_blocks)
+    body = np.asarray(builder.shape_body, dtype=np.int64)[colliding]
+    group = np.asarray(builder.shape_collision_group, dtype=np.int64)[colliding]
+    static = body < 0
+    if len(static_bodies):
+        static |= np.isin(body, np.asarray(list(static_bodies), dtype=np.int64))
+    dyn, sta = colliding[~static], colliding[static]
+    gd, gs = group[~static], group[static]
+    iu, ju = np.triu_indices(dyn.shape[0], k=1)
+    a = np.concatenate([dyn[iu], np.repeat(dyn, sta.shape[0])])
+    b = np.concatenate([dyn[ju], np.tile(sta, dyn.shape[0])])
+    ga = np.concatenate([gd[iu], np.repeat(gd, sta.shape[0])])
+    gb = np.concatenate([gd[ju], np.tile(gs, dyn.shape[0])])
+    # newton's _test_group_pair: 0 never collides; a>0 needs a==b or b<0;
+    # a<0 needs a!=b (symmetric).
+    ok = (ga != 0) & (gb != 0)
+    ok &= np.where(ga > 0, (ga == gb) | (gb < 0), ga != gb)
+    a, b = a[ok], b[ok]
+    pairs = np.stack([np.minimum(a, b), np.maximum(a, b)], axis=1).astype(np.int32)
+    if pairs.shape[0] > 1:
+        pairs = pairs[np.lexsort((pairs[:, 1], pairs[:, 0]))]
+    if pairs.shape[0] > 0:
+        filtered = model.shape_collision_filter_mask(pairs)
+        pairs = pairs[~filtered]
+    model.shape_contact_pairs = wp.array(pairs, dtype=wp.vec2i, device=model.device)
+    model.shape_contact_pair_count = int(pairs.shape[0])
+
+
 class _ClampClean(Exception):
     """Internal: joints are all in range, skip the slow clamp path."""
 
@@ -237,6 +302,28 @@ class World:
         # recipe broke MuJoCo (which rejects mass<mjMINVAL moving bodies).
         # Collision against dynamic bodies still fires.
         self.static_body_indices = []
+        # World-body statics (2026-09-07). A PLAIN static collider -- no joint
+        # in its subtree, not a TouchSensor, no Connector / VacuumGripper, no
+        # cloth coupling; the ENGINE decides, OmSolid.cpp static site -- is
+        # not a Newton body at all: add_static_body(plain=1) records its pose
+        # here and every add_shape_* on it lands on newton body -1 (the world)
+        # at the composed world pose. The engine keeps addressing it by the
+        # opaque VIRTUAL index returned (>= _vid_base, never a Newton body
+        # index): contacts and raycasts answer it (the shape->body maps are
+        # overlaid), set_kinematic_pose re-places the geoms, and every other
+        # body-indexed verb declines cleanly.
+        # WHY. Measured on blocks_N.omniworld (N one-metre static boxes + one
+        # ball, 2026-09-07): with one MuJoCo body per static, N=2000 died in
+        # mj_broadphase ("mj_stackAlloc: out of memory" -- its pair buffer is
+        # nbody*(nbody-1)/2 ints, 8,012,004 bytes against a 14 MiB arena) and
+        # N=5000 registered at t+8.4 s and never finalised in 30 s, while the
+        # same N geoms on the world body compile in 0.17 s / 0.94 s in the
+        # bundled mujoco 3.11 (20000 in 14 s, 0.21 ms per step).
+        # OMNISIM_NEWTON_STATICS_ON_WORLD=0 (value-parsed) reverts to a welded
+        # body per static.
+        self._vid_base = 1 << 24
+        self._world_statics = {}   # vid -> {"xform": wp.transform, "shapes": [(shape, local xform)]}
+        self._shape_vid = {}       # newton shape index -> vid
         # Plane shapes requested on STATIC bodies are deferred to
         # finalize(): newton's MuJoCo converter raises "Planes can only
         # be attached to static bodies" for our weld-pinned statics, so
@@ -334,6 +421,8 @@ class World:
         non-zero value, AFTER that Solid has a newton body index and BEFORE
         finalize() builds the coupled solver. 0 (unset) never reaches here.
         """
+        if self._is_vid(body_index):   # world-body static: no Newton body to address
+            return -1
         try:
             b, m = int(body_index), int(mode)
         except (TypeError, ValueError):
@@ -852,7 +941,19 @@ class World:
         self.body_indices.append(idx)
         return idx
 
-    def add_static_body(self, x, y, z, qx=0.0, qy=0.0, qz=0.0, qw=1.0):
+    def add_static_body(self, x, y, z, qx=0.0, qy=0.0, qz=0.0, qw=1.0, plain=0):
+        # `plain` (2026-09-07): the engine vouches nothing will ever need this
+        # static as a BODY, so its shapes go on the world body instead (see
+        # _world_statics in __init__ for the measurement that forced this).
+        if int(plain) and self._statics_on_world_enabled():
+            self._ws()
+            vid = self._vid_base + len(self._ws())
+            self._ws()[vid] = {
+                "xform": wp.transform((float(x), float(y), float(z)),
+                                      (float(qx), float(qy), float(qz), float(qw))),
+                "shapes": [],
+            }
+            return vid
         # P8.1 statics-on-Newton. Newton treats mass=0 links as static
         # (xform pinned by the solver) but still tests their attached
         # shapes against dynamic-body shapes in the contact phase. The
@@ -876,6 +977,177 @@ class World:
         self.body_indices.append(idx)
         self.static_body_indices.append(idx)
         return idx
+
+    # ---- world-body statics: helpers (see _world_statics in __init__) ----
+    def _ws(self):
+        # The vid -> record map, created on first touch so a World built
+        # without __init__ (the collider-orientation unit test does
+        # World.__new__ and sets only `builder`) behaves like an empty one.
+        d = self.__dict__.get("_world_statics")
+        if d is None:
+            d = {}
+            self._world_statics = d
+            self._shape_vid = {}
+            self._vid_base = 1 << 24
+        return d
+
+    @staticmethod
+    def _statics_on_world_enabled():
+        # OMNISIM_NEWTON_STATICS_ON_WORLD: value-parsed; =0 reverts every plain
+        # static collider to one welded Newton body each (the pre-2026-09-07
+        # recipe, which overflowed MuJoCo's broadphase arena at ~2000 statics).
+        v = (_os.environ.get("OMNISIM_NEWTON_STATICS_ON_WORLD") or "").strip().lower()
+        return v not in ("0", "false", "off", "no")
+
+    def _is_vid(self, idx):
+        try:
+            return int(idx) in self._ws()
+        except (TypeError, ValueError):
+            return False
+
+    def _shape_target(self, body_idx, cx, cy, cz, qx=0.0, qy=0.0, qz=0.0, qw=1.0):
+        # (newton body, xform to hand the builder, the collider's LOCAL xform).
+        # A real body keeps its local offset; a world-body static composes
+        # the offset onto the recorded static pose and targets body -1.
+        local = wp.transform((float(cx), float(cy), float(cz)),
+                             (float(qx), float(qy), float(qz), float(qw)))
+        b = int(body_idx)
+        ws = self._ws().get(b)
+        if ws is None:
+            return b, local, local
+        return -1, wp.transform_multiply(ws["xform"], local), local
+
+    def _note_shape(self, body_idx, shape_idx, local_xf):
+        # Remember which world shapes a virtual static owns, so contacts and
+        # raycasts can name it and set_kinematic_pose can move it.
+        ws = self._ws().get(int(body_idx))
+        if ws is not None and shape_idx is not None and int(shape_idx) >= 0:
+            ws["shapes"].append((int(shape_idx), local_xf))
+            self._shape_vid[int(shape_idx)] = int(body_idx)
+        return shape_idx
+
+    def _builder_add(self, body, fn, with_body=True, **kw):
+        # newton's ModelBuilder.add_shape (builder.py) walks EVERY earlier
+        # shape on the same body to add a same-body collision filter pair.
+        # For body -1 that is every world-body static registered so far:
+        # quadratic registration (5000 statics: 0.7 s -> 6.9 s in-engine on
+        # 2026-09-07) and 12.5 M filter pairs that finalize then has to
+        # pack. Two immovable shapes never need a filter -- the vectorised
+        # pair enumeration never emits a world-world pair -- so hide the
+        # sibling list for the duration of the call and re-attach it after.
+        if int(body) != -1:
+            return fn(int(body), **kw) if with_body else fn(**kw)
+        bs = self.builder.body_shapes
+        saved = bs.get(-1)
+        bs[-1] = []
+        try:
+            out = fn(-1, **kw) if with_body else fn(**kw)
+        finally:
+            added = bs[-1]
+            bs[-1] = saved if saved is not None else []
+            bs[-1].extend(added)
+        return out
+
+    def _overlay_world_statics(self, shape_body):
+        # shape->body map with each world-body static's shapes answering its
+        # virtual index instead of -1, so the C++ contact / raycast unpack
+        # finds the Solid exactly as it did when the static was a body.
+        import numpy as _np
+        out = _np.array(shape_body, dtype=_np.int64, copy=True)
+        self._ws()
+        for _s, _v in self._shape_vid.items():
+            if 0 <= _s < out.shape[0]:
+                out[_s] = _v
+        return out
+
+    def _move_world_static(self, vid, ws, x, y, z, qx, qy, qz, qw):
+        # A field write moved a PLAIN static after finalize. Its geoms live
+        # on the world body, so re-place each one: newton's shape_transform
+        # (what raycast maps and any notify path read) and MuJoCo's
+        # geom_pos / geom_quat, which mj_kinematics turns into the world-body
+        # geom's xpos at the start of the NEXT step -- the same latency as a
+        # mocap write. Mesh geoms carry MuJoCo's mesh recentring offset
+        # (mesh_pos / mesh_quat), composed here exactly as the compiler did.
+        # Returns 0, or -1 before the solver is up.
+        new_xf = wp.transform((float(x), float(y), float(z)),
+                              (float(qx), float(qy), float(qz), float(qw)))
+        ws["xform"] = new_xf
+        sv = self._mjc_solver()
+        if sv is None or self.model is None or not ws["shapes"]:
+            return 0 if sv is None and self.model is None else (-1 if sv is None else 0)
+        import numpy as _np
+        try:
+            import mujoco as _mj
+        except Exception:
+            return -1
+        m = getattr(sv, "mj_model", None)
+        if m is None:
+            return -1
+        st = self.model.shape_transform.numpy()
+        # shape -> geom: the inverse of the geom -> shape map the raycast /
+        # contact readback already relies on (newton_shape_to_mjc_geom is
+        # not populated on the CPU mj_step path -- measured 2026-09-07).
+        s2g = getattr(self, "_shape_to_geom_np", None)
+        if s2g is None:
+            import numpy as _np2
+            try:
+                g2s = sv.mjc_geom_to_newton_shape.numpy()[0]
+                s2g = _np2.full(int(self.model.shape_count), -1, dtype=_np2.int64)
+                for _g, _sh in enumerate(g2s.tolist()):
+                    if 0 <= int(_sh) < s2g.shape[0]:
+                        s2g[int(_sh)] = _g
+            except Exception:
+                s2g = None
+            self._shape_to_geom_np = s2g
+        cpu = bool(getattr(sv, "use_mujoco_cpu", False))
+        mw = getattr(sv, "mjw_model", None)
+        gp_w = gq_w = None
+        if not cpu and mw is not None:
+            try:
+                gp_w = mw.geom_pos.numpy()
+                gq_w = mw.geom_quat.numpy()
+            except Exception:
+                gp_w = gq_w = None
+        mesh_type = int(_mj.mjtGeom.mjGEOM_MESH)
+        for _s, _local in ws["shapes"]:
+            w = wp.transform_multiply(new_xf, _local)
+            p, q = w.p, w.q
+            st[_s] = (float(p[0]), float(p[1]), float(p[2]),
+                      float(q[0]), float(q[1]), float(q[2]), float(q[3]))
+            if s2g is None or _s >= s2g.shape[0]:
+                continue
+            g = int(s2g[_s])
+            if g < 0 or g >= int(m.ngeom):
+                continue
+            gp = _np.array([p[0], p[1], p[2]], dtype=_np.float64)
+            gq = _np.array([q[3], q[0], q[1], q[2]], dtype=_np.float64)   # MUJOCO WXYZ
+            if int(m.geom_type[g]) == mesh_type:
+                mid = int(m.geom_dataid[g])
+                if 0 <= mid < int(m.nmesh):
+                    rp = _np.zeros(3)
+                    _mj.mju_rotVecQuat(rp, _np.asarray(m.mesh_pos[mid], dtype=_np.float64), gq)
+                    rq = _np.zeros(4)
+                    _mj.mju_mulQuat(rq, gq, _np.asarray(m.mesh_quat[mid], dtype=_np.float64))
+                    gp = gp + rp
+                    gq = rq
+            if cpu:
+                m.geom_pos[g] = gp
+                m.geom_quat[g] = gq
+            elif gp_w is not None:
+                gp_w[0, g] = gp
+                gq_w[0, g] = gq
+        try:
+            self.model.shape_transform.assign(st)
+        except Exception:
+            pass
+        if not cpu and gp_w is not None:
+            try:
+                mw.geom_pos.assign(gp_w)
+                mw.geom_quat.assign(gq_w)
+                sv._sync_worldbody_geom_xposes()
+            except Exception:
+                return -1
+        return 0
 
     def add_kinematic_body(self, x, y, z, qx=0.0, qy=0.0, qz=0.0, qw=1.0):
         # Kernel blocker #4 (_scratch/design_kinematic_inertia.md Part 1):
@@ -933,6 +1205,9 @@ class World:
         # direct write in this runtime (weld_engage, touch_force).
         # Returns 0 on success, -1 when the body is unknown / not a mocap
         # (fixed-root) body / the solver is not up yet.
+        _ws = self._ws().get(int(body_idx))
+        if _ws is not None:
+            return self._move_world_static(int(body_idx), _ws, x, y, z, qx, qy, qz, qw)
         sv = self._mjc_solver()
         if sv is None:
             return -1
@@ -1116,6 +1391,8 @@ class World:
 
     def set_body_gravcomp(self, body_idx, value):
         """Fraction of gravity cancelled on one body. 0 = normal, 1 = hovers."""
+        if self._is_vid(body_idx):   # world-body static: no Newton body to address
+            return -1
         try:
             v = float(value)
         except (TypeError, ValueError):
@@ -1133,13 +1410,12 @@ class World:
 
     def add_shape_sphere(self, body_idx, radius, cx=0.0, cy=0.0, cz=0.0, mu=-1.0,
                          mu_t=-1.0, mu_r=-1.0):
-        return self.builder.add_shape_sphere(
-            int(body_idx),
-            xform=wp.transform((float(cx), float(cy), float(cz)),
-                               (0.0, 0.0, 0.0, 1.0)),
+        _b, _xf, _loc = self._shape_target(body_idx, cx, cy, cz)
+        return self._note_shape(body_idx, self._builder_add(_b, self.builder.add_shape_sphere,
+                        xform=_xf,
             radius=float(radius),
             cfg=self._shape_cfg_override(mu=mu, mu_t=mu_t, mu_r=mu_r),
-        )
+        ), _loc)
 
     def add_shape_box(self, body_idx, hx, hy, hz, cx=0.0, cy=0.0, cz=0.0, ke=-1.0,
                       qx=0.0, qy=0.0, qz=0.0, qw=1.0, mu=-1.0, mu_t=-1.0, mu_r=-1.0):
@@ -1150,13 +1426,12 @@ class World:
         # compliant contact; used for tote/bin CONTENTS so a gripper plowing the
         # layer can't inject launch energy) and/or per-shape friction.
         cfg = self._shape_cfg_override(ke=ke, mu=mu, mu_t=mu_t, mu_r=mu_r)
-        return self.builder.add_shape_box(
-            int(body_idx),
-            xform=wp.transform((float(cx), float(cy), float(cz)),
-                               (float(qx), float(qy), float(qz), float(qw))),
+        _b, _xf, _loc = self._shape_target(body_idx, cx, cy, cz, qx, qy, qz, qw)
+        return self._note_shape(body_idx, self._builder_add(_b, self.builder.add_shape_box,
+                        xform=_xf,
             hx=float(hx), hy=float(hy), hz=float(hz),
             cfg=cfg,
-        )
+        ), _loc)
 
     def add_shape_cylinder(self, body_idx, radius, half_height, cx=0.0, cy=0.0, cz=0.0,
                            qx=0.0, qy=0.0, qz=0.0, qw=1.0):
@@ -1173,10 +1448,10 @@ class World:
         if _os.environ.get("OMNISIM_NEWTON_CYLINDER_AS_SPHERE"):
             # Revert lever (matches OMNISIM_NEWTON_MESH_TO_ODE): the pre-W1.2 point-contact sphere, kept so
             # the capsule fit can be A/B'd and disabled if a world ever regresses.
-            return self.builder.add_shape_sphere(
-                int(body_idx),
-                xform=wp.transform((float(cx), float(cy), float(cz)), (0.0, 0.0, 0.0, 1.0)),
-                radius=float(radius), cfg=self._shape_cfg())
+            _b, _xf, _loc = self._shape_target(body_idx, cx, cy, cz)
+            return self._note_shape(body_idx, self._builder_add(_b, self.builder.add_shape_sphere,
+                                xform=_xf,
+                radius=float(radius), cfg=self._shape_cfg()), _loc)
         # ⚠ THIS USED TO APPLY A FIXED -90 DEG ABOUT X AND IT WAS WRONG.
         #
         # The stated premise -- "a Webots Cylinder bounding object extends along
@@ -1253,14 +1528,13 @@ class World:
         _h_sub = float(half_height)
         if _h_sub > _r_sub:
             _h_sub -= _r_sub
-        return self.builder.add_shape_capsule(
-            int(body_idx),
-            xform=wp.transform((float(cx), float(cy), float(cz)),
-                               (float(qx), float(qy), float(qz), float(qw))),
+        _b, _xf, _loc = self._shape_target(body_idx, cx, cy, cz, qx, qy, qz, qw)
+        return self._note_shape(body_idx, self._builder_add(_b, self.builder.add_shape_capsule,
+                        xform=_xf,
             radius=_r_sub,
             half_height=_h_sub,
             cfg=self._shape_cfg(),
-        )
+        ), _loc)
 
     def add_shape_capsule(self, body_idx, radius, half_height, cx=0.0, cy=0.0, cz=0.0,
                           qx=0.0, qy=0.0, qz=0.0, qw=1.0):
@@ -1268,13 +1542,12 @@ class World:
         # this call carried no xform at all, so a capsule authored inside a Pose collided at the
         # body origin, unrotated, however the .wbt placed it. Same Z-aligned convention as the
         # cylinder above (OmCapsule is Z-aligned; so is a newton capsule).
-        return self.builder.add_shape_capsule(
-            int(body_idx),
-            xform=wp.transform((float(cx), float(cy), float(cz)),
-                               (float(qx), float(qy), float(qz), float(qw))),
+        _b, _xf, _loc = self._shape_target(body_idx, cx, cy, cz, qx, qy, qz, qw)
+        return self._note_shape(body_idx, self._builder_add(_b, self.builder.add_shape_capsule,
+                        xform=_xf,
             radius=float(radius),
             half_height=float(half_height),
-            cfg=self._shape_cfg())
+            cfg=self._shape_cfg()), _loc)
 
     def add_shape_plane(self, body_idx, cx=0.0, cy=0.0, cz=0.0):
         # Infinite static ground plane (e.g. a Floor's boundingObject), local normal +Z (the OmPlane
@@ -1309,13 +1582,12 @@ class World:
         # (qx,qy,qz,qw): the collider's authored orientation in the body frame. Was hard identity,
         # which tipped any mesh collision authored inside a rotated Pose -- which the URDF importer
         # emits routinely.
-        return self.builder.add_shape_mesh(
-            int(body_idx),
-            xform=wp.transform((float(cx), float(cy), float(cz)),
-                               (float(qx), float(qy), float(qz), float(qw))),
+        _b, _xf, _loc = self._shape_target(body_idx, cx, cy, cz, qx, qy, qz, qw)
+        return self._note_shape(body_idx, self._builder_add(_b, self.builder.add_shape_mesh,
+                        xform=_xf,
             mesh=mesh,
             cfg=self._shape_cfg(),
-        )
+        ), _loc)
 
     def add_shape_heightfield(self, body_idx, heights, x_dimension, y_dimension,
                               x_spacing, y_spacing, cx=0.0, cy=0.0, cz=0.0):
@@ -1367,8 +1639,13 @@ class World:
         # terrain lands where the .wbt says it does.
         bx, by, bz = 0.0, 0.0, 0.0
         bq = (0.0, 0.0, 0.0, 1.0)
+        _ws = self._ws().get(int(body_idx))
         try:
-            bq_row = self.builder.body_q[int(body_idx)]
+            if _ws is not None:
+                bq_row = (_ws["xform"].p[0], _ws["xform"].p[1], _ws["xform"].p[2],
+                          _ws["xform"].q[0], _ws["xform"].q[1], _ws["xform"].q[2], _ws["xform"].q[3])
+            else:
+                bq_row = self.builder.body_q[int(body_idx)]
             bx, by, bz = float(bq_row[0]), float(bq_row[1]), float(bq_row[2])
             bq = (float(bq_row[3]), float(bq_row[4]), float(bq_row[5]), float(bq_row[6]))
         except (IndexError, TypeError, ValueError):
@@ -1381,11 +1658,11 @@ class World:
             (0.0, 0.0, 0.0, 1.0))
         hfield = newton.Heightfield(data, nrow=ny, ncol=nx,
                                     hx=width * 0.5, hy=depth * 0.5)
-        return self.builder.add_shape_heightfield(
+        return self._note_shape(body_idx, self._builder_add(-1, self.builder.add_shape_heightfield, with_body=False,
             xform=wp.transform_multiply(body_xf, local_xf),
             heightfield=hfield,
             cfg=self._shape_cfg(),
-        )
+        ), local_xf)
 
     # ------------------------------------------------------------------
     # CLOTH AUTHORING
@@ -2355,6 +2632,8 @@ class World:
         return s if s is not None else getattr(self, "solver", None)
 
     def add_body_force(self, body_idx, fx, fy, fz, tx, ty, tz):
+        if self._is_vid(body_idx):   # world-body static: no Newton body to address
+            return -1
         # W3.1 external-wrench injection (newton-ode-replacement-plan.md): accumulate a per-tick WORLD-frame
         # body wrench (force + torque about the body's reference point) for body_idx. step() writes the sum
         # into state.body_f each substep and clears the accumulator after the tick -- matching ODE's
@@ -2374,6 +2653,8 @@ class World:
             w[3] += float(tx); w[4] += float(ty); w[5] += float(tz)
 
     def set_body_vel(self, body_idx, x, y, z, angular):
+        if self._is_vid(body_idx):   # world-body static: no Newton body to address
+            return -1
         # W3.2 mid-step velocity set (newton-ode-replacement-plan.md): directly write a Newton body's spatial
         # velocity. body_qd = [vx,vy,vz, wx,wy,wz] (verified: slots 0-2 linear, 3-5 angular, world frame).
         # angular=0 writes the linear half, =1 the angular half; the other half is preserved (read-mod-write,
@@ -2434,7 +2715,8 @@ class World:
             import numpy as _np
             self._g2s_np = sv.mjc_geom_to_newton_shape.numpy()[0]
             sb = self.model.shape_body
-            self._sb_np = sb.numpy() if hasattr(sb, "numpy") else _np.asarray(sb)
+            self._sb_np = self._overlay_world_statics(
+                sb.numpy() if hasattr(sb, "numpy") else _np.asarray(sb))
         return self._g2s_np, self._sb_np
 
     # ---- GPU-path readback guard (internal parity plan, item W1.1) ----
@@ -2741,7 +3023,8 @@ class World:
         n = min(n, int(c.rigid_contact_max))
         if not hasattr(self, "_shape_body_np"):
             sb = self.model.shape_body
-            self._shape_body_np = sb.numpy() if hasattr(sb, "numpy") else __import__("numpy").asarray(sb)
+            self._shape_body_np = self._overlay_world_statics(
+                sb.numpy() if hasattr(sb, "numpy") else __import__("numpy").asarray(sb))
         import numpy as _np
         sbn = self._shape_body_np
         s0 = c.rigid_contact_shape0.numpy(); s1 = c.rigid_contact_shape1.numpy()
@@ -2793,6 +3076,8 @@ class World:
     # toggles into model.equality_constraint_enabled as well.
 
     def add_weld_slot(self, body_idx):
+        if self._is_vid(body_idx):   # world-body static: no Newton body to address
+            return -1
         # BUILD phase only. Placeholder = an INACTIVE weld of the device's
         # body to the WORLD (a body1==body2 placeholder is refused at compile
         # -- "element repeated in equality constraint" -- while body-to-world
@@ -2881,6 +3166,10 @@ class World:
         if eq is None:
             return -1
         a, b = int(body_a), int(body_b)
+        if self._is_vid(a):
+            a = -1          # a world-body static: weld to the world at the current pose
+        if self._is_vid(b):
+            b = -1
         if a < 0 and b < 0:
             return -1
         if a < 0:
@@ -2971,6 +3260,8 @@ class World:
         return list(snap.get(int(slot), [0.0] * 6))
 
     def touch_force(self, body_idx):
+        if self._is_vid(body_idx):   # world-body static: no Newton body to address
+            return []
         # ODE-f1-compatible mount wrench of a WELDED (fixed-joint, un-folded)
         # child body: [fx,fy,fz, tx,ty,tz], world-aligned axes, as of the LAST
         # completed tick. Source: mjData.cfrc_int after mj_rnePostConstraint,
@@ -3091,7 +3382,12 @@ class World:
                            limit_lower=0.0, limit_upper=0.0,
                            effort_limit=0.0, velocity_limit=0.0,
                            child_rot_x=0.0, child_rot_y=0.0,
-                           child_rot_z=0.0, child_rot_w=1.0):
+                           child_rot_z=0.0, child_rot_w=1.0,
+                           initial_q=0.0):
+        # initial_q (2026-09-08): the joint's authored position. The engine
+        # registers the joint frame at the child's ZERO pose and this seeds
+        # newton's joint coordinate, so the joint starts the first physics
+        # step at that angle instead of at q=0 (_seed_initial_q).
         # Don't push to builder yet -- the caller (OmBasicJoint flush)
         # can feed joints in any order (e.g. leaf-first on nested PROTO
         # finalisation chains for Spot). Adding to the builder eagerly
@@ -3124,6 +3420,7 @@ class World:
             limit_upper=float(limit_upper),
             effort_limit=float(effort_limit),
             velocity_limit=float(velocity_limit),
+            initial_q=float(initial_q),
         ))
         return slot
 
@@ -3133,7 +3430,8 @@ class World:
                             child_anchor_x, child_anchor_y, child_anchor_z,
                             target_ke=0.0, target_kd=0.0,
                             limit_lower=0.0, limit_upper=0.0,
-                            effort_limit=0.0, velocity_limit=0.0):
+                            effort_limit=0.0, velocity_limit=0.0,
+                            initial_q=0.0):
         # Linear/slider joint (e.g. parallel-gripper fingers). Queues into the
         # SAME pending list as revolutes so it joins the one articulation in
         # finalize()'s BFS (a finger's parent body is the gripper base, which
@@ -3154,6 +3452,7 @@ class World:
             limit_upper=float(limit_upper),
             effort_limit=float(effort_limit),
             velocity_limit=float(velocity_limit),
+            initial_q=float(initial_q),
         ))
         return slot
 
@@ -3739,6 +4038,8 @@ class World:
         drifts away from where Webots is rendering after a few
         hundred episodes -- the constraint solver eventually fails
         with NaN once the divergence is large enough."""
+        if self._is_vid(body_idx):   # world-body static: no Newton body to address
+            return -1
         if self.model is None or self.state_a is None:
             return
         try:
@@ -4176,8 +4477,37 @@ class World:
         # Prismatic (slider) joints -- gripper fingers -- share the entire
         # queue/topo-sort/gain path; only the builder call differs.
         if j.get("kind") == "prismatic":
-            return self.builder.add_joint_prismatic(**joint_kwargs)
-        return self.builder.add_joint_revolute(**joint_kwargs)
+            jid = self.builder.add_joint_prismatic(**joint_kwargs)
+        else:
+            jid = self.builder.add_joint_revolute(**joint_kwargs)
+        self._seed_initial_q(jid, j)
+        return jid
+
+    def _seed_initial_q(self, jid, j):
+        """Start a 1-DoF joint at its authored `position` (2026-09-08).
+
+        The engine defines the joint frame at the child's ZERO pose (the
+        endPoint un-rotated by HingeJointParameters.position, which is what
+        Webots' own bookkeeping already computes) and passes `position` as
+        initial_q; writing it into builder.joint_q makes MuJoCo's first
+        forward kinematics place the child at the authored, posed pose, so a
+        URDF robot imported with a standing <rest> crouch starts the first
+        physics step IN that crouch. Before this every joint started at q=0
+        (the Deep Robotics Lite3 read hip-pitch -0.015 / knee 0.524 at t=8 ms
+        with targets -1.0 / 1.8 and yanked itself through the floor). Limits
+        and the position readback stay absolute, unchanged.
+        OMNISIM_NEWTON_SPAWN_AT_POSITION=0 in the engine reverts (it then
+        passes initial_q=0 and the current pose, as before)."""
+        q0 = float(j.get("initial_q", 0.0) or 0.0)
+        if q0 == 0.0 or jid is None or int(jid) < 0:
+            return
+        try:
+            qs = int(self.builder.joint_q_start[int(jid)])
+            self.builder.joint_q[qs] = q0
+            self._n_seeded_q = getattr(self, "_n_seeded_q", 0) + 1
+        except Exception as exc:
+            self._newton_log("[OmNewtonBackend] initial position %.4f of joint %s NOT seeded: %r"
+                             % (q0, jid, exc))
 
     def runtime_report(self):
         """Compact JSON naming the runtime that drove THIS world, and its device.
@@ -5638,6 +5968,19 @@ class World:
 
     def finalize(self):
         self._fin_mark("enter")
+        # World-body statics: a world whose only colliders are plain statics
+        # has NO Newton body and NO joint, and newton's MuJoCo converter
+        # refuses that ("The model must have at least one joint to be able
+        # to convert it to MuJoCo") -- the world then has no physics at all
+        # and every ray sensor reads its maximum. Anchor it with one welded,
+        # shapeless static body (the pre-2026-09-07 recipe for a single
+        # static) so the converter has its joint. Measured 2026-09-07 on
+        # tests/protos/worlds/template_deterministic.omniworld: four template
+        # statics, no robot body, finalize FAILED without this.
+        if not self.body_indices and self._ws():
+            self.add_static_body(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0)
+            self._newton_log("[OmNewtonBackend] statics-on-world: anchored a body-less world "
+                             "with one welded static (newton's MuJoCo converter needs a joint)")
         # ---- Deferred static planes ---------------------------------
         # Added here (not at add_shape_plane time) because the choice is
         # solver-dependent: newton's MuJoCo converter raises "Planes can
@@ -5935,6 +6278,10 @@ class World:
                 except Exception:
                     pass
 
+        if getattr(self, "_n_seeded_q", 0):
+            self._newton_log("[OmNewtonBackend] %d joint(s) start at their authored position "
+                             "(HingeJointParameters/JointParameters.position); "
+                             "OMNISIM_NEWTON_SPAWN_AT_POSITION=0 reverts" % self._n_seeded_q)
         self._fin_mark("topology")
         # newton raises "Cannot create an articulation with no joints" on an
         # empty list (builder.py:3062). Every world with a body has at least the
@@ -6053,11 +6400,32 @@ class World:
             elif _want_cpu:
                 _want_cpu = False
                 _cloth_dev_note = " (forced to cuda by %s: SolverVBD is a warp solver)" % _who
+        # OMNISIM_NEWTON_FAST_PAIRS: value-parsed; =0 leaves newton's own
+        # Python double loop over every colliding shape pair in place (12.5 M
+        # iterations for 5000 shapes) instead of the vectorised stand-in
+        # _fast_find_shape_contact_pairs.
+        import os as _fpos     # finalize() rebinds _os locally further down
+        if (_fpos.environ.get("OMNISIM_NEWTON_FAST_PAIRS") or "").strip().lower() \
+                not in ("0", "false", "off", "no"):
+            _orig_pairs = self.builder._find_shape_contact_pairs
+            _static_bodies = tuple(int(i) for i in self.static_body_indices)
+            _bld = self.builder
+
+            def _fast_pairs(model, *, allow_filter_blocks):
+                return _fast_find_shape_contact_pairs(
+                    _bld, model, allow_filter_blocks=allow_filter_blocks,
+                    orig=_orig_pairs, static_bodies=_static_bodies)
+            self.builder._find_shape_contact_pairs = _fast_pairs
         if _want_cpu:
             self.model = self.builder.finalize(device="cpu")
         else:
             self.model = self.builder.finalize()
         self._fin_mark("builder.finalize")
+        if self._ws():
+            self._newton_log("[OmNewtonBackend] statics-on-world: %d plain static colliders "
+                             "(%d shapes) attached to the world body; %d statics kept as Newton "
+                             "bodies" % (len(self._ws()), len(self._shape_vid),
+                                         len(self.static_body_indices)))
 
         # --- Per-BODY particle-contact friction override --------------------
         # OMNISIM_CLOTH_BODY_MU="<newtonBodyIdx>:<mu>,..."  e.g. "6:64,7:64"
@@ -8323,6 +8691,48 @@ class World:
         _FINGER_KD / _ARM_KD. ``OMNISIM_NEWTON_VELOCITY_GAIN_CLAMP=0`` is the
         exact-revert hatch (verified: it reproduces the 9.62x overrun exactly).
 
+        ⚠ STALL TORQUE, and why the bound is now held with ARMATURE instead
+        (2026-09-11). Bounding kv is not free: a velocity servo's peak torque
+        is ``kv * (cmd - w)``, so pinning kv at M/dt ties a wheel's stall
+        torque to its own rotational inertia and severs it from the effort the
+        URDF declares. MEASURED on the shipped Clearpath Husky (effort 200 N.m,
+        M_ii 0.0441, dt 16 ms -> kv 2.76, so 9.5 N.m at a 3.46 rad/s error,
+        against the ~25 N.m a four-tyre scrub pivot needs), open loop, no
+        bridge, commanded wheel 3.457 rad/s:
+
+            straight (common mode)   3.457 rad/s   ratio 1.000
+            pivot (differential)     0.044 rad/s   ratio 0.013
+
+        Nothing about that is differential-specific -- rolling straight needs
+        almost no torque, and a pivot is simply the first real LOAD a wheeled
+        base meets. Three shipped bases measured the same way, HEAD before /
+        after (wheel-rate ratio, then chassis yaw ratio):
+
+            Husky        0.013 -> 0.987     yaw 0.007 -> 0.532
+            TB3 Burger   0.244 -> 0.967     yaw 0.238 -> 0.943
+            ROSbot XL    0.010 -> 0.932     yaw 0.007 -> 0.526
+
+        The yaw numbers land where PHYSICS puts them, not at 1.0: the TB3 is a
+        true two-wheel differential drive whose wheels sit on one axle through
+        the centre, so a pivot scrubs nothing and it reaches 0.94; the Husky
+        and the XL are four-wheel skid-steers that must scrub all four tyres
+        sideways, and a Coulomb moment balance for the Husky's geometry
+        (half-track 0.2775, half-wheelbase 0.256) predicts a 0.55 ceiling
+        against the 0.532 measured. Straight-line tracking is unchanged
+        (0.9991 -> 0.9992).
+
+        WHY THIS KEEPS THE BOUND. The invariant this pass exists to hold is
+        ``dt*kv <= M_eff``. Armature raises M_eff by (ratio-1) x the joint's
+        own inertia, and kv is then bounded by the RAISED M_eff, so
+        ``dt*kv/M_eff`` is exactly what it was -- the inertia-inflation ratio,
+        and with it the ladder0 pogo the rest of this docstring measures, is
+        unchanged. What changes is only that the wheel now really carries the
+        inertia the solve was already pretending it had. The honest cost is
+        that a driven wheel IS a flywheel: it resists being spun by the world,
+        so a base freewheeling down a slope accelerates more slowly.
+        The armature added is never more than ``kv*dt - M`` (only what the
+        authored gain needs) and never more than (ratio-1)*M.
+
         REACHES BOTH SOLVER PATHS since 2026-08-13. It was CPU-``mj_step``-only
         when first written, and that gap was itself a measurable defect: on
         ``mujoco_warp`` the rung-6 rover commanded to a full stop travelled
@@ -8406,7 +8816,23 @@ class World:
                     has_position.add(jid)
                 if kv < 0.0 and float(m.actuator_gainprm[a][0]) > 0.0:
                     vel_actuators.append((a, jid))
-            clamped = []
+            # ARMATURE, the other way to satisfy the same bound. See the
+            # "STALL TORQUE" note in the docstring: the invariant this whole
+            # pass protects is ``dt*kv <= M_eff``, and lowering kv is only ONE
+            # way to hold it. Giving the joint REAL rotor armature raises
+            # M_eff instead, so kv can be RATIO times larger at exactly the
+            # same inertia-inflation ratio (dt*kv/M_eff stays 1). That matters
+            # because a velocity servo's peak torque is kv*(cmd - w): with kv
+            # pinned at M/dt a wheel's stall torque is set by its own inertia
+            # and has nothing to do with the effort the URDF declares, which
+            # is why a Husky wheel commanded 3.457 rad/s into a pivot stalled
+            # at 0.044 (0.013 of command) while rolling straight tracked 1.000.
+            # OMNISIM_NEWTON_WHEEL_ARMATURE_RATIO=1 (or 0) reverts to the
+            # gain-only clamp exactly.
+            ratio = self._env_float("OMNISIM_NEWTON_WHEEL_ARMATURE_RATIO", 100.0)
+            if ratio < 1.0:
+                ratio = 1.0
+            clamped, armed = [], []
             for a, jid in vel_actuators:
                 if jid in has_position:
                     continue                       # tuned PD -- not ours
@@ -8416,8 +8842,17 @@ class World:
                 inertia = float(full[dof][dof])
                 if inertia <= 0.0:
                     continue
-                kv_max = inertia / dt
                 kv = float(m.actuator_gainprm[a][0])
+                # Only ever add the armature the AUTHORED gain actually needs,
+                # and never more than (ratio - 1) x the joint's own inertia --
+                # so a wheel is never made heavier than the bound requires.
+                add_arm = min((ratio - 1.0) * inertia,
+                              max(0.0, kv * dt - inertia))
+                if add_arm > 0.0:
+                    m.dof_armature[dof] = float(m.dof_armature[dof]) + add_arm
+                    armed.append((dof, add_arm, inertia))
+                    inertia += add_arm
+                kv_max = inertia / dt
                 if kv <= kv_max:
                     continue
                 m.actuator_gainprm[a][0] = kv_max
@@ -8436,6 +8871,42 @@ class World:
             # at least announced itself. Any failure is reported AS a failure and
             # the clamp is declared not applied.
             warp_applied = None
+            if armed and getattr(self, "_kv_target_warp", False):
+                # Same dual-write as the gains below: the armature must reach
+                # the device model or the GPU path keeps the un-armed inertia
+                # while running the RAISED gain -- which is the one combination
+                # this pass must never produce.
+                wm = getattr(sv, "mjw_model", None)
+                try:
+                    if wm is None or not hasattr(wm, "dof_armature"):
+                        raise AttributeError("mjw_model.dof_armature absent")
+                    _da = wm.dof_armature.numpy()
+                    for _dof, _add, _own in armed:
+                        if _da.ndim == 1:
+                            _da[_dof] += _add
+                        else:
+                            _da[:, _dof] += _add
+                    wm.dof_armature.assign(_da)
+                except Exception as _ae:           # noqa: BLE001
+                    # Undo the CPU-side armature so the two models cannot
+                    # disagree, and fall back to the gain-only clamp.
+                    _own_of = {}
+                    for _dof, _add, _own in armed:
+                        m.dof_armature[_dof] = float(m.dof_armature[_dof]) - _add
+                        _own_of[_dof] = _own
+                    _rev = []
+                    for _jid, _kv0, _kvm, _I, _a in clamped:
+                        _d0 = int(m.jnt_dofadr[_jid])
+                        _kvm2 = _own_of.get(_d0, _I) / dt
+                        m.actuator_gainprm[_a][0] = _kvm2
+                        m.actuator_biasprm[_a][2] = -_kvm2
+                        _rev.append((_jid, _kv0, _kvm2, _own_of.get(_d0, _I), _a))
+                    clamped = _rev
+                    self._newton_log(
+                        "[OmNewtonBackend] wheel armature did NOT reach the GPU "
+                        "model (%r) -- reverted to the gain-only clamp; this "
+                        "world's wheels keep the low stall torque." % (_ae,))
+                    armed = []
             if clamped and getattr(self, "_kv_target_warp", False):
                 wm = getattr(sv, "mjw_model", None)
                 if wm is None:
@@ -8452,6 +8923,16 @@ class World:
                         warp_applied = "ok"
                     except Exception as _we:           # noqa: BLE001
                         warp_applied = repr(_we)[:160]
+            if armed:
+                self._newton_log(
+                    "[OmNewtonBackend] wheel armature added on %d velocity-mode "
+                    "joints: +%.4g..%.4g kg m^2 (ratio %.4g x the joint's own "
+                    "inertia, OMNISIM_NEWTON_WHEEL_ARMATURE_RATIO). This is what "
+                    "buys stall torque: peak servo torque is kv*(cmd-w) and kv "
+                    "is bounded by M_eff/dt, so raising M_eff with REAL armature "
+                    "raises the torque at an unchanged dt*kv/M_eff."
+                    % (len(armed), min(x[1] for x in armed),
+                       max(x[1] for x in armed), ratio))
             if clamped:
                 lo = min(c[2] for c in clamped)
                 hi = max(c[2] for c in clamped)
@@ -10083,6 +10564,11 @@ class World:
         # doing a full GPU->CPU transfer of ALL body poses. With 10
         # huskies (50 bodies) the readback alone dominated step time.
         # The cache is invalidated at the end of each step().
+        _ws = self._ws().get(int(idx))
+        if _ws is not None:     # world-body static: its pose is the record
+            _p, _q = _ws["xform"].p, _ws["xform"].q
+            return (float(_p[0]), float(_p[1]), float(_p[2]),
+                    float(_q[0]), float(_q[1]), float(_q[2]), float(_q[3]))
         cache = getattr(self, "_body_q_cache", None)
         if cache is None:
             cache = self.state_a.body_q.numpy()
@@ -10098,6 +10584,8 @@ class World:
         # the OmSolid's velocity fields were only ever filled by ODE. The
         # RL policy is a velocity-feedback balancer, so a zero velocity obs
         # made it (and in-OmniSim training) fail. Cached per step like body_q.
+        if self._is_vid(idx):   # world-body static: never moves
+            return (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
         cache = getattr(self, "_body_qd_cache", None)
         if cache is None:
             cache = self.state_a.body_qd.numpy()

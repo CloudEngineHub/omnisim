@@ -53,6 +53,7 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -695,6 +696,20 @@ def _parse_args() -> argparse.Namespace:
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
+def _safe_motor_read(motor, method: str):
+    """Read a Motor accessor that a given device/backend may not implement.
+
+    Motor limits and torque feedback are advisory telemetry: a base that
+    cannot answer must not take the bridge down with it."""
+    if motor is None:
+        return None
+    try:
+        value = float(getattr(motor, method)())
+    except Exception:
+        return None
+    return value if math.isfinite(value) else None
+
+
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
@@ -1004,6 +1019,7 @@ class MobileBridge:
         self.floor_z = float(cfg.get("floor_z", 0.0))
         self._kin_cmd = (0.0, 0.0)
         wheel_names = WHEEL_MOTORS[layout]
+        self._wheel_names = wheel_names["left"] + wheel_names["right"]
         self.left_motors = [robot.getDevice(n) for n in wheel_names["left"]]
         self.right_motors = [robot.getDevice(n) for n in wheel_names["right"]]
         missing = [n for n, m in zip(wheel_names["left"] + wheel_names["right"],
@@ -1014,6 +1030,64 @@ class MobileBridge:
             if m is not None:
                 m.setPosition(float("inf"))
                 m.setVelocity(0.0)
+        # NOT setControlPID: on the Newton path it is a no-op. STILL TRUE --
+        # do not call it. Measured 2026-09-10 (PRE-FIX figures): a Husky pivot
+        # delivered the same 0.0058 of its commanded yaw rate at the default
+        # gain and at P=1000.
+        # THE REASON GIVEN HERE USED TO BE WRONG. It said the MuJoCo
+        # actuator's gains come from "the joint's torque ceiling". They do
+        # not, and never did: the velocity actuator's kv was set by
+        # _clamp_velocity_servo_gains to M_ii/dt -- the joint's own inertia
+        # over the timestep -- which is why P=1000 changed nothing AND why
+        # the pivot was starved. See commit 69b4b024b. The no-op conclusion
+        # is unaffected: setPosition(inf) + setVelocity is the only path.
+
+        # Opt-in, evaluation-only per-tick telemetry. Off by default, so the
+        # normal bridge pays no device-read or file-I/O cost. Wheel velocity is
+        # derived from the URDF joint PositionSensors; it is measured feedback,
+        # not the motor target echoed back.
+        self._trace_path = _os.environ.get("OMNISIM_MOBILE_TRACE_PATH")
+        self._trace_file = None
+        self._trace_sensors = []
+        self._trace_previous = None
+        self._last_body_target = (0.0, 0.0)
+        self._last_wheel_targets = [0.0] * len(self._wheel_names)
+        if self._trace_path:
+            _os.makedirs(_os.path.dirname(_os.path.abspath(self._trace_path)), exist_ok=True)
+            self._trace_file = open(self._trace_path, "w", encoding="utf-8")
+            for name in self._wheel_names:
+                sensor_name = ((name[:-6] if name.endswith("_motor") else name)
+                               + "_sensor")
+                sensor = robot.getDevice(sensor_name)
+                if sensor is not None:
+                    sensor.enable(self.timestep)
+                self._trace_sensors.append((sensor_name, sensor))
+            # WHEEL LIMITS, once.
+            # DO NOT REPEAT THE INFERENCE THIS BLOCK USED TO CARRY. It read
+            # "this is how the pivot deficit was ruled out as a torque limit:
+            # the Husky's wheels report 200 N.m and 60 rad/s ... and it still
+            # would not turn." That is exactly backwards, and it sent the
+            # investigation away from the cause.
+            # getMaxTorque reports the URDF's DECLARED effort. It says nothing
+            # about what the actuator can DELIVER. A velocity servo's peak
+            # torque is kv*(cmd - w), and _clamp_velocity_servo_gains pinned
+            # kv at M_ii/dt, so the Husky's deliverable peak was ~9.5 N.m --
+            # not 200 -- against the ~25 N.m a four-tyre scrub pivot needs.
+            # The declared ceiling was never approached BECAUSE the servo
+            # could not command it. Reading a declared limit proves nothing
+            # about a deficit; measure the achieved joint rate instead.
+            # Fixed in 69b4b024b. (getTorqueFeedback is NOT read here -- it
+            # returns 0.0 for URDF motors on the Newton path, so a per-tick
+            # read would only add cost and a misleading column.)
+            self._trace_motor_limits = [
+                {"name": n,
+                 "max_torque": (_safe_motor_read(m, "getMaxTorque")),
+                 "available_torque": (_safe_motor_read(m, "getAvailableTorque")),
+                 "max_velocity": (_safe_motor_read(m, "getMaxVelocity"))}
+                for n, m in zip(self._wheel_names,
+                                self.left_motors + self.right_motors)]
+            print("[omnilink_mobile_bridge] wheel motor limits: "
+                  + json.dumps(self._trace_motor_limits), flush=True)
 
         # Optional init poses -- tuck arms, lower torso, etc. for
         # robots whose default URDF spawn pose looks like a failure
@@ -1030,10 +1104,35 @@ class MobileBridge:
         self.ht = cfg["half_track_m"]
         self.v_max = cfg["max_wheel_speed_radps"]
         self.v_max_linear = self.v_max * self.r
-        self.v_max_angular = self.v_max * self.r / self.ht
+        # The IDEAL kinematic yaw ceiling: what the wheels could do if the
+        # body turned as fast as the differential says it should. Kept,
+        # because it is the number the mixing is built on -- but it is NOT
+        # what this base can hold, and it must never be the number a caller
+        # is given (see v_max_angular below and _mobile_configs.yaw_rate_gain).
+        self.v_max_angular_kinematic = self.v_max * self.r / self.ht
+        # OMNISIM_MOBILE_YAW_GAIN overrides the config figure. This is the
+        # hatch for RE-MEASURING it: set it to 1.0 and the bridge commands
+        # the raw kinematic differential again, which is the only way to
+        # sweep the base's open-loop yaw response after the solver, the
+        # floor or the robot model changes.
+        self.yaw_gain = float(_os.environ.get("OMNISIM_MOBILE_YAW_GAIN")
+                              or cfg.get("yaw_rate_gain", 1.0))
+        if not (1e-4 <= self.yaw_gain <= 1.0):
+            print(f"[omnilink_mobile_bridge] WARNING: yaw_rate_gain "
+                  f"{self.yaw_gain} out of range, using 1.0")
+            self.yaw_gain = 1.0
+        # THE ADVERTISED CEILING IS THE MEASURED ONE. The principle stands;
+        # the numbers that used to illustrate it are pre-fix history and now
+        # err the OTHER way. Before 2026-09-10 this was the kinematic value
+        # and the ceiling was far too GENEROUS (the Husky published 3.47 rad/s
+        # and held ~0.02). Between 2026-09-10 and 69b4b024b the measured gains
+        # were honest but tiny, so the published ceilings UNDER-stated every
+        # base by 7-76x. Re-measured 2026-09-11 (see _mobile_configs): the
+        # Husky now publishes 1.805 rad/s and holds it.
+        self.v_max_angular = self.v_max_angular_kinematic * self.yaw_gain
 
         self.cruise_linear = cfg["cruise_frac"] * self.v_max_linear
-        self.spin_speed = cfg["spin_speed"]
+        self.spin_speed = min(cfg["spin_speed"], self.v_max_angular)
 
         # Pose tracking.
         self.self_node = robot.getSelf()
@@ -1064,11 +1163,28 @@ class MobileBridge:
         # (wrap_pi(yaw - pulse_y0)) reads it back NEGATED and `remaining`
         # GROWS. The loop still converges; it walks the long way round.
         #
-        # MEASURED LIVE on tug_a mid-dock, before this change: 1294.3 deg of
-        # rotation in 30 s -- 3.60 revolutions -- for 73.9 deg of net
-        # progress. Efficiency |net|/total = 0.057, i.e. 94% of the turning
-        # was wasted, and it was still turning when the sample ended.
-        self._turn_gain = 1.0 if self.kinematic else 0.55
+        # MEASURED LIVE on tug_a mid-dock, before that change (PRE-FIX,
+        # 2026-09-10): 1294.3 deg of rotation in 30 s -- 3.60 revolutions --
+        # for 73.9 deg of net progress. Efficiency |net|/total = 0.057, i.e.
+        # 94% of the turning was wasted, and it was still turning when the
+        # sample ended. That specific pathology will NOT reproduce post
+        # 69b4b024b; the wrap arithmetic behind it is unchanged and still the
+        # reason to seed a learned gain low rather than high.
+        # Residual TRIM on the yaw feed-forward, learned from settled
+        # turns. Seeded at 1.0 because _command_velocity now applies the
+        # measured yaw_rate_gain itself: before that this number carried the
+        # whole 0.006-0.13 platform deficit, and a floor of 0.08 put it 13x
+        # above the Husky's truth, which is what sized every pulse too short.
+        self._turn_gain = 1.0
+        # Yaw-rate servo state (see _yaw_mix).
+        self._yaw_want = 0.0        # body yaw rate currently being servoed
+        self._yaw_mix_cmd = 0.0     # differential the mixing is being given
+        self._yaw_measured = 0.0    # EMA of the measured body yaw rate
+        # Value-parsed, per AGENTS.md: OMNISIM_MOBILE_YAW_SERVO=0 turns the
+        # integrator off and leaves the bare feed-forward, which is how the
+        # platform's open-loop yaw curve gets re-measured.
+        self.yaw_servo = (_os.environ.get("OMNISIM_MOBILE_YAW_SERVO", "1")
+                          not in ("0", "false", "FALSE", "no"))
         # SETTLE. The pulse-and-settle design exists because a skid-steer's
         # IN-MOTION yaw readback is wrong, so the loop commands zero and waits
         # for the chassis to unwind before believing a number. A kinematic
@@ -1084,6 +1200,11 @@ class MobileBridge:
         # motion ends. `accepted: true` plus an echo of the caller's own
         # argument is not a result -- it is the caller's request handed back,
         # and an agent has no way to tell the difference.
+        # A seq is monotonic only for this controller process. Pair it with a
+        # process-incarnation id so a caller never mistakes seq=1 after a
+        # bridge restart for seq=1 from the process it originally dispatched
+        # to. Generated once here and immutable for this process lifetime.
+        self.bridge_instance_id = str(uuid.uuid4())
         self.motion_seq = 0
         self.last_completion: Optional[dict] = None
         self.fault: Optional[str] = None
@@ -1113,7 +1234,8 @@ class MobileBridge:
         # kinematic, so _command_velocity just stores a command that tick()
         # integrates into the pose write -- a commanded velocity of zero says
         # nothing about whether the pose stopped changing.
-        self._pose_hist: List[Tuple[float, float, float, float]] = []
+        self._pose_hist: List[
+            Tuple[float, float, float, float, float]] = []
         self.idle_mode: Optional[str] = None
         self.idle_loop: Optional["MavIdleLoop"] = None
         self._carries: List[dict] = []
@@ -1190,7 +1312,18 @@ class MobileBridge:
             "wheel_radius_m": self.r,
             "half_track_m": self.ht,
             "max_linear_m_s": self.v_max_linear,
+            # THE MEASURED YAW CEILING, not the geometric one. These three
+            # keys exist together because an agent that reads only the first
+            # would plan turns this base cannot make: max_angular_rad_s is
+            # what it can hold, _kinematic is what the wheels imply, and
+            # yaw_rate_gain is the ratio the solver actually delivers.
             "max_angular_rad_s": self.v_max_angular,
+            "max_angular_rad_s_kinematic": self.v_max_angular_kinematic,
+            "yaw_rate_gain": self.yaw_gain,
+            "can_rotate_in_place": bool(
+                self.kinematic
+                or self.v_max_angular * self.TURN_MAX_SPIN_S >= math.pi),
+            "can_strafe": False,
             "cruise_linear_m_s": self.cruise_linear,
             "set_velocity_max_s": self.VELOCITY_MAX_S,
             # PROTOCOL.md 5.3: the verb set, discoverable rather than guessed.
@@ -1271,30 +1404,215 @@ class MobileBridge:
 
     # ── Wheel commanding ──────────────────────────────────────────
 
+    # ── Yaw-rate servo ────────────────────────────────────────────
+    # THE CURVE THIS SERVO WAS BUILT FOR NO LONGER EXISTS, and the reason
+    # it was given was wrong. Pre-fix (2026-09-10) the Husky's raw kinematic
+    # differential delivered 0.0058 of command up to a wheel differential of
+    # ~3.5 rad/s and then broke out -- 2.0 -> 0.0139, 2.5 -> 0.0490, 3.0 ->
+    # 0.0919, 3.47 -> 0.1191 -- and this comment called that "a stiction
+    # dead-band". IT WAS NOT STICTION. Peak servo torque is kv*(cmd - w) with
+    # kv pinned at M_ii/dt, so the available torque was a fixed small ceiling
+    # and a GROWING commanded error simply climbed over the scrub break-away
+    # at some point. The knee moved with the command, which reads like
+    # stiction and is not. Commit 69b4b024b removed the ceiling.
+    #
+    # POST-FIX, measured 2026-09-11: every base is linear or near-linear.
+    # The two-wheel TB3s fit one constant to within 1.5%; the four-wheel
+    # skid-steers are flat above ~1.0-1.5 rad/s and droop ~20% at the very
+    # slowest commands. A feed-forward divide is now a good approximation
+    # everywhere, which it never was before.
+    #
+    # THE LOOP GAIN DEPENDS ON THE CONSTANT BEING RIGHT. The step is
+    # YAW_KI*err*dt/yaw_gain in MIX units and a mix unit is worth g_plant of
+    # body yaw, so the BODY-level loop gain is YAW_KI * (g_plant/yaw_gain).
+    # It is unity-tuned ONLY while the config constant tracks the plant; a
+    # stale constant multiplies it by the ratio of the two. That is why the
+    # 15-76x plant change of 69b4b024b had to be followed by a re-measurement
+    # rather than left to the integrator to absorb. Do not read YAW_KI as
+    # safe on its own; see the stale-constant measurement above the
+    # YAW_KI/YAW_FILTER block.
+    #
+    # KEEP THE INTEGRATOR -- decided on measurement 2026-09-11, not taste.
+    # With the gains re-measured, the CALIBRATED FEED-FORWARD ALONE
+    # (OMNISIM_MOBILE_YAW_SERVO=0) delivers, as a fraction of the request:
+    #
+    #     command   0.05    0.10    0.20    0.30    0.50   rad/s
+    #     husky     0.756   0.863   0.941   0.948   0.991
+    #     rosbot_xl 0.658   0.658   0.882   0.904   0.979
+    #
+    # A low-rate droop survives on both skid-steers and it is well outside
+    # the VEL_TOL_FRAC = 0.15 band that `settled` promises -- 24% short on
+    # the Husky and 34% on the XL at 0.05 rad/s. The servo closes exactly
+    # that: with it ON the XL holds 1.0000 of a 1.5 and a 2.0 rad/s request.
+    # The two-wheel TB3s would not need it; the four-wheel skid-steers do.
+    #
+    # So the feed-forward SEEDS and an integrator finishes: each tick the
+    # commanded differential is nudged by the error between the yaw rate
+    # asked for and the yaw rate measured. It needs no per-base curve, it
+    # tracks a floor whose friction the config never saw, and it costs a
+    # subtraction per tick.
+    YAW_KI = 2.5              # mix units per (rad/s of error) per second
+    YAW_FILTER = 0.15         # EMA weight on the per-tick yaw readback
+    YAW_RESEED_FRAC = 0.15    # request change that restarts the servo
+    # ⚠ THIS LOOP IS ONLY AS SAFE AS `yaw_rate_gain` IS FRESH, and the
+    # protection is calibration, not anything in here. The step below is
+    # divided by `yaw_gain`, so the BODY-level loop gain is
+    # YAW_KI * (g_plant / yaw_gain) -- unity only while the config constant
+    # tracks the plant.
+    #
+    # MEASURED 2026-09-11 on a deliberately stale pair (ROSbot XL, config
+    # 0.0069 against a plant of 0.520 -- the state main was briefly in after
+    # 69b4b024b): the commanded mix slammed between 0 and the 4.645 rad/s
+    # kinematic ceiling 16 times and the chassis peaked at 1.318 rad/s
+    # against a 0.032 rad/s request, a 41x overshoot that no `settled` flag
+    # reports. With the constant re-measured: 0 slams, peak overshoot 1.1x,
+    # and set_velocity holds 1.0000 of a 1.5 and a 2.0 rad/s request.
+    #
+    # ⚠ A PER-TICK SLEW BOUND ON THE INTEGRATOR WAS TRIED HERE AND REMOVED --
+    # do not re-add it without re-reading this. It does not work, because the
+    # slam is NOT in the integrator step: it is in the RESEED branch below,
+    # which assigns `clamp(want/yaw_gain, +/-ceiling)` in a single tick. That
+    # assignment IS the feed-forward and it is exactly right when the constant
+    # is right, so bounding it would break correct operation to soften a
+    # mis-calibrated one. Measured with the bound in place and the stale
+    # constant: the biggest one-tick mix jump was unchanged at 4.551 and the
+    # peak overshoot got WORSE (1.318 -> 1.817 rad/s).
+    #
+    # OPEN DESIGN QUESTION, deliberately not decided here: making the loop
+    # gain explicit (estimate g_plant online, or bound YAW_KI*g_plant against
+    # a stated margin) would make a stale constant a calibration error rather
+    # than a stability one. That is a control-design change, not a trim, and
+    # it needs an owner.
+
+    def _yaw_mix(self, angular: float) -> float:
+        """Yaw rate to hand the diff-drive mixing so the BODY turns at
+        `angular`. Feed-forward from the measured platform gain, corrected
+        by an integrator against the measured yaw rate."""
+        want = float(angular)
+        ceiling = self.v_max_angular_kinematic
+        if not self.yaw_servo:
+            # OPEN LOOP, for re-measuring the platform response. With the
+            # servo on, every command converges to the requested rate, which
+            # is the point -- and makes the raw curve unmeasurable.
+            return clamp(want / self.yaw_gain, -ceiling, ceiling)
+        if abs(want) < 1e-6:
+            self._yaw_mix_cmd = 0.0
+            self._yaw_want = 0.0
+            return 0.0
+        # Restart on a materially different request: the integrator's state
+        # belongs to the rate it was built for.
+        if (self._yaw_want == 0.0
+                or (want * self._yaw_want) <= 0.0
+                or abs(want - self._yaw_want)
+                > self.YAW_RESEED_FRAC * max(abs(want), 1e-6)):
+            self._yaw_want = want
+            self._yaw_mix_cmd = clamp(want / self.yaw_gain, -ceiling, ceiling)
+            return self._yaw_mix_cmd
+        err = want - self._yaw_measured
+        dt = max(self.timestep / 1000.0, 1e-3)
+        step = self.YAW_KI * err * dt / max(self.yaw_gain, 1e-4)
+        new = self._yaw_mix_cmd + step
+        # ANTI-WINDUP: at the wheel ceiling the base is doing all it can, and
+        # an integrator that keeps climbing there only delays the recovery
+        # when the request comes back down.
+        if abs(new) > ceiling:
+            new = math.copysign(ceiling, new)
+        if new * want < 0.0:
+            new = 0.0
+        self._yaw_mix_cmd = new
+        return new
+
     def _command_velocity(self, linear: float, angular: float) -> Tuple[float, float]:
         """Convert (linear m/s, angular rad/s) to (left rad/s, right rad/s),
         apply, return clamped values. Kinematic bodies store the command;
-        tick() integrates it into a supervisor pose write."""
+        tick() integrates it into a supervisor pose write.
+
+        `angular` is a BODY yaw rate the caller wants to SEE, not a number to
+        feed the mixing. The two are not the same on a skid-steer base under
+        this solver: the differential the ideal kinematics asks for delivers
+        `yaw_rate_gain` of it (0.132 on the Burger, 0.0058 on the Husky,
+        measured -- see _mobile_configs). So the request is divided by the
+        gain before it reaches the wheels, and clamped FIRST against the rate
+        the base can really hold, so the correction can never ask for more
+        wheel speed than exists."""
         linear = clamp(linear, -self.v_max_linear, self.v_max_linear)
         angular = clamp(angular, -self.v_max_angular, self.v_max_angular)
+        self._last_body_target = (linear, angular)
         if self.kinematic:
             self._kin_cmd = (linear, angular)
+            self._last_wheel_targets = []
             return 0.0, 0.0
-        # Skid-steer / diff-drive kinematics.
-        v_left = (linear - angular * self.ht) / self.r
-        v_right = (linear + angular * self.ht) / self.r
+        # Skid-steer / diff-drive kinematics, on the SERVOED yaw rate.
+        mix_angular = self._yaw_mix(angular)
+        v_left = (linear - mix_angular * self.ht) / self.r
+        v_right = (linear + mix_angular * self.ht) / self.r
         max_abs = max(abs(v_left), abs(v_right), 1e-9)
         if max_abs > self.v_max:
+            # SCALE THE PAIR, so the yaw the caller asked for survives and
+            # only the speed is given up. Scaling each wheel independently
+            # would change the differential -- i.e. silently steer somewhere
+            # else -- which is the failure this whole path exists to remove.
             scale = self.v_max / max_abs
             v_left *= scale
             v_right *= scale
+            self._last_body_target = (
+                (v_left + v_right) * 0.5 * self.r,
+                (v_right - v_left) * 0.5 * self.r / self.ht * self.yaw_gain)
         for m in self.left_motors:
             if m is not None:
                 m.setVelocity(v_left)
         for m in self.right_motors:
             if m is not None:
                 m.setVelocity(v_right)
+        self._last_wheel_targets = ([v_left] * len(self.left_motors) +
+                                    [v_right] * len(self.right_motors))
         return v_left, v_right
+
+    def _write_motion_trace(self, x: float, y: float, yaw: float) -> None:
+        if self._trace_file is None:
+            return
+        now_sim = float(self.robot.getTime())
+        positions = []
+        for name, sensor in self._trace_sensors:
+            try:
+                value = float(sensor.getValue()) if sensor is not None else None
+            except Exception:
+                value = None
+            positions.append((name, value))
+        achieved = [None] * len(positions)
+        if self._trace_previous is not None:
+            previous_time, previous_positions = self._trace_previous
+            elapsed = now_sim - previous_time
+            if elapsed > 1e-9:
+                achieved = [((value - before) / elapsed
+                             if value is not None and before is not None else None)
+                            for (_, value), before in zip(positions, previous_positions)]
+        self._trace_previous = (now_sim, [value for _, value in positions])
+        with self.lock:
+            kind, state = self.motion
+        try:
+            contact_count = len(self.self_node.getContactPoints(True))
+        except Exception:
+            contact_count = None
+        record = {
+            "sim_time_s": now_sim,
+            "motion": kind,
+            "phase": state.get("phase"),
+            "pose": {"x_m": x, "y_m": y, "yaw_rad": yaw},
+            "target_body": {"linear_m_s": self._last_body_target[0],
+                            "yaw_rate_rad_s": self._last_body_target[1]},
+            "wheel_names": self._wheel_names,
+            "target_wheel_rad_s": self._last_wheel_targets,
+            "achieved_wheel_rad_s": achieved,
+            "target_yaw_mix_rad_s": self._yaw_mix_cmd,
+            "measured_yaw_filt_rad_s": self._yaw_measured,
+            "chassis_yaw_rate_rad_s": self.v_angular,
+            "contact_count": contact_count,
+            "pulse_duration_s": state.get("pulse_duration_s"),
+            "turn_gain": self._turn_gain,
+        }
+        self._trace_file.write(json.dumps(record, separators=(",", ":")) + "\n")
+        self._trace_file.flush()
 
     def queue_window(self, line: str) -> None:
         with self.lock:
@@ -1546,6 +1864,13 @@ class MobileBridge:
     # each settled error, so later commands land in one shot.
     DRIVE_APPROACH_GAIN = 1.5    # m/s commanded per m of remaining error
     DRIVE_APPROACH_MIN = 0.25    # m/s floor (pose-lead grows at low speed)
+    # FLOOR FOR A CORRECTION LEG. The 0.25 m/s floor is sized for covering
+    # ground; a correction is 10 cm of trim, and driving it at 0.25 m/s just
+    # buys the same coast in the other direction. Measured on the ROSbot XL:
+    # 1.000 m commanded settled at 1.093 m and four corrections could not
+    # close it, because every one of them was travelling too fast to stop
+    # where it meant to.
+    DRIVE_APPROACH_FINE = 0.06
     DRIVE_BRAKE_M = 0.02         # stop when |remaining| is inside this
     DRIVE_TOL_MIN_M = 0.03       # settled-error tolerance floor …
     DRIVE_TOL_FRAC = 0.02        # … or 2% of the commanded distance
@@ -1587,7 +1912,13 @@ class MobileBridge:
     # gain (achieved ÷ commanded) is learned from that delta and converges to
     # ~0.17 on the Husky. Measured client-side before porting: +89.75° /
     # −90.17° / +135.79° against goals of ±90° / +135°, in 4–5 pulses.
-    TURN_TOL_RAD = 0.0175        # settled-error tolerance (1°)
+    TURN_TOL_RAD = 0.0175        # settled-error tolerance ceiling (1 deg)
+    # 1 deg is a sensible ceiling and a terrible floor: on a 0.1 rad command
+    # it is 25% of the motion, and the loop duly stopped 14 mrad short and
+    # called it settled. Small turns get a proportional tolerance instead,
+    # never looser than TURN_TOL_RAD and never tighter than the floor.
+    TURN_TOL_FRAC = 0.05
+    TURN_TOL_MIN_RAD = 0.003
     TURN_SETTLE_S = 1.0          # sim-s of zero command before re-measuring
     # LONGEST SINGLE PULSE IN RADIANS -- a correctness bound, not a tuning
     # knob. The settle phase measures what a pulse delivered with
@@ -1608,7 +1939,14 @@ class MobileBridge:
     TURN_PULSE_MAX_RAD = 0.9 * math.pi
     TURN_PULSE_MAX_S = 15.0      # longest single open-loop pulse
     TURN_SLOW_RAD = 0.25         # below this residual, pulse at TURN_SLOW_W
-    TURN_SLOW_W = 0.25           # rad/s for the fine pulses
+    # rad/s for the fine pulses. 0.25 until 2026-09-10, when it was chosen
+    # against a base that delivered ~13% of it: the wheels were asked for
+    # 0.25 and the body turned at 0.033, so a pulse that overran by one
+    # 16 ms tick cost 0.5 mrad. Now that the yaw servo delivers the rate
+    # asked for, the same overrun cost 4 mrad and a 0.1 rad turn landed
+    # 15 mrad long. The fine rate has to be slow in BODY terms, not in
+    # wheel terms.
+    TURN_SLOW_W = 0.08
     TURN_MAX_CORRECTIONS = 10
     # Typical learned gain, used ONLY to size the time budget before the real
     # gain is known. A skid-steer pivot delivers ~0.17 of the commanded rate,
@@ -1616,14 +1954,17 @@ class MobileBridge:
     # commanded rate instead is what made 180° and 270° both stop dead at
     # 138° -- the same number for both, which is the signature of a timeout
     # rather than a control failure.
-    TURN_GAIN_TYPICAL = 0.17
+    # With the platform yaw gain applied in _command_velocity, a turn now
+    # gets close to the rate it asks for and this trim sits near 1.0. It is
+    # used ONLY to size the time budget before the real trim is known.
+    TURN_GAIN_TYPICAL = 0.8
     # drive_to: the compound verb. Exists so the model never has to compose a
     # rotation with a translation, or call atan2 -- the two things LLMs are
     # measurably worst at and the tool is exactly correct at.
     DRIVE_TO_TOL_M = 0.10
     DRIVE_TO_HEADING_TOL = 0.03    # rad; below this, skip the turn leg
     DRIVE_TO_MAX_LEGS = 3
-    TURN_GAIN_MIN = 0.08
+    TURN_GAIN_MIN = 0.15
     TURN_GAIN_MAX = 1.5
 
     def _site_clamped(self, x: float, y: float) -> bool:
@@ -1653,6 +1994,11 @@ class MobileBridge:
         if dt_s > 1e-4:
             self.v_linear = math.cos(yaw) * dx / dt_s + math.sin(yaw) * dy / dt_s
             self.v_angular = wrap_pi(yaw - self.last_yaw) / dt_s
+            # Low-passed feedback for the yaw servo. The raw per-tick figure
+            # is a 16 ms difference of a supervisor pose and is far too noisy
+            # to integrate against directly.
+            self._yaw_measured += self.YAW_FILTER * (self.v_angular
+                                                     - self._yaw_measured)
         self.last_xy = (x, y)
         self.last_yaw = yaw
         self.last_tick_at = time.time()
@@ -1661,7 +2007,11 @@ class MobileBridge:
         # the robot stood still WITHOUT issuing a supervisor read of its own
         # (MainThreadCalls: threaded reads drag the sim to ~0.2x realtime).
         with self.lock:
-            self._pose_hist.append((self.last_tick_at, x, y, yaw))
+            # index 4 is SIM time: a rate measured against wall clock is
+            # wrong by whatever the sim is running at, and the only honest
+            # denominator for "rad per second" is the clock the physics uses.
+            self._pose_hist.append((self.last_tick_at, x, y, yaw,
+                                    float(self.robot.getTime())))
             if len(self._pose_hist) > self.POSE_HIST_MAX:
                 del self._pose_hist[:-self.POSE_HIST_MAX]
 
@@ -1709,6 +2059,12 @@ class MobileBridge:
                     tol = max(self.DRIVE_TOL_MIN_M,
                               self.DRIVE_TOL_FRAC * p["distance"])
                     # Learn the stop rollback from the settled truth.
+                    # The floor stays at zero: a symmetric bias was tried
+                    # 2026-09-10 so an overshooting base could learn to aim
+                    # short, and it made the ROSbot XL worse (1.093 m -> 1.104
+                    # on a 1 m drive) by fighting the correction leg. What
+                    # actually fixed the overshoot was slowing the correction
+                    # leg down -- see DRIVE_APPROACH_FINE.
                     self._drive_bias = clamp(self._drive_bias + 0.8 * err,
                                              0.0, self.DRIVE_BIAS_MAX_M)
                     if (abs(err) > tol and not timed_out
@@ -1740,9 +2096,17 @@ class MobileBridge:
                         else:
                             achieved = ((x - p["x0"]) * math.cos(yaw0)
                                         + (y - p["y0"]) * math.sin(yaw0))
+                        # SETTLED MEANS CONVERGED. It used to mean only
+                        # "did not time out", so a drive that gave up at the
+                        # correction limit still reported settled: true --
+                        # measured on the Burger, 1.000 m commanded, 1.086 m
+                        # achieved, 4 corrections, settled: true, with the
+                        # 8.6% error sitting in a field the caller had been
+                        # told it could trust.
                         self._record_completion(
                             p, achieved,
-                            settled=not timed_out, timed_out=timed_out)
+                            settled=(abs(err) <= tol) and not timed_out,
+                            timed_out=timed_out)
                         self.queue_window(
                             f"system:drive complete (advanced {achieved:+.2f} m "
                             f"along the start heading, path {travelled:.2f} m)")
@@ -1756,8 +2120,20 @@ class MobileBridge:
                         self.motion = ("drive", p2)
                     self._command_velocity(0.0, 0.0)
                 else:
+                    # The floor cannot exceed the ceiling. clamp() is
+                    # max(lo, min(hi, v)), so on a base whose top speed is
+                    # under DRIVE_APPROACH_MIN -- the Burger tops out at
+                    # 0.198 m/s against a 0.25 m/s floor -- the expression
+                    # collapsed to the floor for every value of `remaining`.
+                    # The proportional slow-down was dead on exactly the
+                    # small bases that need it, which is why the Burger
+                    # braked from full speed and overshot 1 m by 8.6%.
+                    v_ceiling = abs(p["speed"])
+                    floor = (self.DRIVE_APPROACH_MIN
+                             if not p.get("corrections")
+                             else self.DRIVE_APPROACH_FINE)
                     v_mag = clamp(self.DRIVE_APPROACH_GAIN * abs(remaining),
-                                  self.DRIVE_APPROACH_MIN, abs(p["speed"]))
+                                  min(floor, v_ceiling), v_ceiling)
                     self._command_velocity(
                         direction * math.copysign(v_mag, remaining), 0.0)
         elif kind == "turn":
@@ -1816,8 +2192,10 @@ class MobileBridge:
                 # direction and landed 42° short; accumulated remaining has no
                 # antipode and also lets a turn exceed ±π.
                 err = p["remaining"]
-                done = (abs(err) <= self.TURN_TOL_RAD or timed_out
-                        or p.get("corrections", 0) >= self.TURN_MAX_CORRECTIONS)
+                converged = abs(err) <= self._turn_tol(p.get("commanded", 0.0))
+                correction_limit = (
+                    p.get("corrections", 0) >= self.TURN_MAX_CORRECTIONS)
+                done = converged or timed_out or correction_limit
                 if done:
                     with self.lock:
                         self.motion = ("idle", {})
@@ -1825,10 +2203,17 @@ class MobileBridge:
                     # `err` is what is LEFT of the commanded rotation, so the
                     # achieved rotation is commanded - remaining. Measured,
                     # settled, and signed -- not the argument echoed back.
+                    p_done = dict(p)
+                    p_done["completion_reason"] = (
+                        "tolerance" if converged else
+                        "timeout" if timed_out else
+                        "correction_limit")
                     self._record_completion(
-                        p, float(p.get("commanded", 0.0)) - err,
-                        settled=not timed_out, timed_out=timed_out)
-                    msg = (f"turn complete (yaw err {math.degrees(err):+.2f} deg, "
+                        p_done, float(p.get("commanded", 0.0)) - err,
+                        settled=converged and not timed_out,
+                        timed_out=timed_out)
+                    outcome = "complete" if converged else "stopped"
+                    msg = (f"turn {outcome} (yaw err {math.degrees(err):+.2f} deg, "
                            f"{p.get('corrections', 0)} pulses, "
                            f"gain {self._turn_gain:.3f}"
                            f"{', TIMED OUT' if timed_out else ''})")
@@ -1856,6 +2241,7 @@ class MobileBridge:
                         p2 = dict(p)
                         p2["phase"] = "pulse"
                         p2["pulse_w"] = math.copysign(w_mag, err)
+                        p2["pulse_duration_s"] = dur
                         p2["pulse_end_sim"] = now_sim + dur
                         p2["pulse_y0"] = yaw
                         p2["pulse_want"] = w_mag * self._turn_gain * dur
@@ -1878,6 +2264,8 @@ class MobileBridge:
                 except Exception:
                     pass
                 x, y, yaw = nx, ny, heading
+
+        self._write_motion_trace(x, y, yaw)
 
         # Optional trolley tow (no-op unless --pallets active AND docked).
         if self.pallet_feature:
@@ -2643,6 +3031,7 @@ class MobileBridge:
                         "details": {
                             "current": kind,
                             "current_seq": p.get("seq"),
+                            "current_bridge_instance_id": self.bridge_instance_id,
                             "hint": ("wait for get_robot_state.mode == "
                                      "'idle', or pass wait=true so each "
                                      "command returns only once it has "
@@ -2664,6 +3053,7 @@ class MobileBridge:
         achieved is null -- never a number nobody measured, and never the
         commanded value standing in for one."""
         self.last_completion = {
+            "bridge_instance_id": self.bridge_instance_id,
             "seq": int(p.get("seq", 0)),
             "verb": p.get("verb", "?"),
             "commanded": float(p.get("commanded", 0.0)),
@@ -2678,6 +3068,8 @@ class MobileBridge:
                                 "finished; how far it got was not measured")),
             "sim_time": self.robot.getTime(),
         }
+        if p.get("completion_reason"):
+            self.last_completion["completion_reason"] = p["completion_reason"]
 
     def _supersede_inflight(self, reason: str) -> None:
         """Cancel whatever is in the motion slot and release its waiter.
@@ -2906,6 +3298,7 @@ class MobileBridge:
         motion result is written, and it writes what was MEASURED."""
         commanded = float(p.get("commanded", 0.0))
         self.last_completion = {
+            "bridge_instance_id": self.bridge_instance_id,
             "seq": int(p.get("seq", 0)),
             "verb": p.get("verb", "?"),
             "commanded": commanded,
@@ -2940,7 +3333,8 @@ class MobileBridge:
             with self.lock:
                 latest = self.motion_seq
             if latest > seq:
-                return {"seq": seq, "achieved": None, "error": None,
+                return {"bridge_instance_id": self.bridge_instance_id,
+                        "seq": seq, "achieved": None, "error": None,
                         "settled": False, "timed_out": False,
                         "superseded": True,
                         "note": ("a later command superseded this motion "
@@ -2950,27 +3344,191 @@ class MobileBridge:
             time.sleep(self.WAIT_POLL_S)
         # The caller asked us to wait and we could not confirm. Say exactly
         # that -- never fall back to reporting the commanded value.
-        return {"seq": seq, "achieved": None, "error": None,
+        return {"bridge_instance_id": self.bridge_instance_id,
+                "seq": seq, "achieved": None, "error": None,
                 "settled": False, "timed_out": True,
                 "note": "wait budget expired before the motion reported; "
                         "the robot may still be moving -- poll get_robot_state"}
 
-    def act_set_velocity(self, linear: float, angular: float) -> dict:
-        # Clamp to the platform's own limits and stamp an expiry (see tick).
+    # ── set_velocity measurement window ───────────────────────────
+    # An open-ended velocity command has no completion to report, so before
+    # 2026-09-10 it answered with the arguments it had just been handed:
+    # {accepted: true, linear, angular}. On the Husky that reply said
+    # "angular 2.0 rad/s" while the base turned at 0.0115 -- 0.6% -- and
+    # nothing in the response could tell an agent so. A verb reports what
+    # the robot DID (PROTOCOL.md 5.4.1); the only way to do that for a
+    # standing command is to hold it and measure, which is what these two
+    # constants pay for.
+    # The settle window has to outlast the yaw servo's convergence, or the
+    # measurement reports the ramp rather than the rate. Measured worst case
+    # is the Husky's stiction break-out, ~0.5 s from seed to steady.
+    VEL_SETTLE_S = 1.20     # sim-s discarded while the base accelerates
+    VEL_MEASURE_S = 0.80    # sim-s differenced for the achieved rates
+    VEL_TOL_FRAC = 0.15     # |error| within this fraction counts as settled
+    VEL_TOL_ANG_MIN = 0.02  # rad/s floor for that tolerance
+    VEL_TOL_LIN_MIN = 0.02  # m/s floor for that tolerance
+
+    def _measure_body_rates(self, t_from: float,
+                            span_s: float) -> Optional[dict]:
+        """Differences the SETTLED pose history over `span_s` sim-seconds
+        starting at wall time `t_from`. Reads no devices: the sim thread
+        already files every tick's pose, and a supervisor read from an HTTP
+        thread drags the sim to ~0.2x realtime."""
+        deadline = t_from + self.VEL_SETTLE_S + span_s + 0.5
+        while time.time() < deadline:
+            with self.lock:
+                window = [s for s in self._pose_hist if s[0] >= t_from]
+            if len(window) >= 3 and (window[-1][4] - window[0][4]) >= (
+                    self.VEL_SETTLE_S + span_s):
+                break
+            if time.time() - self.last_tick_at > 2.0:
+                return None           # world is not stepping
+            time.sleep(self.WAIT_POLL_S)
+        with self.lock:
+            window = [s for s in self._pose_hist if s[0] >= t_from]
+        if len(window) < 3:
+            return None
+        # Drop the acceleration ramp, then difference the tail.
+        cut = window[0][4] + self.VEL_SETTLE_S
+        tail = [s for s in window if s[4] >= cut]
+        if len(tail) < 2:
+            tail = window[-2:]
+        dt = tail[-1][4] - tail[0][4]
+        if dt <= 1e-6:
+            return None
+        dyaw = wrap_pi(tail[-1][3] - tail[0][3])
+        dist = math.hypot(tail[-1][1] - tail[0][1], tail[-1][2] - tail[0][2])
+        heading = tail[0][3]
+        signed = (math.cos(heading) * (tail[-1][1] - tail[0][1])
+                  + math.sin(heading) * (tail[-1][2] - tail[0][2]))
+        return {"linear": signed / dt,
+                "angular": dyaw / dt,
+                "path_speed": dist / dt,
+                "span_sim_s": dt, "samples": len(tail)}
+
+    # Longest in-place rotation this bridge will attempt, in sim seconds.
+    # Past this the honest answer is "this base cannot do that", not a
+    # command that runs for minutes and then reports a timeout.
+    TURN_MAX_SPIN_S = 45.0
+
+    def _turn_tol(self, commanded: float) -> float:
+        """Settled-error tolerance for a turn of this size."""
+        return max(self.TURN_TOL_MIN_RAD,
+                   min(self.TURN_TOL_RAD,
+                       self.TURN_TOL_FRAC * abs(float(commanded))))
+
+    def _turn_feasibility(self, angle_rad: float) -> Optional[dict]:
+        """Refuse a rotation the base provably cannot finish.
+
+        Returns None when the turn is worth attempting, or a refusal naming
+        the measured yaw ceiling and the time the rotation would need."""
+        want = abs(float(angle_rad))
+        if want <= self.TURN_TOL_RAD or self.kinematic:
+            return None
+        ceiling = self.v_max_angular
+        if ceiling <= 1e-6:
+            spin_s = float("inf")
+        else:
+            spin_s = want / ceiling
+        if spin_s <= self.TURN_MAX_SPIN_S:
+            return None
+        return {
+            "accepted": False,
+            "refused": "cannot_rotate_in_place",
+            "commanded": float(angle_rad), "unit": "rad",
+            "achieved": None, "error": None, "settled": False,
+            "timed_out": False,
+            "max_angular_rad_s": ceiling,
+            "max_angular_rad_s_kinematic": self.v_max_angular_kinematic,
+            "yaw_rate_gain": self.yaw_gain,
+            "estimated_spin_s": spin_s,
+            "message": (
+                f"{self.cfg['model']} holds at most {ceiling:.4f} rad/s of "
+                f"yaw in place, so {want:.4f} rad needs {spin_s:.0f} s of "
+                f"continuous spinning -- past this bridge's "
+                f"{self.TURN_MAX_SPIN_S:.0f} s ceiling. This is the base, "
+                f"not the request: the wheel geometry alone would give "
+                f"{self.v_max_angular_kinematic:.2f} rad/s, and this base "
+                f"delivers {self.yaw_gain:.4f} of it because a skid-steer "
+                f"pivot has to scrub all four tyres sideways."),
+            "alternatives": [
+                "drive_to <x> <y> -- it turns only as much as it must, and "
+                "reports the pose it reached",
+                "drive_forward with a curved approach instead of a pivot",
+                "a base that pivots faster: the TurtleBot3 Burger holds "
+                "2.33 rad/s in this same world (measured 2026-09-11)",
+            ],
+        }
+
+    def act_set_velocity(self, linear: float, angular: float,
+                         wait: bool = True) -> dict:
+        # Clamp to the platform's REAL limits (v_max_angular is the measured
+        # ceiling, not the kinematic one) and stamp an expiry (see tick).
         lin = clamp(float(linear), -self.v_max_linear, self.v_max_linear)
         ang = clamp(float(angular), -self.v_max_angular, self.v_max_angular)
         # Teleop overrides an in-flight drive/turn rather than being
         # refused -- but it does not get to do so silently.
         self._supersede_inflight(
             "overridden by set_velocity before it finished")
+        t_from = time.time()
         with self.lock:
             self.motion = ("velocity", {"l": lin, "a": ang,
                                         "t0_sim": self.robot.getTime()})
-        out = {"accepted": True, "linear": lin, "angular": ang,
-               "expires_in_s": self.VELOCITY_MAX_S}
-        if abs(lin - float(linear)) > 1e-6 or abs(ang - float(angular)) > 1e-6:
-            out["clamped_from"] = {"linear": float(linear),
-                                   "angular": float(angular)}
+        commanded = {"linear": float(linear), "angular": float(angular)}
+        applied = {"linear": lin, "angular": ang}
+        out = {"accepted": True, "commanded": commanded, "applied": applied,
+               "unit": {"linear": "m/s", "angular": "rad/s"},
+               "expires_in_s": self.VELOCITY_MAX_S,
+               # Kept for existing callers that read the flat pair. They are
+               # the APPLIED values, which is what they always meant.
+               "linear": lin, "angular": ang,
+               "limits": {"max_linear_m_s": self.v_max_linear,
+                          "max_angular_rad_s": self.v_max_angular}}
+        clamped = {}
+        if abs(lin - float(linear)) > 1e-6:
+            clamped["linear"] = float(linear)
+        if abs(ang - float(angular)) > 1e-6:
+            clamped["angular"] = float(angular)
+        if clamped:
+            out["clamped_from"] = clamped
+            if "angular" in clamped:
+                # NAME THE REASON. A caller that asks a Husky for 2 rad/s is
+                # not making a rounding error; it is working from a ceiling
+                # this base has never been able to hold.
+                out["limited"] = "angular_rate_above_platform_maximum"
+                out["limit_note"] = (
+                    f"{self.cfg['model']} holds at most "
+                    f"{self.v_max_angular:.3f} rad/s of yaw "
+                    f"({self.v_max_angular_kinematic:.2f} rad/s is what the "
+                    f"wheel geometry alone would give; the base delivers "
+                    f"{self.yaw_gain:.4f} of it under this solver)")
+        if not wait:
+            out.update(achieved=None, error=None, settled=False,
+                       note=("returned without measuring (wait=false) -- "
+                             "the achieved rates are unknown, not equal to "
+                             "the commanded ones; poll get_robot_state for "
+                             "v_linear / v_angular"))
+            return out
+        measured = self._measure_body_rates(t_from, self.VEL_MEASURE_S)
+        if measured is None:
+            out.update(achieved=None, error=None, settled=False,
+                       note=("the command is applied but no pose samples "
+                             "arrived to measure it -- is the world "
+                             "stepping?"))
+            return out
+        achieved = {"linear": measured["linear"],
+                    "angular": measured["angular"]}
+        error = {"linear": achieved["linear"] - commanded["linear"],
+                 "angular": achieved["angular"] - commanded["angular"]}
+        lin_tol = max(self.VEL_TOL_LIN_MIN,
+                      self.VEL_TOL_FRAC * abs(commanded["linear"]))
+        ang_tol = max(self.VEL_TOL_ANG_MIN,
+                      self.VEL_TOL_FRAC * abs(commanded["angular"]))
+        out.update(achieved=achieved, error=error,
+                   settled=(abs(error["linear"]) <= lin_tol
+                            and abs(error["angular"]) <= ang_tol),
+                   measured_over_sim_s=measured["span_sim_s"],
+                   samples=measured["samples"])
         return out
 
     def act_drive_forward(self, distance: float, speed: Optional[float] = None,
@@ -3007,12 +3565,15 @@ class MobileBridge:
             wait_budget_s = eta * 3.0 + 12.0 if timeout_s is None else float(timeout_s)
             return {"accepted": True, "commanded": float(distance), "unit": "m",
                     **self._await_completion(seq, wait_budget_s)}
-        return {"accepted": True, "seq": seq, "commanded": float(distance),
+        return {"accepted": True,
+                "bridge_instance_id": self.bridge_instance_id,
+                "seq": seq, "commanded": float(distance),
                 "unit": "m", "eta_s": eta,
                 "note": "NOT complete -- this returns on acceptance. Pass "
                         "wait=true, or poll get_robot_state until "
-                        "last_command.seq == this seq, for the achieved "
-                        "value. Match the seq EXACTLY: a later command's "
+                        "last_command identity matches this "
+                        "(bridge_instance_id, seq), for the achieved value. "
+                        "Match BOTH fields: a later command's "
                         "record is a measurement of a different motion, and "
                         "a superseded motion reports achieved: null."}
 
@@ -3021,6 +3582,24 @@ class MobileBridge:
         _, _, yaw = self._read_pose()
         target = wrap_pi(yaw + angle_rad)
         eta = abs(angle_rad) / max(self.spin_speed, 1e-6)
+        # PRE-FLIGHT: can this base finish this rotation at all?
+        #
+        # The pulse-and-settle loop below is patient by design, and that
+        # patience used to hide an impossibility. A ROSbot XL asked for 90
+        # degrees answered {settled: false, timed_out: true, yaw 0.0875} after
+        # burning its whole budget -- a timeout is what a loop reports when
+        # something went wrong, and nothing here had gone wrong: the base was
+        # too slow to finish. (PRE-FIX, 2026-09-10. The rate quoted here was
+        # 0.0075 rad/s while _mobile_configs said 0.032 -- the two disagreed,
+        # so trust neither; both are history. POST 69b4b024b the XL holds
+        # 2.435 rad/s and a measured 90 degree turn takes ~5 sim-seconds, so
+        # this refusal no longer fires on any shipped base.)
+        # THE GUARD STAYS: refusing up front, with the measured rate and the
+        # arithmetic, is still the only answer an agent can act on if a future
+        # base or floor is genuinely too slow.
+        refused = self._turn_feasibility(angle_rad)
+        if refused is not None:
+            return refused
         seq, refusal = self._begin_motion(source)
         if refusal is not None:
             return refusal
@@ -3034,11 +3613,13 @@ class MobileBridge:
                 "t0_sim": self.robot.getTime(),
                 "phase": "plan",
                 "corrections": 0,
-                # Budget in SIM seconds. The skid-steer pivot saturates well
-                # below the commanded spin under the MuJoCo solvers (measured
-                # ~0.3-0.4 rad/s apparent on the Husky), and the settle-verify
-                # pass adds >=1 sim-s per correction, so budget generously: the
-                # turn converges inside TURN_TOL_RAD long before this fires.
+                # Budget in SIM seconds, deliberately generous -- a generous
+                # timeout costs nothing and the turn converges inside
+                # TURN_TOL_RAD long before this fires. (The "~0.3-0.4 rad/s
+                # apparent on the Husky" this comment used to cite was a
+                # PRE-FIX 2026-09-10 figure; post 69b4b024b the Husky holds
+                # 1.805 rad/s and a measured 90 deg turn completes in ~5 sim-s
+                # including settle. The budget is left as it is.)
                 "timeout_s": (20.0 + 3.0 * abs(angle_rad)
                               / max(self.spin_speed * self.TURN_GAIN_TYPICAL,
                                     1e-3)),
@@ -3047,12 +3628,15 @@ class MobileBridge:
             return {"accepted": True, "commanded": float(angle_rad),
                     "unit": "rad",
                     **self._await_completion(seq, eta * 6.0 + 30.0)}
-        return {"accepted": True, "seq": seq, "commanded": float(angle_rad),
+        return {"accepted": True,
+                "bridge_instance_id": self.bridge_instance_id,
+                "seq": seq, "commanded": float(angle_rad),
                 "unit": "rad", "eta_s": eta,
                 "note": "NOT complete -- this returns on acceptance. Pass "
                         "wait=true, or poll get_robot_state until "
-                        "last_command.seq == this seq, for the achieved "
-                        "value. Match the seq EXACTLY: a later command's "
+                        "last_command identity matches this "
+                        "(bridge_instance_id, seq), for the achieved value. "
+                        "Match BOTH fields: a later command's "
                         "record is a measurement of a different motion, and "
                         "a superseded motion reports achieved: null."}
 
@@ -3296,6 +3880,7 @@ class MobileBridge:
             "fault": self.fault,
             "last_tick_at": self.last_tick_at,
             "sim_time": self.robot.getTime(),
+            "bridge_instance_id": self.bridge_instance_id,
             # What the last finished motion ACTUALLY did (PROTOCOL.md 5.4.1).
             # None until one completes. This is how a caller that did not pass
             # wait=true learns the achieved value instead of assuming it.
@@ -3519,7 +4104,8 @@ class IntentRouter:
 
         # Spin in place.
         if re.search(r"\b(spin|rotate)\b", s) and not re.search(r"degree|rad|left|right", s):
-            self.bridge.act_set_velocity(0.0, self.bridge.spin_speed)
+            self.bridge.act_set_velocity(0.0, self.bridge.spin_speed,
+                                         wait=False)
             return {
                 "agent": (f"Spinning in place for at most "
                           f"{self.bridge.VELOCITY_MAX_S:.0f} seconds."),
@@ -3527,7 +4113,9 @@ class IntentRouter:
             }
 
         if re.search(r"\b(circle|loop)\b", s):
-            self.bridge.act_set_velocity(self.bridge.cruise_linear * 0.6, self.bridge.spin_speed * 0.6)
+            self.bridge.act_set_velocity(self.bridge.cruise_linear * 0.6,
+                                         self.bridge.spin_speed * 0.6,
+                                         wait=False)
             return {
                 "agent": (f"Driving in a circle for at most "
                           f"{self.bridge.VELOCITY_MAX_S:.0f} seconds."),
@@ -3611,7 +4199,7 @@ class IntentRouter:
         if m:
             lin = float(m.group(1))
             ang = float(m.group(2))
-            self.bridge.act_set_velocity(lin, ang)
+            self.bridge.act_set_velocity(lin, ang, wait=False)
             return {
                 "agent": f"Setting velocity to ({lin:.2f} m/s, {ang:.2f} rad/s).",
                 "tools": [("set_velocity", "ok", f"({lin:+.2f}, {ang:+.2f})")],
@@ -4388,14 +4976,19 @@ class MavIdleLoop(threading.Thread):
             return False
         if abs(err) < tol:
             return True
-        # Budget from the ACHIEVED pivot rate, not the commanded one. A
-        # skid-steer turn delivers ~TURN_GAIN_TYPICAL of what is commanded, so
-        # a budget sized on spin_speed alone abandons the leg about two thirds
-        # of the way through -- which used to be masked by the turn stopping
-        # short anyway.
-        return self._wait_motion_idle(
-            abs(err) / max(0.2, b.spin_speed * b.TURN_GAIN_TYPICAL) * 3.0
-            + 4.0)
+        # Budget from the rate the base can actually hold. b.spin_speed is
+        # now clamped to v_max_angular, so this is the measured pivot rate.
+        # KEEP DERIVING IT: the hardcoded 0.2 rad/s floor that used to sit
+        # here was, pre-fix (2026-09-10), above what three of the four bases
+        # could do, and a budget sized on a rate the robot cannot reach
+        # abandons the leg part-way through. Post 69b4b024b all four clear
+        # 0.2 rad/s comfortably (slowest is the Jackal at 1.541 rad/s), so
+        # that particular trap is closed -- but a constant would go stale
+        # again on the next solver or floor change, and this expression will
+        # not.
+        rate = max(min(b.spin_speed, b.v_max_angular) * b.TURN_GAIN_TYPICAL,
+                   1e-3)
+        return self._wait_motion_idle(abs(err) / rate * 3.0 + 4.0)
 
     def _drive(self, dist: float, speed: Optional[float] = None) -> bool:
         b = self.bridge
@@ -7206,7 +7799,9 @@ def make_handler(bridge: MobileBridge, router: IntentRouter, relay: Any = None):
                     "ok": True, "omnisim_wire": WIRE_VERSION,
                     "service": WIRE_SERVICE,
                     "service_versions": {WIRE_SERVICE: WIRE_VERSION},
-                    "instance": {"name": "omnilink_mobile_bridge", "robot_id": bridge.robot_id},
+                    "instance": {"name": "omnilink_mobile_bridge",
+                                 "robot_id": bridge.robot_id,
+                                 "id": bridge.bridge_instance_id},
                     "extensions": [],
                 })
             if self.path in ("/state", "/get_robot_state"):
@@ -7291,8 +7886,12 @@ def make_handler(bridge: MobileBridge, router: IntentRouter, relay: Any = None):
             if p == "/set_velocity":
                 linear = finite_number(require_field(body, "linear"), "linear")
                 angular = finite_number(require_field(body, "angular"), "angular")
+                # MEASURES BY DEFAULT. The call costs ~1 sim-second and
+                # returns what the base actually did; wait=false is there
+                # for a teleop stream that cannot afford it, and says
+                # achieved: null rather than echoing the request back.
                 return self._json(200, bridge.act_set_velocity(
-                    linear, angular))
+                    linear, angular, wait=bool(body.get("wait", True))))
             # BUSY REJECTS, it does not clobber (PROTOCOL.md 5.4.1).
             # `self.motion` is a single slot: a second command used to
             # overwrite the first silently, so `turn` then `drive` -- which a
@@ -7785,9 +8384,17 @@ def _build_base_tools(bridge: MobileBridge) -> List[Any]:
                 "counter-clockwise (left). Set wait=true (recommended) and "
                 "the call returns only once the yaw has settled, with "
                 "'achieved' in radians and 'error' = achieved - commanded. "
-                "A skid-steer pivot is slow: a 90 degree turn takes roughly "
-                "15-25 seconds of simulated time, so do not read a delay as "
-                "a failure. A second motion command while one is running is "
+                "This base holds at most "
+                f"{bridge.v_max_angular:.3f} rad/s of yaw, so a 90 degree "
+                f"turn needs roughly "
+                f"{1.5708 / max(bridge.v_max_angular, 1e-6):.1f} s of "
+                "simulated spinning plus a settle pass -- do not read that "
+                "delay as a failure. If a base is ever too slow to finish a "
+                "rotation at all it is REFUSED up front with "
+                "refused='cannot_rotate_in_place' and the measured rate "
+                "attached; that is a fact about the robot, not a retryable "
+                "error, so use drive_to instead of trying again. No shipped "
+                "base is refused at present. A second motion command while one is running is "
                 "REJECTED with 409 busy, so turn THEN drive as two waited "
                 "calls — do not issue both at once. (stop_robot and "
                 "set_velocity are the exceptions: they cancel a running "
@@ -7819,14 +8426,24 @@ def _build_base_tools(bridge: MobileBridge) -> List[Any]:
                 "return 409 when a motion is already running -- it is the "
                 "teleop override, so it CANCELS that motion (whose achieved "
                 "value then reports as null, because it was never measured). "
-                "It reports no achieved distance or angle of its own: read "
-                "get_robot_state for the pose."
+                "It DOES report what the base actually did: 'achieved' "
+                "carries the MEASURED linear and yaw rates and 'error' the "
+                "difference from what you asked for -- quote those, not the "
+                "arguments you sent. "
+                f"THIS BASE HOLDS AT MOST {bridge.v_max_angular:.3f} rad/s "
+                f"of yaw and {bridge.v_max_linear:.2f} m/s forward; a larger "
+                "yaw request is clamped to the ceiling and the reply says so "
+                "in 'limited'. Asking for more does not make it turn faster."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "linear": {"type": "number", "description": "Forward velocity (m/s)."},
-                    "angular": {"type": "number", "description": "Yaw rate (rad/s, +=left)."},
+                    "angular": {"type": "number",
+                                "description": (
+                                    "Yaw rate (rad/s, +=left). Ceiling "
+                                    f"{bridge.v_max_angular:.3f} rad/s on "
+                                    "this base.")},
                 },
                 "required": ["linear", "angular"],
             },

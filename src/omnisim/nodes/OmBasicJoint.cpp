@@ -449,6 +449,29 @@ void OmBasicJoint::requeueAllNewtonJointsForRebuild() {
   }
 }
 
+// Spawn-at-position (2026-09-08). A 1-DoF joint authored with a non-zero
+// `position` (a URDF <rest> crouch, a midpoint-seeded Panda joint, a
+// hand-posed alife limb) used to start the first physics step at q=0: the
+// frame was registered at the child's CURRENT pose, newton's coordinate began
+// at 0, and only the motor TARGET carried the authored value -- so the servos
+// yanked the joint there from wherever the scene had it (the Deep Robotics
+// Lite3 read hip-pitch -0.015 / knee 0.524 at t=8 ms with targets -1.0 / 1.8
+// and drove its feet through the floor). Now the frame is defined at the
+// child's ZERO pose -- Webots' own bookkeeping (zeroEndPointTranslation /
+// zeroEndPointRotation) already computes it from the authored pose and
+// `position` -- and the authored `position` seeds newton's joint coordinate,
+// so the first forward kinematics lands exactly on the authored pose. Limits
+// and the position readback are absolute, as before. Value-parsed hatch:
+// OMNISIM_NEWTON_SPAWN_AT_POSITION=0 restores the old registration.
+static bool newtonSpawnAtPositionEnabled() {
+  static int cached = -1;
+  if (cached < 0) {
+    const QString v = QString::fromUtf8(qgetenv("OMNISIM_NEWTON_SPAWN_AT_POSITION")).trimmed().toLower();
+    cached = (v == "0" || v == "false" || v == "off" || v == "no") ? 0 : 1;
+  }
+  return cached == 1;
+}
+
 void OmBasicJoint::flushPendingNewtonRegistrations() {
   // Drain the queue regardless of whether registration succeeds, so
   // we don't repeatedly re-attempt failed entries on subsequent ticks.
@@ -635,9 +658,26 @@ void OmBasicJoint::flushPendingNewtonRegistrations() {
     // explicit transpose.
     const OmVector3 anchor = p->anchor();  // virtual; public on OmBasicJoint
     const OmVector3 parentWorld = parent->matrix().translation();
-    const OmVector3 childWorld = child->matrix().translation();
     const OmMatrix3 parentRot = parent->rotationMatrix();
-    const OmMatrix3 childRot = child->rotationMatrix();
+    // The child pose the joint frame is defined at: its ZERO pose when the
+    // joint is authored at a non-zero `position` (see newtonSpawnAtPositionEnabled
+    // above), else its current pose. The zero pose is the current world pose
+    // with the endPoint's own local pose swapped for the zero one, which keeps
+    // any Pose/Group nodes between the parent Solid and the joint intact.
+    OmVector3 childWorld = child->matrix().translation();
+    OmMatrix3 childRot = child->rotationMatrix();
+    double initialPosition = 0.0;
+    {
+      const OmJointParameters *const jp = hinge ? hinge->parameters() : slider->parameters();
+      const double authored = (jp != nullptr) ? jp->position() : 0.0;
+      if (authored != 0.0 && newtonSpawnAtPositionEnabled()) {
+        const OmMatrix3 ancestorRot = childRot * child->rotation().toMatrix3().transposed();
+        const OmVector3 ancestorWorld = childWorld - ancestorRot * child->translation();
+        childRot = ancestorRot * p->zeroEndPointRotation().toMatrix3();
+        childWorld = ancestorWorld + ancestorRot * p->zeroEndPointTranslation();
+        initialPosition = authored;
+      }
+    }
     const OmVector3 jointWorld = parentWorld + parentRot * anchor;
     const OmVector3 childAnchor = (jointWorld - childWorld) * childRot;
 
@@ -856,7 +896,8 @@ void OmBasicJoint::flushPendingNewtonRegistrations() {
               childAnchor.x(), childAnchor.y(), childAnchor.z(),
               targetKe, targetKd,
               limitLower, limitUpper,
-              effortLimit, velocityLimit)
+              effortLimit, velocityLimit,
+              initialPosition)
         : newton->addJointRevolute(
               parentIdx, childIdx,
               axisLocal.x(), axisLocal.y(), axisLocal.z(),
@@ -865,7 +906,8 @@ void OmBasicJoint::flushPendingNewtonRegistrations() {
               targetKe, targetKd,
               limitLower, limitUpper,
               effortLimit, velocityLimit,
-              childRelRot.x(), childRelRot.y(), childRelRot.z(), childRelRot.w());
+              childRelRot.x(), childRelRot.y(), childRelRot.z(), childRelRot.w(),
+              initialPosition);
     p->mNewtonJointIndex = idx;
     if (idx >= 0 && motor != nullptr && limitlessWheel)
       limitlessNewtonJointIndices().insert(idx);

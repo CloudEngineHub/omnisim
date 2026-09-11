@@ -245,9 +245,15 @@ def g_cap_turn_then_drive(ep: Episode, ctx: GradeContext) -> Verdict:
     held, held_detail = _held(ctx, _others(["husky_nw"]), 0.30)
     m = {"yaw_change_deg": round(dyaw, 1), "moved_m": round(dist, 3),
          "others": held_detail}
-    # Deliberately loose on the angle: the bridge's turn primitive was measured
-    # at -43% on a commanded 90 deg (2026-07-25, README of the swarm agent).
-    # A tight tolerance here would grade the actuator, not the agent.
+    # Deliberately loose on the angle. It was set because the bridge's turn
+    # primitive was measured at -43% on a commanded 90 deg (2026-07-25, README
+    # of the swarm agent), so a tight tolerance would have graded the actuator
+    # rather than the agent. That -43% is PRE-69b4b024b (2026-09-11), which
+    # lifted a solver cap on wheel stall torque (open-loop Husky yaw ratio
+    # 0.0069 -> 0.532); the turn has not been re-measured through the bridge.
+    # The threshold is versioned and stays as-is, but it is now looser than the
+    # actuator warrants and will NOT catch a turn regression. Due for
+    # re-derivation against a fresh bridge measurement.
     if dyaw < 30.0:
         return Verdict.no(f"heading changed only {dyaw:.0f}° — no turn", **m)
     if dist < 0.8:
@@ -678,9 +684,16 @@ TASKS: List[SuiteTask] = [
                "other Huskies.",
         grader=g_cap_turn_then_drive, timeout_s=300,
         notes="Graded on ≥30° of heading change and ≥0.8 m of travel, NOT on "
-              "hitting 90°. The bridge's turn primitive was measured at -43% "
-              "on a commanded 90° (2026-07-25); a tight angular tolerance "
-              "would score the actuator instead of the agent."),
+              "hitting 90°. The threshold was set because the bridge's turn "
+              "primitive was measured at -43% on a commanded 90° (2026-07-25), "
+              "so a tight angular tolerance would have scored the actuator "
+              "instead of the agent. ⚠️ That -43% is pre-69b4b024b "
+              "(2026-09-11), which lifted a solver cap on wheel stall torque "
+              "(open-loop Husky yaw ratio 0.0069 → 0.532); the turn has not "
+              "been re-measured through the bridge. The threshold is "
+              "unchanged and versioned, but it is now looser than the "
+              "actuator warrants and will not catch a turn regression — due "
+              "for re-derivation."),
 
     SuiteTask(
         id="cap_query_then_act", version="1", category="capability",

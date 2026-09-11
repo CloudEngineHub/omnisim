@@ -72,6 +72,9 @@ BASE_ARGS = ("--batch", "--mode=fast", "--no-rendering", "--minimize")
 
 def resolve_binary(repo=None):
     """Locate omnisim-bin per-platform. Returns a Path or None."""
+    override = os.environ.get("OMNISIM_BINARY")   # same override as run-headless and the harness
+    if override:
+        return Path(override) if Path(override).exists() else None
     repo = Path(repo or os.environ.get("OMNISIM_HOME") or REPO)
     if IS_WIN:
         candidates = [repo / "msys64" / "mingw64" / "bin" / "omnisim-bin.exe"]

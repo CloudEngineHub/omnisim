@@ -61,7 +61,7 @@ python -m omnisim cinema agent-build-make agent_build.json
 This layer consumes real captures from `scripts/capture/` or the Cinema
 director and applies the approved simulator-first three-act story, silent 0–10
 second signature, purposeful direct-cut grammar, sparse information cards,
-natural local voice, restrained score, claim boundaries, GitHub-only outro,
+natural local voice, restrained score, claim boundaries, a clean story ending,
 provenance hashes, and fail-closed delivery gate. The validator requires at
 least 75 percent real simulator footage and an Act III simulator climax. The
 exact workflow and editorial rules are in
@@ -138,7 +138,7 @@ python -m omnisim cinema inspect projects/samples/demos/worlds/<world>.wbt
 | [`director.py`](director.py) | The orchestrator. Load world → render shots → critique → edit. |
 | [`critique.py`](critique.py) | Vision-model review (Claude). Flags weak shots, suggests reshoots. |
 | [`grade.py`](grade.py), [`brand.py`](brand.py), [`edit.py`](edit.py) | Post: color grade, title/end cards, multi-aspect assembly. |
-| [`agent_build.py`](agent_build.py) | Locked Agent Build manifest, intro/outro, evidence edit, mix, receipt, and release gate. |
+| [`agent_build.py`](agent_build.py) | Locked Agent Build manifest, intro, no-outro evidence edit, mix, receipt, and release gate. |
 | [`agent_build_voice.py`](agent_build_voice.py) | Pinned local natural narration with authored editorial windows. |
 | [`cli.py`](cli.py) | `python -m omnisim cinema` dispatch. |
 

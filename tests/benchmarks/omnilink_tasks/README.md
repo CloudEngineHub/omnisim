@@ -121,10 +121,18 @@ Five outcomes; only two are scores:
 measurement. Four of sixteen. Every other task is decided by pose and trace
 alone. Each task's caveats live in its `notes=` field in
 [`ol_suite.py`](ol_suite.py) and are worth reading before quoting a score —
-for example `cap_turn_then_drive` grades ≥30° of heading change, not 90°,
-because the bridge's turn primitive was measured at **-43%** on a commanded
-90° (2026-07-25) and a tight tolerance would score the actuator instead of
-the agent.
+for example `cap_turn_then_drive` grades ≥30° of heading change, not 90°.
+The threshold is versioned and is **unchanged**; its stated justification is
+not. It was set because the bridge's turn primitive was measured at **-43%**
+on a commanded 90° (2026-07-25), so a tight tolerance would have scored the
+actuator instead of the agent. ⚠️ That -43% is **pre-`69b4b024b`
+(2026-09-11)**, which lifted a solver cap that bounded a wheel's stall torque
+at its own rotational inertia; open loop, the Husky's chassis yaw ratio went
+0.0069 → 0.532, and the turn has not been re-measured through the bridge.
+The task still measures what it says it measures, but the gate is now **looser
+than the actuator warrants** and will not catch a turn regression: an agent
+delivering 35° on a commanded 90° passes. It is due for re-derivation against
+a fresh bridge measurement — a suite-version decision, not a drive-by edit.
 
 ### Fault injection
 

@@ -2,7 +2,7 @@
 
 Every `.wbt` in the repo classified by purpose. Use this when you have a world filename and need to know what it's for; use [DEMOS.md](DEMOS.md) when you want to find a demo by what it does.
 
-> **Canonical lighting recipe.** Every user-facing `.omniworld` (demos, samples, RL, top-level robot demos — **383** of the 434 tracked `.omniworld` worlds outside `tests/`, re-counted 2026-09-02) uses the same three-PROTO sky+sun recipe defined in [`docs/WORLD_RECIPE.md`](docs/WORLD_RECIPE.md): `OmniSimSky` + `DEF SUN OmniSimSun` + `DEF SUN_MARKER OmniSimSunMarker`. Test worlds under `tests/` are exempt. Exception: the omniworld-**generated** worlds under `distribution/generated_worlds/` currently ship with `TexturedBackground`, pending the emitter's migration to the OmniSimSky recipe. New worlds — human- or agent-authored — MUST follow the recipe; migrate via `python scripts/dev/migrate_world_recipe.py`.
+> **Canonical lighting recipe.** Every user-facing `.omniworld` (demos, samples, RL, top-level robot demos — **384** of the 435 tracked `.omniworld` worlds outside `tests/`, re-counted 2026-09-08) uses the same three-PROTO sky+sun recipe defined in [`docs/WORLD_RECIPE.md`](docs/WORLD_RECIPE.md): `OmniSimSky` + `DEF SUN OmniSimSun` + `DEF SUN_MARKER OmniSimSunMarker`. Test worlds under `tests/` are exempt. Exception: the omniworld-**generated** worlds under `distribution/generated_worlds/` currently ship with `TexturedBackground`, pending the emitter's migration to the OmniSimSky recipe. New worlds — human- or agent-authored — MUST follow the recipe; migrate via `python scripts/dev/migrate_world_recipe.py`.
 
 > **Migration status.** All 73 demo worlds are now grouped by category under [`projects/samples/demos/worlds/<category>/`](projects/samples/demos/worlds/) (Phase 3 — done). EXTERNPROTO/texture/mesh paths rewritten to portable `omnisim://` form; URDFRobot `url` paths kept relative (the URDF loader does not honour the URL scheme). Only [`omnilink_launcher.omniworld`](projects/samples/demos/worlds/omnilink_launcher.omniworld) stays at the top.
 
@@ -12,7 +12,7 @@ Every `.wbt` in the repo classified by purpose. Use this when you have a world f
 
 | Category | Root | Worlds | Purpose |
 |---|---|---|---|
-| [Demo worlds](#1-demo-worlds) | `projects/samples/demos/worlds/{chat,flagship,physics,showcase,environments,rendering,dev,misc,starter,portability}/` + the flat `omnilink_launcher.omniworld` | **115** (114 `.omniworld` + the 1 dual-read-proof `.wbt`) | User-facing showcases, chat demos, plus renderer-smoke & dev worlds. All ship publicly (`publish_deny.txt` holds no entry under this tree) |
+| [Demo worlds](#1-demo-worlds) | `projects/samples/demos/worlds/{chat,flagship,physics,showcase,environments,rendering,dev,misc,starter,portability}/` + the flat `omnilink_launcher.omniworld` | **122** (121 `.omniworld` + the 1 dual-read-proof `.wbt`) | User-facing showcases, chat demos, plus renderer-smoke & dev worlds. All ship publicly (`publish_deny.txt` holds no entry under this tree) |
 | [Generated worlds](#2-generated-worlds) | `distribution/generated_worlds/` | 9 | Procedural scaffolds from the omniworld library (the `mars_small/big/max.wbt` scale variants are gitignored — regenerate them) |
 | [Device sample worlds](#3-device-sample-worlds) | `projects/samples/devices/worlds/` | 45 | One world per sensor/actuator — pedagogical tour |
 | [Rendering sample worlds](#4-rendering-sample-worlds) | `projects/samples/rendering/worlds/` | 2 | PBR reference + Sponza scene |
@@ -34,15 +34,19 @@ Every `.wbt` in the repo classified by purpose. Use this when you have a world f
 User-facing showcases. Cross-referenced in [DEMOS.md](DEMOS.md).
 
 ### 1a. Chat demos *(one robot, talk to it)*
-`projects/samples/demos/worlds/chat/` — one `omnilink_<robot>.omniworld` per URDF robot, incl. the 3-arm `omnilink_multi_arm.omniworld`. *(Count check: `git ls-files projects/samples/demos/worlds/chat/ | grep -c '\.omniworld$'` → **16**. Of the 16, **15** are `omnilink_<robot>.omniworld`; the sixteenth is `omniarm6_talk.omniworld`. All 16 ship publicly — [`scripts/release/publish_deny.txt`](scripts/release/publish_deny.txt) holds no entry under this directory.)* See the [chat demos section in DEMOS.md](DEMOS.md#1-chat-demos--single-robot-natural-language-console) and the in-folder guide [`chat/OMNILINK_CHAT_DEMOS.md`](projects/samples/demos/worlds/chat/OMNILINK_CHAT_DEMOS.md).
+`projects/samples/demos/worlds/chat/` — one `omnilink_<robot>.omniworld` per URDF robot, incl. the 3-arm `omnilink_multi_arm.omniworld`. *(Count check: `git ls-files projects/samples/demos/worlds/chat/ | grep -c '\.omniworld$'` → **21**. Of the 21, **20** are `omnilink_<robot>.omniworld` (five of them the Deep Robotics quadrupeds added 2026-09-08); the twenty-first is `omniarm6_talk.omniworld`. All 21 ship publicly — [`scripts/release/publish_deny.txt`](scripts/release/publish_deny.txt) holds no entry under this directory.)* See the [chat demos section in DEMOS.md](DEMOS.md#1-chat-demos--single-robot-natural-language-console) and the in-folder guide [`chat/OMNILINK_CHAT_DEMOS.md`](projects/samples/demos/worlds/chat/OMNILINK_CHAT_DEMOS.md).
 
-### 1b. Flagship — `worlds/flagship/` (**24** worlds, all public)
+### 1b. Flagship — `worlds/flagship/` (**26** worlds, all public)
 
-*(Count check: `git ls-files projects/samples/demos/worlds/flagship/ | grep -c '\.omniworld$'` → **24**. [`scripts/release/publish_deny.txt`](scripts/release/publish_deny.txt) holds no entry under this directory, so all 24 ship publicly — the old "18 dev / 8 public" split predates the OmniArm replacement of the held robot packages and is gone. The table below lists the highlights; the rest are the `omniarm6_*` manipulation set, `husky_unseen_maze`, and `warehouse_omnilink`.)*
+*(Count check: `git ls-files projects/samples/demos/worlds/flagship/ | grep -c '\.omniworld$'` → **25**. [`scripts/release/publish_deny.txt`](scripts/release/publish_deny.txt) holds no entry under this directory, so all 25 ship publicly — the old "18 dev / 8 public" split predates the OmniArm replacement of the held robot packages and is gone. The table below lists the highlights; the rest are the `omniarm6_*` manipulation set, `husky_unseen_maze`, `husky_extreme_terrain`, and `warehouse_omnilink`.)*
 
 | World | Demo |
 |---|---|
 | `warehouse_industrial.omniworld` | Industrial warehouse scene |
+| `husky_extreme_terrain.omniworld` | Husky fixed-throttle control versus pose-feedback navigation through a three-gate boulder course |
+| `husky_one_passage.omniworld` | Four Husky robots share one narrow passage; collision, mutual yielding, and passage-reservation experiments for a long-form build film |
+| `two_robots_tower.omniworld` | Two Cartesian robot builders place twenty free blocks with physical finger grips; narrow and wider-base tower experiments for a build film |
+| `two_robots_100_boxes.omniworld` | Part Two of the tower build: two Cartesian builders, one hundred free boxes, wider-stack and gripper-clearance experiments with a capped production workflow |
 | `husky_maze.omniworld`, `husky_maze_unknown.omniworld`, `husky_maze_corners.omniworld`, `husky_maze_visual.omniworld`, `husky_maze_blind.omniworld` | Husky Maze (5 difficulty tiers) |
 | `omnilink_husky_swarm.omniworld` | Husky swarm coordination |
 | `omnilink_smart_house.omniworld` | Smart house — an OmniLink agent runs a physics-backed home (hub bridge on :8766; see DEMOS.md §3) |
@@ -72,7 +76,7 @@ Combat-oriented Newton worlds (`newton_husky_head_on*.wbt`, `newton_husky_combat
 
 Combat showcase worlds (head-on, damage arena, brawl, duel) live under [`projects/robot_combat/worlds/`](projects/robot_combat/worlds/). For the BattleBox combat-sport scene — `battlebox_husky_proving.omniworld`, `battlebox_duel.omniworld`, `battlebox_royal_rumble.omniworld` — see the [Robot Combat README](projects/robot_combat/README.md#battlebots-league--battlebots).
 
-### 1e. Environments — `worlds/environments/` (4)
+### 1e. Environments — `worlds/environments/` (5)
 
 | World | Purpose |
 |---|---|
@@ -80,6 +84,7 @@ Combat showcase worlds (head-on, damage arena, brawl, duel) live under [`project
 | `desert_ruins.omniworld` | Outdoor rough terrain |
 | `forest.omniworld` | Forest environment backdrop |
 | `northgate_depot.omniworld` | Northgate Depot — a bare 25.8 × 16.8 m distribution-centre interior: concrete slab, 4 m rendered walls, three double rows of pallet racking, three dock-door panels. **Robot-free and prop-free by design** — drop a ground robot in and drive it. Hand-maintained (no generator) |
+| `blockworld.omniworld` | Minecraft-style block world for agents — 2,666 addressable static cubes + a probe ball; generated by `gen_blockworld.py`; guide `docs/guide/blockworld-agent-environment.md` |
 
 ### 1f. Misc — `worlds/misc/` (2)
 

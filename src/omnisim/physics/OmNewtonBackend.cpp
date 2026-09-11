@@ -292,16 +292,33 @@ namespace {
   int reportPyErrorFatal(const char *step) {
     std::string detail;
     const bool had = takePyError(detail);
+    // Two diagnosed causes, each named ONLY when the exception says so. The
+    // arena overflow was measured on 2026-09-07: 2000 one-box static Solids,
+    // each its own MuJoCo body, asked mj_broadphase for an nbody*(nbody-1)/2
+    // pair buffer (8,012,004 bytes) that the 14 MiB default arena could not
+    // hold. Plain static colliders now share the world body, so a world
+    // that still hits this has thousands of statics that carry a device,
+    // a joint or cloth coupling -- or OMNISIM_NEWTON_STATICS_ON_WORLD=0.
+    const bool arenaOverflow = had && (detail.find("mj_stackAlloc") != std::string::npos ||
+                                       detail.find("stack overflow") != std::string::npos);
+    const std::string cause = arenaOverflow
+      ? "The diagnosed cause: MuJoCo's arena overflowed while sizing the broadphase, whose pair buffer "
+        "grows with the SQUARE of the body count -- this world registered too many separate Newton BODIES. "
+        "Plain static colliders share the world body (since 2026-09-07; OMNISIM_NEWTON_STATICS_ON_WORLD=0 "
+        "reverts that and reproduces this failure), so the bodies left are dynamic Solids, static-base "
+        "robots, kinematic props, and statics that carry a joint, a TouchSensor, a Connector / "
+        "VacuumGripper or cloth coupling. Reduce those, or merge colliders into fewer Solids. "
+      : "The known cause is a loop-closing SolidReference, for which newton says either \"Multiple joints "
+        "lead to body N\" or \"Body N has multiple parents in this articulation\": MuJoCo is a "
+        "tree-articulation solver and cannot close a kinematic loop, so model the mechanism as a tree and "
+        "drive the dependent joint from a controller. For anything else, the exception below names what "
+        "the solver refused. ";
     newtonError(QString::fromStdString(
       "[OmNewtonBackend] " + std::string(step) +
       " FAILED -- THIS WORLD HAS NO PHYSICS. No Newton world was built, so nothing in it will fall, "
       "collide, actuate or report a contact: every body stays frozen at its authored pose for the whole "
       "run, and Newton is the only physics backend so there is no fallback to degrade to. Do not read a "
-      "pose, a rest height or a contact from this run -- it measured nothing. The known cause is a "
-      "loop-closing SolidReference, for which newton says either \"Multiple joints lead to body N\" or "
-      "\"Body N has multiple parents in this articulation\": MuJoCo is a tree-articulation solver and "
-      "cannot close a kinematic loop, so model the mechanism as a tree and drive the dependent joint "
-      "from a controller. For anything else, the exception below names what the solver refused. " +
+      "pose, a rest height or a contact from this run -- it measured nothing. " + cause +
       (had ? ("The Python exception was: " + detail) : std::string("No Python error was set."))));
     return -1;
   }
@@ -1036,9 +1053,11 @@ int OmNewtonBackend::addBody(double mass, double x, double y, double z,
     return -1;
   // Default path (hasCom=false): the exact 14-arg call this backend has always
   // made -> the Python add_body leaves cx/cy/cz=None -> link COM at the origin
-  // (legacy behavior every existing Newton robot is validated against). Only
-  // when the caller opts in (OMNISIM_NEWTON_USE_LINK_COM) do we append the true
-  // link COM as 3 extra positional args.
+  // (legacy behavior every existing Newton robot is validated against). The
+  // caller (OmSolid.cpp) sets hasCom either when the Solid declares an explicit
+  // inertiaMatrix -- that tensor is BY DEFINITION about the centerOfMass, so
+  // the two travel together (OMNISIM_NEWTON_INERTIA_COM=0 reverts) -- or when
+  // OMNISIM_NEWTON_USE_LINK_COM opts the geometry-derived case in too.
   PyObject *r = hasCom
       ? PyObject_CallMethod(mRuntime->world, "add_body",
                             "(ddddddddddddddddd)",
@@ -1056,12 +1075,13 @@ int OmNewtonBackend::addBody(double mass, double x, double y, double z,
 }
 
 int OmNewtonBackend::addStaticBody(double x, double y, double z,
-                                   double qx, double qy, double qz, double qw) {
+                                   double qx, double qy, double qz, double qw,
+                                   bool plainCollider) {
   if (!mAvailable || mRuntime == nullptr || mRuntime->world == nullptr || !mRuntime->openForBuild)
     return -1;
   PyObject *r = PyObject_CallMethod(mRuntime->world, "add_static_body",
-                                     "(ddddddd)",
-                                     x, y, z, qx, qy, qz, qw);
+                                     "(dddddddi)",
+                                     x, y, z, qx, qy, qz, qw, plainCollider ? 1 : 0);
   if (r == nullptr)
     return reportPyError("add_static_body");
   long idx = PyLong_AsLong(r);
@@ -2066,7 +2086,8 @@ int OmNewtonBackend::addJointRevolute(int parentIdx, int childIdx,
                                       double targetKe, double targetKd,
                                       double limitLower, double limitUpper,
                                       double effortLimit, double velocityLimit,
-                                      double crx, double cry, double crz, double crw) {
+                                      double crx, double cry, double crz, double crw,
+                                      double initialPosition) {
   if (!mAvailable || mRuntime == nullptr || mRuntime->world == nullptr || !mRuntime->openForBuild)
     return -1;
   // G1 fix 2026-05-28: explicitly hold the GIL across the FFI call.
@@ -2078,7 +2099,7 @@ int OmNewtonBackend::addJointRevolute(int parentIdx, int childIdx,
   // that already had the GIL.
   PyGILState_STATE gstate = PyGILState_Ensure();
   PyObject *r = PyObject_CallMethod(mRuntime->world, "add_joint_revolute",
-                                     "(iiddddddddddddddddddd)",
+                                     "(iidddddddddddddddddddd)",
                                      parentIdx, childIdx,
                                      ax, ay, az,
                                      pX, pY, pZ,
@@ -2086,7 +2107,8 @@ int OmNewtonBackend::addJointRevolute(int parentIdx, int childIdx,
                                      targetKe, targetKd,
                                      limitLower, limitUpper,
                                      effortLimit, velocityLimit,
-                                     crx, cry, crz, crw);
+                                     crx, cry, crz, crw,
+                                     initialPosition);
   if (r == nullptr) {
     const int err = reportPyError("add_joint_revolute");
     PyGILState_Release(gstate);
@@ -2240,19 +2262,21 @@ int OmNewtonBackend::addJointPrismatic(int parentIdx, int childIdx,
                                        double cX, double cY, double cZ,
                                        double targetKe, double targetKd,
                                        double limitLower, double limitUpper,
-                                       double effortLimit, double velocityLimit) {
+                                       double effortLimit, double velocityLimit,
+                                       double initialPosition) {
   if (!mAvailable || mRuntime == nullptr || mRuntime->world == nullptr || !mRuntime->openForBuild)
     return -1;
   PyGILState_STATE gstate = PyGILState_Ensure();
   PyObject *r = PyObject_CallMethod(mRuntime->world, "add_joint_prismatic",
-                                     "(iiddddddddddddddd)",
+                                     "(iidddddddddddddddd)",
                                      parentIdx, childIdx,
                                      ax, ay, az,
                                      pX, pY, pZ,
                                      cX, cY, cZ,
                                      targetKe, targetKd,
                                      limitLower, limitUpper,
-                                     effortLimit, velocityLimit);
+                                     effortLimit, velocityLimit,
+                                     initialPosition);
   if (r == nullptr) {
     const int err = reportPyError("add_joint_prismatic");
     PyGILState_Release(gstate);
@@ -3603,7 +3627,7 @@ int OmNewtonBackend::addGroundPlane() { return -1; }
 int OmNewtonBackend::addBody(double, double, double, double, double, double, double, double,
                              double, double, double, double, double, double,
                              bool, double, double, double) { return -1; }
-int OmNewtonBackend::addStaticBody(double, double, double, double, double, double, double) { return -1; }
+int OmNewtonBackend::addStaticBody(double, double, double, double, double, double, double, bool) { return -1; }
 int OmNewtonBackend::addKinematicBody(double, double, double, double, double, double, double) { return -1; }
 int OmNewtonBackend::setKinematicPose(int, double, double, double, double, double, double, double) { return -1; }
 int OmNewtonBackend::addShapeSphere(int, double, double, double, double, double, double, double) { return -1; }
@@ -3661,7 +3685,8 @@ int OmNewtonBackend::addJointRevolute(int, int, double, double, double,
                                       double, double,
                                       double, double,
                                       double, double,
-                                      double, double, double, double) { return -1; }
+                                      double, double, double, double,
+                                      double) { return -1; }
 int OmNewtonBackend::addJointHinge2(int, int, double, double, double,
                                     double, double, double,
                                     double, double, double,
@@ -3679,7 +3704,8 @@ int OmNewtonBackend::addJointPrismatic(int, int, double, double, double,
                                        double, double, double,
                                        double, double,
                                        double, double,
-                                       double, double) { return -1; }
+                                       double, double,
+                                       double) { return -1; }
 int OmNewtonBackend::setJointTargetVelocity(int, double) { return -1; }
 int OmNewtonBackend::setJointTargetPosition(int, double) { return -1; }
 int OmNewtonBackend::setJointGains(int, int, double, double) { return -1; }

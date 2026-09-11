@@ -75,7 +75,7 @@ The OmniSim Newton backend selects its solver at runtime based on env vars. **Se
 
 | Env var                            | Why                                                                                                |
 |--                                  |--                                                                                                  |
-| `OMNISIM_URDF_USE_INERTIA=1`       | Without this OmniSim's URDF importer discards `<inertial>` tags entirely. Robot won't balance.    |
+| `OMNISIM_URDF_USE_INERTIA=1`       | Redundant since 2026-09-10 — this is now the DEFAULT. Until then the importer discarded `<inertial>` tags entirely and the robot would not balance; setting it explicitly still costs nothing and documents the intent. `=0` reverts. |
 | `OMNISIM_NEWTON_FORCE_MUJOCO=1`    | Pick `newton.solvers.SolverMuJoCo` instead of the XPBD default — the solver mujoco_warp matches. |
 | `OMNISIM_NEWTON_MJWARP=1`          | Inside SolverMuJoCo, use GPU mujoco_warp (not CPU `mj_step`). Same engine your trainer runs.       |
 

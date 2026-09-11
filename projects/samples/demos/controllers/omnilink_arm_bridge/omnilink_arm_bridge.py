@@ -6795,8 +6795,10 @@ def _wait_flag(body: dict) -> bool:
     measurement. An arm motion here is 0.8-8 s -- short enough that blocking
     is a better answer than a promise, and well inside the 50 s wait ceiling.
     (The mobile bridge defaults its HTTP `wait` to FALSE for the opposite
-    reason: a skid-steer 180-degree pivot is ~40 s and sits right on the
-    edge connector's per-tool timeout.) Pass {"wait": false} for the old
+    reason -- though the figure behind that is now stale: a skid-steer
+    180-degree pivot was ~40 s before commit 69b4b024b and is ~10 sim-s
+    measured 2026-09-11. The default is unchanged; only its justification
+    weakened.) Pass {"wait": false} for the old
     return-on-dispatch behaviour, then poll get_robot_state.last_command.
 
     Deliberately NOT applied to the act_* methods themselves, whose default

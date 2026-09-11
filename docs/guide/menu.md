@@ -24,6 +24,7 @@
     - [Rendering](samples-rendering.md)
 - [OmniLink Agent Demos](omnilink-chat-demos.md)
     - [Talk to a Robot — Chat Demos](omnilink-chat-demos.md)
+    - [Blockworld — a Block World for Agents](blockworld-agent-environment.md)
     - [Add Your Own Robot](omnilink-add-your-robot.md)
     - [From Sim to Real](omnilink-sim-to-real.md)
     - [Build an Agent](omnilink-build-agent.md)

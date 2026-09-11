@@ -25,9 +25,533 @@ top of that foundation.
 ---
 
 
-## [Unreleased]
+## [v8.4.0] — 2026-09-11
 
-Nothing yet.
+The release where the solver runs on what the author declared — a link's
+inertia tensor, a wheel's declared effort and a static's true cost, each of
+which had quietly been a preset. Seven Deep Robotics robots join the library, a
+2,666-block world shows what the statics change buys, and the Mavic follow-ups
+ship with the two contributed pieces built to measure them (#18, #19). Every
+number is measured on machine `9722d23d12a3` (RTX 3060 laptop, Windows, CPU
+`mj_step`); every engine change carries a value-parsed revert switch.
+
+### Physics
+
+- **A wheel's stall torque is no longer capped by its own rotational inertia**
+  (2026-09-11, `omnisim_newton_runtime.py`; hatch
+  `OMNISIM_NEWTON_WHEEL_ARMATURE_RATIO`, default 100, `=1` or `=0` reverts
+  bit-identically). The velocity-servo gain clamp `kv ≤ M_ii/dt` — written for
+  the ladder0 pogo — also bounded a pure-velocity motor's peak torque
+  `kv·(cmd − ω)`, so the shipped Husky's wheels could deliver 9.5 N·m at a
+  3.46 rad/s error against the ~25 N·m a four-tyre scrub pivot needs, and the
+  declared 200 N·m was never approached. Rolling straight needs almost no torque
+  (wheel-rate ratio 1.000); a pivot is simply the first real load a wheeled
+  base meets (0.013). Confirmed three ways: `OMNISIM_NEWTON_VELOCITY_GAIN_CLAMP=0`
+  takes the ratio to 0.99, `newtonGroundMu 0.02` to 0.96, and a substep sweep
+  1/2/4/8 gives 0.0128 / 0.0172 / 0.0337 / 0.0678 — a clean ×2 per halving of
+  the sub-step, exactly `kv_max = M_ii/sub_dt`. The same invariant
+  (`dt·kv ≤ M_eff`) is now held by raising `M_eff` with real rotor armature
+  instead of starving `kv`, so the pogo the clamp was written for cannot
+  return. Open loop, no bridge — wheel-rate ratio, then chassis yaw ratio:
+  Husky 0.0128 → 0.987 (yaw 0.0069 → 0.532), TB3 Burger 0.2440 → 0.982
+  (0.2383 → 0.958), ROSbot XL 0.0104 → 0.931 (0.0069 → 0.525). Yaw lands where
+  physics puts it, not at 1.0: the Burger is a true two-wheel differential
+  drive and scrubs nothing; the two skid-steers must scrub all four tyres, and
+  a Coulomb moment balance for the Husky's geometry predicts a 0.55 ceiling
+  against the 0.532 measured. Straight-line tracking is unchanged (0.9991).
+  The honest cost: a driven wheel is now a flywheel, so a base freewheeling
+  down a slope accelerates more slowly. `dof_armature` is dual-written to the
+  `mujoco_warp` model with a revert-on-failure path. This also root-causes
+  `roll-check.md` §5, open and explicitly not root-caused since 2026-07.
+- **URDF inertia tensors and Robot-root inertia now reach the solver**
+  (2026-09-10, `OmUrdfImporter.cpp`, `OmSolid`,
+  `flushPendingNewtonRegistrations`; hatches `OMNISIM_URDF_USE_INERTIA=0`,
+  `OMNISIM_NEWTON_INERTIA_COM=0`, `OMNISIM_NEWTON_ROBOT_GEOM_INERTIA=0`). Two
+  defects made a body's rotational inertia a mass-scaled preset whatever the
+  author declared. The importer gated tensor emission behind a presence-gated,
+  default-OFF flag — an ODE-era workaround for a `dMassSetParameters` crash
+  that outlived ODE's deletion by a month — so the native `URDFRobot` path
+  never wrote `Physics.inertiaMatrix` and `add_body` substituted the
+  Husky-tuned preset, with `kMinInertia 1e-4` silently dropping small tensors
+  and `centerOfMass` discarded unless `OMNISIM_NEWTON_USE_LINK_COM` was set
+  (handing MuJoCo a COM-frame tensor at `ipos = 0` understates joint inertia by
+  `m·d²` and zeroes the gravity torque on any pendulum-shaped link); and the
+  geometry-derived branch skipped every `Robot` wrapper. Measured, before →
+  after: the cart-pole pole read 0.26669 about the ORIGIN with `ipos = 0`, and
+  a 4.5× tensor change gave a byte-identical `mjModel` → 0.0667 with
+  `ipos = [0, 0, 1.0]`, and the control now moves it; two 8×-scale robots with
+  no `<inertia>` both read `[0.0668, 0.0376, 0.0376]` → `[0.0219, …]` and
+  `[1.3333, …]`, exact to seven digits against `m/12·(b²+c²)`; a 0.2 m rod
+  pendulum released horizontal (theory 0.21615 s) never fell at all →
+  0.21515 s, −0.46 %. Every load prints an inertia provenance census (N
+  declared, M from geometry, K from the preset) and a rejected tensor WARNs
+  with the link name, so this class of substitution can never be silent again.
+  **Behaviour change, read before deploying a trained policy:** on
+  `g1_stand_deploy` 14 of 15 bodies moved `body_ipos` (max 0.154 m). That
+  closes the train–deploy COM gap `train-deploy-gap.md` names as the dominant
+  cause of trajectory drift — deploy now matches the trainer's `add_urdf` —
+  and it means a policy trained against the old COM-at-origin deploy now runs
+  on different physics; `OMNISIM_NEWTON_INERTIA_COM=0` restores what it was
+  trained on. Husky deterministic straight-line drive 12.532 m vs 12.511 m
+  reverted (0.17 %); the OmniQuad still stands at trunk z 0.845 with its trunk
+  tensor dropping from the preset (3.33, 3.10, 1.09) to the declared (1.17,
+  1.14, 0.20); `omniarm6_real_pick_place` still grasps, lifts, carries and
+  places (its already-failing drift criterion widens 0.0205 → 0.0283 m).
+- **Plain static colliders share Newton's world body: a 5000-static world
+  loads in 16 s instead of never** (2026-09-07; hatches
+  `OMNISIM_NEWTON_STATICS_ON_WORLD=0`, `OMNISIM_NEWTON_FAST_PAIRS=0`). Every
+  static Solid used to be its own MuJoCo body, and the broadphase pair buffer
+  grows with the square of the body count: 2000 one-metre statics died in
+  `mj_broadphase` (`mj_stackAlloc: out of memory`) and 5000 never finalised
+  while `run-headless --until-finalized` still said PASS. A static with no
+  joint in its subtree, no TouchSensor / Connector / VacuumGripper and no cloth
+  coupling now registers its shapes on newton body −1 at the composed world
+  pose; contacts and raycasts still name the Solid, a field write that moves
+  it re-places its geoms on both solver paths, welds treat it as the world, and
+  a static that carries a device, a joint or cloth keeps its body. Two
+  quadratic walls in vendored newton 1.5.0 are bypassed from the runtime:
+  `add_shape` walked every earlier shape on the body per add (5000 statics
+  registered in 6.9 s → 0.6 s) and `_find_shape_contact_pairs` was a Python
+  double loop over 12.5 M pairs (`builder.finalize` 18.2 s → 0.09 s). Measured
+  on N static boxes plus one ball: N = 2000 finalises 9.1 s after launch (was
+  FAILED), N = 5000 in 15.9 s with the ball resting at the right height (was
+  never); N = 20000 registers in 2.5 s and finalises in ~130 s, all of it
+  inside newton's own MuJoCo conversion — the next wall is vendored. The census
+  line reads how many statics went to the world body; `run-headless
+  --until-finalized` now FAILS a world whose census registered bodies but
+  never finalised; a world whose only colliders are plain statics gets one
+  welded anchor body so newton's converter has its joint
+  (`template_deterministic` in the smoke set pins it); and `OMNISIM_BINARY` is
+  honoured by the harness and the lane-4 runner as it is by `run-headless`.
+
+### Fixed
+
+- **A joint authored at a non-zero `position` now starts the first physics
+  step THERE** (2026-09-08; `OmBasicJoint::flushPendingNewtonRegistrations`,
+  `OmUrdfImporter.cpp`, `omnisim_newton_runtime.py`; hatch
+  `OMNISIM_NEWTON_SPAWN_AT_POSITION=0`). Three things disagreed about what
+  `HingeJointParameters.position` means: the URDF importer wrote the endPoint
+  at the URDF zero pose and set `position` to the `<rest>` / midpoint angle,
+  Webots' joint bookkeeping treats the authored endPoint pose as the pose AT
+  `position`, and the Newton bridge registered the joint frame at the current
+  pose with the coordinate at 0 — so every URDF robot with a rest crouch (Go2,
+  B2, OmniQuad, the Deep Robotics dogs, a midpoint-seeded Panda joint 4) spawned
+  straight-legged with only the motor targets carrying the crouch, and the
+  servos yanked it there in ~0.2 s (the Lite3 read hip-pitch −0.015 / knee
+  0.524 at t = 8 ms against targets −1.0 / 1.8 and drove its feet through the
+  floor). Now the importer writes the endPoint already posed, the bridge
+  defines the joint frame at the child's zero pose (Webots' own
+  `zeroEndPointTranslation` / `zeroEndPointRotation`) and seeds newton's joint
+  coordinate with `position`, and the first forward kinematics lands on the
+  authored pose: the same trace reads −1.000 / 1.800 at t = 8 ms. Limits and
+  the position readback stay absolute. Hand-authored worlds with a posed
+  `position` (the alife creatures) now read the authored angle at spawn
+  instead of 0.
+
+### Robot library
+
+- **Seven Deep Robotics robots join the library** (2026-09-08,
+  `projects/robots/deep_robotics/`, from
+  [DeepRoboticsLab/deep_robotics_model](https://github.com/DeepRoboticsLab/deep_robotics_model)
+  commit `549eb9ac`, BSD-3-Clause): the **Lite3** and **X30** quadrupeds, the
+  **M20**, **M20S** and **M20 + AgileX Piper** wheeled-legged quadrupeds, and
+  the **DR02 Standard** / **DR02 Pro** humanoids (plus upstream's
+  fixed-wrist DR02 Pro). `make_urdfs.py` regenerates every package from a
+  sparse clone; `PROVENANCE.md` lists each change to the upstream files (mesh
+  paths, standing rest poses, bare foot frames with the contact sphere moved
+  onto the shank, one full-width-period typo) and the shared-mesh layout that
+  keeps the M20 family at one copy of its leg meshes.
+- **Every one of them stands.** A stand world per robot plus a seven-robot
+  showroom under `projects/robots/deep_robotics/worlds/`, all run by the new
+  `deep_robotics_stand` controller, which ramps the motors from the engine's
+  spawn pose to the URDF rest pose. Two engine behaviours were measured on the
+  way and are written up in `PROVENANCE.md`: a URDF robot's joints start the
+  first physics step at q = 0 whatever `<rest>` / `HingeJointParameters.position`
+  says (only the motor targets carry the rest pose), and a stiff position servo
+  on a light leg link is numerically unstable at an 8 ms step — the Lite3
+  hopped and flipped on every floor, friction, contact stiffness and damping
+  tried until `newtonSubsteps 8` + `newtonCompoundColliders TRUE` (with
+  `newtonGroundMu 2`) held it. Every new world carries that recipe.
+- **A legged terrain traverse for the Lite3 and X30**
+  (`projects/robots/deep_robotics/worlds/{lite3,x30}_terrain.omniworld`,
+  controller `deep_robotics_crawl`). A SCRIPTED, statically stable creep gait
+  through closed-form leg IK — the Unitree B2 crawl model re-parameterised for
+  the Deep Robotics leg geometry and mirrored joint axes, with an offline
+  IK-versus-URDF-chain self-test — plus a heading hold that steers with the
+  gait's yaw sweep from the robot's own pose. No supervisor pin, no policy,
+  and at that point nothing sensed the terrain (the next bullet makes it
+  map-aware). Measured 2026-09-08 on a 10 m ElevationGrid
+  strip of 2–6 cm rolling hills: the Lite3 crossed it at 0.045 m/s within
+  12 cm of its line (20 cm once map-aware) and never tilted; the X30 at 0.07–0.10 m/s within 4 cm;
+  both stop and hold their stance 1.5 m past the strip. Catalogued under the
+  quadruped-locomotion table with that label so nobody mistakes it for
+  learned walking.
+- **The X30 crosses a 16 m EXTREME-terrain course, and the crawl is now
+  terrain-aware** (`projects/robots/deep_robotics/worlds/x30_extreme_terrain.omniworld`:
+  6–14 cm rolling hills, a field of 2–4 cm rubble plateaus, a 12° ramp up to
+  a 0.64 m plateau and a 12° ramp down). `deep_robotics_crawl` gained
+  `TerrainCrawl`: the world's ElevationGrid is read once through the
+  Supervisor — standing in for the elevation map a real robot builds from
+  depth sensing — and the gait plants its feet on it, keeps the body at a set
+  height above the MEAN ground under the four feet (the map under the body
+  centre jumped at plateau edges), pitches to sustained grades (0.8 m
+  look-ahead, gated at a 6 % grade), picks the flattest of three footholds
+  along the stride, lifts each swing over the highest ground on its path and
+  slows on descents. Still scripted: no contact sensing, no policy, and the
+  measured-tilt feedback loop ships OFF (`--attitude-gain 0`) because every
+  gain tried rocked the robot over in the rubble. Measured 2026-09-08: the
+  X30 crossed the whole course including the descent — 18 m in 320 s
+  (0.056 m/s), minimum up-vector z 0.91, centreline within 25 cm, stops and
+  holds at x = 16.5 m. The ceiling is recorded, not hidden: 3–6 cm and
+  4–8 cm rubble plateaus tip it in the rubble field, a lateral foothold
+  search narrowed the support polygon and made it worse, and the Lite3 is
+  thrown sideways at the 7 cm hill of a half-scale copy of the course, so
+  no Lite3 extreme world ships.
+- **The quadruped chat bridge is config-driven.** `omnilink_quadruped_bridge`
+  now reads `_quadruped_configs.py` (`--robot <key>`): leg motor names, stand /
+  sit poses, per-leg sign conventions, a settle ramp, `body_lock`, and a `walk`
+  mode of `gait` (OmniQuad's supervisor-assisted gait, unchanged), `march`
+  (Lite3 / X30: the gait in place on real physics) or `wheels` (the M20
+  family drives its wheels — 0.48 m/s measured through the bridge). Five new
+  chat worlds: `omnilink_lite3` / `x30` / `m20` / `m20s` / `m20_piper`.
+  `tests/test_validate_urdf.py` pins the eight generated URDFs clean.
+
+### Agent bridges
+
+- **`/set_velocity` delivers the commanded yaw, and `/turn` refuses what the
+  base cannot do** (2026-09-10, `omnilink_mobile_bridge`;
+  `OMNISIM_MOBILE_YAW_SERVO=0`, `OMNISIM_MOBILE_YAW_GAIN` to override).
+  Angular rate was under-delivered badly — 0.6 % of command on the Husky, 13 %
+  on the Burger — while linear tracked at ~1.0. The mixing was not the bug
+  (textbook diff-drive, matching the URDF geometry); the deficit lived in the
+  solver (the stall-torque cap under *Physics*) and the bridge was lying about
+  it. It now feed-forwards the measured yaw gain, closes an integrator around
+  measured yaw and clamps to the measured ceiling, reporting `limited` above
+  it. Commanded vs achieved at low / mid / ceiling: TB3 0.132× → 1.003×,
+  Husky 0.006× → 0.999×, XL 1.001 / 1.001 / 1.000. Verbs return
+  `{commanded, applied, achieved, error, settled}` plus `limit_note`, not an
+  `{accepted, linear, angular}` echo. Two drive bugs found alongside: the
+  proportional slow-down clamp was inverted on any base topping out below
+  0.25 m/s (the Burger's overshoot +8.6 % → +1.5 %), and `settled` in the
+  drive branch meant "did not time out" rather than "converged". The ROSbot
+  XL's configured `wheel_radius_m` was 0.05 against 0.048 in its URDF, a 4 %
+  linear scale error. `gripper_effectors.py` drops a `setControlPID(5000, 0, 0)`
+  that is a no-op on this engine (see the `motor.md` note under
+  *Documentation*); `setAvailableForce` was already the live lever.
+- **Restart-safe motion identity** (2026-09-07). `seq` is monotonic only
+  within one controller process, so a caller polling for
+  `last_command.seq == 1` after a bridge restart could match the new process's
+  first motion instead of the one it dispatched. Every seq-bearing path —
+  dispatch replies, completion and superseded records, the wait timeout,
+  `get_robot_state`, the 409 busy detail, `GET /protocol`'s `instance` — now
+  carries a per-process `bridge_instance_id` beside the seq, and PROTOCOL.md
+  §5.4.1 rule 4 records the tuple requirement. `turn` used to report
+  `settled: true` when it had merely spent its correction pulses; it now
+  reports `settled` only on tolerance and names `completion_reason`
+  (`tolerance` / `timeout` / `correction_limit`).
+- **The mobile bridge's yaw envelope is re-measured after the stall-torque
+  change, and two bases stop refusing turns they can make** (2026-09-11,
+  `_mobile_configs.py`, `omnilink_mobile_bridge.py`). The armature change made
+  the solver deliver 7–104× more yaw than the bridge's `yaw_rate_gain`
+  constants believed, and the bridge feed-forwards `1/gain`, so it was
+  over-commanding by that factor while `max_angular_rad_s` clamped every base
+  to a fraction of what it could now do. Measured at each base's kinematic
+  ceiling through the documented protocol (`OMNISIM_MOBILE_YAW_SERVO=0`,
+  `OMNISIM_MOBILE_YAW_GAIN=1.0`), every base on its own world, no twin carried
+  across — old → new gain, then `max_angular` old → new in rad/s: TB3 Waffle /
+  Waffle Pi 0.1324 → 0.955 (0.182 → 1.313), TB3 Burger 0.1324 → 0.942
+  (0.328 → 2.331), ROSbot 0.0069 → 0.720 (0.034 → 3.497), ROSbot XL
+  0.0069 → 0.520 (0.032 → 2.416), Husky 0.0343 → 0.520 (0.119 → 1.805), Jackal
+  0.0343 → 0.490 (0.108 → 1.541). Three of the seven had inherited a twin's
+  number, never measured, and were wrong in both directions: the ROSbot is
+  materially better than the XL it copied, the Jackal worse than the Husky.
+  `can_rotate_in_place` is derived from the ceiling, so the ROSbot XL's
+  `cannot_rotate_in_place` refusal — a false negative since the armature
+  change — self-corrected with no edit to the refusal logic: `/turn` at ±90°
+  and ±180° settles within 0.88°, 5.2 s of simulation for 90° against a 49 s
+  estimate and an outright refusal before; the ROSbot was refusing too, and
+  `drive_to` on either base could not complete a leg needing more than ~90° of
+  heading change. `can_strafe` stays `false`: the XL's mecanum wheels are still
+  plain cylinders with no rollers, a separate and still-true limitation. The
+  yaw servo stays, on measurement rather than assumption — calibrated
+  feed-forward alone is 24 % short on the Husky and 34 % on the XL at a
+  0.05 rad/s request, outside the 0.15 band `settled` promises, while with the
+  servo the XL holds 1.0000 of a 1.5 and a 2.0 rad/s request. The armature did
+  not lengthen the stop transient (chassis yaw rate falls below 0.01 rad/s
+  within 1–4 ticks) and linear is not regressed (`set_velocity` holds 0.9991
+  at 0.2 and 0.5 m/s; `drive_forward` is bit-identical on the XL).
+  `yaw_rate_gain` is now documented in `omnilink-add-your-robot.md` with its
+  measurement recipe; an author adding a robot used to inherit the 1.0 default
+  silently, about 2× optimistic for a skid-steer. Every turning claim the fix
+  falsified is withdrawn across DEMOS.md, PROTOCOL.md, the maze and swarm
+  agents and the developer docs — the lesson kept, the number withdrawn,
+  nothing invented in its place. The sweep also found the maze agent's prompt
+  instructing the model to call a removed `snap_to_cell` verb after every
+  move; fixed.
+
+### Reported by beta testers
+
+- **The parked Mavic no longer jumps at world load** (#14, follow-up). The
+  tester's harness measured a repeatable 0.485 m displacement from the authored
+  start within 2.5 s; here it was 1.15 m along the heading plus a 20 cm hop
+  (engine body trace, step 30: z 0.10 -> 0.28). Bisected with sibling copies of
+  the bridge on one engine: the current bridge and the v8.1.17 bridge eject
+  byte-identically, a bridge that never commands the gimbal does not move, no
+  controller does not move, the v8.1.17 URDF ejects too, and lowering the
+  gimbal's URDF effort from 5 to 0.2 N*m only shrinks it to 0.3 m. The cause is
+  the init command itself: `setPosition(pi/2)` on the camera-pitch servo from
+  rest is a 1.57 rad step, and the reaction into a 1 kg airframe throws it. The
+  bridge now walks the commanded gimbal angle toward its target at 1 rad/s
+  (`GIMBAL_RATE_RAD_S`, ~1.6 s to straight down) from wherever the joint is; the
+  aircraft then parks at the authored pose to the millimetre (`-0.500, -0.501`
+  vs authored `-0.5, -0.5`) through 2 s. So the v8.3.0 idle drift and this jump
+  were the same servo: the friction declaration held the sustained part, this
+  removes the transient. `gimbal_pitch_rad` in `/state` now reports the
+  commanded (ramping) angle rather than the target.
+- **`reset` returns to the world's authored pose** (#14, found by the same
+  harness). The default teleport target was the `omnilink_mavic` spawn
+  `(0, -12, 0.1, yaw pi/2)` hard-coded in the bridge, so on any other world a
+  bare `POST /action {"action": "reset"}` put the aircraft somewhere else -- on
+  the tester's corridor world, 11.5 m away and off the edge of the floor.
+  The bridge now captures the URDFRobot's `translation`/`rotation` at init
+  (`yaw_from_axis_angle`, unit-tested) and resets there unless told otherwise.
+- **`no_progress` is advisory again inside `goto_waypoint {"wait": true}`**
+  (#14). The v8.3.0 stall report was documented as report-only, but the wait
+  helper returned on ANY fault, so a leg that stalled for 12 s of sim time came
+  back as failed instead of using the caller's `timeout_s`. Only a hard fault
+  ends the wait early now; the advisory is still set in `/state`, still in the
+  final response if the leg times out, and is cleared on arrival. Three unit
+  tests pin it.
+- **A fallen aircraft now reports `crashed`, and the stall check sees it** (#14).
+  The tester wrote that `no_progress` never fired on a wedged flight; the probe
+  that reproduced it clipped a shelf, tumbled, and sat on its nose at z 0.19 m
+  (pitch -pi/2) for 85 s in `mode=goto` with `fault=None` on every sample. Not
+  the closest-approach logic -- on a flight pinned at cruise it fired -- but the
+  stall check lived inside the bridge's `altitude > 0.25` gate, so an aircraft
+  that had fallen was never evaluated. Both checks now run before that gate,
+  and an airframe tipped past 1.2 rad of roll or pitch for 1 s of sim time in a
+  flight mode gets a HARD `crashed` fault (`crash_verdict`, unit-tested) that
+  ends a `goto_waypoint {"wait": true}` at once, because that leg cannot
+  succeed on its own; `no_progress` stays advisory.
+- **And the stall clock no longer resets itself on an aircraft at exact rest**
+  (#14, the tester's 197 s pin at cruise, 1.073 m from the target, with
+  `fault=None` on all 3868 samples). The v8.3.0 wiring decided "we just set a
+  new closest approach" with a float equality (`state.stall_best == dist_xy`),
+  and a distance that is bit-identical from one tick to the next satisfies it
+  on every tick -- a wedged airframe that MuJoCo holds at exact rest reset its
+  own 12 s clock 125 times a second. Any jitter fired it, which is why every
+  pin measured here reported and his did not: his aircraft moved by
+  millimetres a few times a minute, and each 60 s leg window saw a constant
+  distance. Reproduced engine-free by replaying the wiring on a constant
+  distance (never fires) and on +-0.1 mm of jitter (fires at 12 s). The
+  tracker is now one pure per-tick step (`stall_step`) whose clock resets only
+  on actual progress; four tests replay constant, jittering, progressing and
+  hard-faulted distances through it.
+- **The Mavic position hold has an integral term, and the v8.2.0 damping
+  change stays** (#14, the completion regression). The tester measured mission
+  completion fall from 14/17 on v8.1.17 to 8/18 on v8.3.0 on a shelf corridor
+  with 0.5 m of standoff. Reproduced with his harness on one engine so only the
+  bridge varied, three flights per arm, one engine per flight, on the ejected
+  start pose he had: v8.3.0 as shipped (`K_XY_V` 8, 1.0 m/s cruise) completed
+  1/3 with two flights wedged against a shelf face; the v8.1.17 bridge
+  (`K_XY_V` 3, 2.7 m/s) 2/3 with one flight tumbling into the first shelf at
+  1.5 m/s on leg 1; v8.3.0 with only `K_XY_V` put back to 3, 3/3 with one
+  contact. So the direction was real and the cause was the v8.2.0 "firmer
+  velocity damping": at 1.0 m/s the aircraft flies near-minimal straight lines
+  (path 23-33 m on a 34 m route) and cuts every corner along the shelf faces,
+  while at 2.7 m/s it swings wide (52-56 m) and clears them by overshoot. What
+  made the straight lines dangerous was a standing hold error of 0.2-0.6 m --
+  a body-frame trim the P term can only balance with an offset -- so each leg
+  started off-lane; the tighter arrival tolerance that would have exposed it
+  instead never arrives (the aircraft parks 0.55 m short, forever). A body-frame
+  integral term (`K_XY_I` 0.4, clamp 3, active inside `POS_HOLD_RADIUS_M`,
+  cleared by `reset`) removes the offset: with the authored start restored by
+  the gimbal ramp, the shipped bridge went 3/3 before the integrator with the
+  hull grazing at 0.000-0.005 m, and 3/3 after it with 0.15-0.18 m of hull
+  clearance and 0.30-0.32 m to the nearest shelf, travel 41 s, path 33.4 m.
+  An intermediate gain (`K_XY_V` 5, 1.6 m/s) was measured too: 1/3, two
+  collisions. The cruise ceiling stays at 1.0 m/s.
+- **`newtonGroundMu 1.5` is a per-world declaration, not a new default** (#14,
+  follow-up). The v8.3.0 note on the parked Mavic could be read as a change to
+  the engine; it was not. `WorldInfo.newtonGroundMu` still defaults to unset
+  (`-1`), which the engine runs at 1.0, and a world that does not declare the
+  field keeps exactly the old behaviour -- a tester nearly measured the old
+  physics believing it was the new. The shipped `omnilink_mavic.omniworld`
+  declares it; a world of your own has to as well.
+
+### Contributed
+
+- **`omnisim.apply_wrench`, a documented external-wrench helper** (public PR
+  #19, lluisestape-upc). A thin wrapper over `Node.addForce`,
+  `addForceWithOffset` and `addTorque` that adds no engine capability and
+  fixes the two things that are easy to get silently wrong with them: the
+  frame is stated at the call site (`frame="world"|"body"`, and the offset is
+  always in the node's local frame, as the primitive has it), and a supervisor
+  wrench is a single-step impulse, so `apply_wrench` returns a `Wrench` whose
+  `tick()` re-applies it every step for `duration_s` of simulation time.
+  Validates the target and the vectors, warns once past ten times the body's
+  weight (`clamp=` for a hard ceiling). `tests/test_wrench_api.py` builds a
+  zero-gravity world with two free bodies and checks the delivered impulse
+  against the analytic value -- with a degenerate one-shot arm beside it, so
+  a re-application that silently dies shows up as the two arms converging
+  (5 tests, engine lane, 11.5 s here). Exported from the `omnisim` package;
+  the engine override the suite honours is `OMNISIM_BINARY`, like everything
+  else in the tree. A contributed follow-up lets that override name an engine
+  installed outside the clone, with its caveat recorded rather than papered
+  over: a controller then resolves `omnisim` from the install's
+  `lib/controller/python`, so a module that exists only in a checkout is
+  invisible to it.
+- **The Mavic corridor navigation benchmark** (public PR #18, lluisestape-upc):
+  `tests/benchmarks/mavic_corridor/` -- two warehouse-corridor worlds, the
+  eight-waypoint mission script, the kinematic baseline, and a README with the
+  recipe. This is the test that made the v8.2.0 corner-cutting visible: every
+  flight reported eight arrivals while the hull cleared the shelving by
+  millimetres, and `min_hull_clearance_m` is the number that sees it. The
+  controller in the benchmark tree is a relay that execs the shipped bridge
+  (a world under `tests/` cannot see `projects/.../controllers/`, and the
+  engine falls back to `generic` without complaining). Verified from the new
+  location on this tree: 8/8, hull clearance 0.159 m, 40.8 s.
+
+### Documentation
+
+- **Two Linux onboarding gotchas from a fresh-clone test** (#17). The `gpu`
+  phase of `linux_bootstrap.sh` installs the physics wheels into the *system*
+  interpreter on purpose (the engine embeds it; a venv is invisible to it), so
+  a venv created for your own tooling needs `--system-site-packages` or
+  `include-system-site-packages = true` in its `pyvenv.cfg` to see them -- now
+  in the quickstart's Linux gotchas. And `python -m omnisim` runs from the
+  repository root: the clone directory is itself named `omnisim`, so from the
+  parent directory Python resolves the clone as an empty namespace package.
+  There is no installable package yet, so `pip install -e .` is not an
+  alternative; that is on the list.
+- **Public replies name releases, not commits.** A development commit hash
+  quoted in an issue reply does not resolve in a public clone, because each
+  release lands as a squashed snapshot (#17 hit this with `6a4381c4b`).
+- **`controlPID` and `acceleration` are dead on the Newton path**
+  (`docs/reference/motor.md`, 2026-09-10). `controlPID` parses, is
+  range-checked, streams to libController and still feeds
+  `OmMotor::computeCurrentDynamicVelocity` — but the ODE deletion removed the
+  consumer of that computation's result. The Newton/MuJoCo actuator is PD with
+  gains from the torque ceiling (`ke = effortLimit × 10`,
+  `kd = effortLimit × 0.5`) and no integral term. Measured on a one-hinge servo
+  over 250 ticks: `controlPID 10 0 0` vs `0.01 0 0` gives byte-identical
+  joint-angle traces for a limited `RotationalMotor`, a limit-less motor
+  promoted to a servo, a `LinearMotor` on a `SliderJoint` and a runtime
+  `wb_motor_set_control_pid` call; `maxTorque 20 → 2` diverges at tick 1 on the
+  same rig. Wiring `controlPID` into the solver gains was considered and
+  rejected: the default `10 0 0` would take a 194 N·m shoulder from `ke 1940`
+  to `ke 10`, and every position-controlled joint in the tree — deployed RL
+  policies included — would go limp at once.
+- **Four claims falsified by the inertia default flip are corrected**
+  (`sim-to-deploy-rl-recipe.md`, `g1-stand-rl-playbook.md`,
+  `simulator-comparison.md`, `g1-single-source-of-truth.md`).
+  `OMNISIM_URDF_USE_INERTIA=1` is no longer "required or the importer discards
+  `<inertial>`" — it is the default, and `=0` reverts; the measured lane-3b
+  parity score is flagged as predating the change rather than edited in place,
+  because it is evidence and must be re-run to speak for itself
+  (`OMNISIM_NEWTON_INERTIA_COM=0` reproduces the configuration it scored).
+  `roll-check.md` §5 — a coarse step divides the actuator's available torque
+  so the wheel slides instead of rolling — is root-caused by the armature
+  change under *Physics*. And the Deep Robotics `PROVENANCE.md` records that
+  the explicit spring–mass ratio does not predict the Lite3 stance
+  instability.
+
+### Demos
+
+- **Blockworld, a Minecraft-style block world for agents**
+  (`projects/samples/demos/worlds/environments/blockworld.omniworld`, guide
+  `docs/guide/blockworld-agent-environment.md`, 2026-09-07). A 32 × 32 field
+  of one-metre cubes — grass, dirt, stone, ore, six trees, one dynamic probe
+  ball — where every block is its own static Solid named by grid coordinate
+  (`DEF B_x_y_z`, name `b_x_y_z`), so an agent mines and builds over the
+  harness: `GET /scene/node/B_x_y_z`, `POST /scene/delete` and `/scene/spawn`
+  with `{"physics": "rebuild"}`, `GET /sim/contacts`, `POST /world/screenshot`.
+  No robot and no keyboard: the agent is the player. Generated by
+  `gen_blockworld.py` (seeded value noise; same inputs → byte-identical
+  output). Measured through the harness (CPU `mj_step`): light load 10.7 s,
+  5,343 nodes, 2,667 statics on the world body; 120 steps in 148 ms wall;
+  delete + rebuild 4.6 s round trip (the probe fell one block, 3.30 → 2.30);
+  `run-headless --until-finalized --fail-on-warning` PASS, finalised 7.7 s
+  after launch. It is the demo of the world-body statics change and would not
+  load at all without it.
+- **Three Agent Build Film flagship worlds ship** (2026-09-09/11;
+  `flagship/husky_one_passage.omniworld`, `two_robots_tower.omniworld`,
+  `two_robots_100_boxes.omniworld`; the flagship count moves 25 → 26). Four
+  Huskies sharing a 1.10 m passage — the film measured three coordination
+  mistakes: independent entry, symmetric proximity yielding, releasing a shared
+  approach too soon; two physical Cartesian builders with friction-only grips
+  stacking free dynamic blocks, where the wider-base design reached 20 blocks,
+  17 layers, 1.6868 m hands-off; and Part Two, two gantry robots (x / y / z
+  sliders and a two-finger gripper, the fingers supplying all grip force) on
+  either side of a plinth with one hundred free boxes at `basicTimeStep 8`
+  with compound colliders, elliptic cones and raised constraint caps, driven
+  by `tower100_builder` / `tower100_director`. The passage Husky variants live
+  beside the stock Husky as `husky_passage_{A,B,C,D}.urdf` with `package://`
+  mesh references, and every texture ships under
+  `projects/samples/demos/worlds/textures/` by `omnisim://` URL, so the worlds
+  load anywhere (they had pointed at absolute paths on the authoring machine).
+- **BattleBots realism pass**
+  (`projects/robot_combat/battlebots/worlds/hydra_vs_gravedigger.omniworld`,
+  2026-09-09). The spec sheet is re-derived — a 108 kg Hydra with a
+  2500 N·m / 55 rad/s ram that throws a heavyweight 2–3 m; a 113 kg
+  Gravedigger with a 30 kg bar at 160 rad/s, tip 80 m/s, 32 kJ stored.
+  `contactProperties` (never read on Newton) gives way to `newtonGroundMu 0.9`,
+  `newtonContactKe` / `Kd` 111000 / 667 — a 3 ms contact, still critically
+  damped; the stock 20 ms cushion let the bar sink 66 mm and swallow ~98 % of
+  a hit's energy — and `newtonSubsteps 12` so the bar tip moves under 3 cm per
+  sub-step. `battlebot_brain --tune KEY=VALUE` overrides one tuning value for
+  one bot (repeatable) and `weapon_hold` replaces a hard-coded spin throttle;
+  `OMNISIM_DAMAGE_TRACE=<path>` writes one JSON line per contact tick (default
+  OFF) and `scripts/dev/combat_realism_report.py` scores a configuration from
+  it.
+- **OmniTug 500 MCL dataset recorder**
+  (`projects/robots/omnisim/omnitug500/worlds/omnitug500_mcl_record.omniworld`):
+  the lidar-patrol arena with a recording controller. The rover drives the
+  same elliptical loop for 60 s and writes, at 5 Hz, ground-truth pose, noisy
+  wheel odometry and one 512-beam scan per tick, plus a kidnapped-robot
+  teleport at t = 30 s that leaves odometry untouched. Seeded, so two runs of
+  one build give identical files.
+- **Evaluation-only trace hooks, both off by default.** `PICK_PHASE_TRACE=1`
+  on `omniarm6_real_pick_place` records the simulation-time boundary of every
+  phase (ready, approach, pre-grasp, grasp commanded, lift, carry, released,
+  settled) as a `phase_trace` list on the result JSON;
+  `OMNISIM_MOBILE_TRACE_PATH=<file>` on the mobile bridge writes one JSON line
+  per tick with the commanded body and wheel targets next to the ACHIEVED
+  wheel rates (differentiated from the joint sensors, not the target echoed
+  back). And the two ladder0 OmniSim-arm controllers still imported from
+  `controller`, the alias deleted in 8.x, so every ladder run failed before
+  its first step — fixed, with `LADDER0_DURATION_OVERRIDE` for evaluations
+  that must hold a rung longer than the benchmark contract.
+
+### Cinema
+
+- **An action opening for the Agent Build Films, brand typography, and plate
+  segments with sources** (2026-09-08). `editorial.opening` selects
+  `signature` (the silent 10 s intro, still the default) or `action`: picture
+  and narration start at second zero, the AI-production disclosure rides the
+  first simulator shot as an overlay, there is no intro or outro, and the
+  score is an original synthesized bed with more movement through the
+  decisive run; action edits keep their source grade. A `kind: "plate"`
+  segment may carry a `source` video (an authored diagram) with the same
+  media-range, hash and delivery checks as a clip, and stays out of the
+  real-footage ratio. Films now end on the story. Space Grotesk (variable,
+  300–700), the brand-book display and body family the overlays render with,
+  ships under `resources/branding/omnisim/fonts/` under the SIL OFL 1.1 with
+  its licence text and a provenance README; `NOTICE` and
+  `THIRD_PARTY_NOTICES.md` gain the entry.
+
+### Tooling
+
+- **The pre-push smoke gate tolerates parallel engines** (2026-09-08).
+  Engines coexist by design — each takes the first free port in
+  [1234, 1294] — but the gate assumed it owned the machine: `test_suite.py`
+  required the literal pair "1234" and "1235" on one stderr line to prove its
+  engine had fallen back, so with a foreign engine on 1235 it reported a
+  correctly-behaving engine as a failure; and `run_smoke.py` exited 2 before
+  launching anything when 1234 was busy. Both now match the engine's own
+  port-fallback message (`... on port 1234. ... Using port N instead`) and
+  proceed; verified by a push that ran with four foreign engines up and 1234
+  held.
 
 ## [v8.3.0] — 2026-09-03
 

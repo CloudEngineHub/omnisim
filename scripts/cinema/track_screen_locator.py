@@ -171,6 +171,8 @@ def main() -> int:
     parser.add_argument("--fps", type=int, default=25)
     parser.add_argument("--scale", type=int, default=4)
     parser.add_argument("--radius", type=int, default=24)
+    parser.add_argument("--output-width", type=int, default=0)
+    parser.add_argument("--output-height", type=int, default=0)
     args = parser.parse_args()
 
     frames = sorted(args.frames.glob("frame_*.png"))
@@ -179,10 +181,23 @@ def main() -> int:
     tracked, full_size = _track(frames, args.scale)
     max_score = max(point[2] for point in tracked) or 1.0
     args.output_video.parent.mkdir(parents=True, exist_ok=True)
+    if bool(args.output_width) != bool(args.output_height):
+        raise SystemExit("--output-width and --output-height must be provided together")
+    if args.output_width and args.output_height:
+        video_filter = (
+            f"scale={args.output_width}:{args.output_height}:force_original_aspect_ratio=decrease,"
+            f"pad={args.output_width}:{args.output_height}:(ow-iw)/2:(oh-ih)/2:black"
+        )
+        output_size = [args.output_width, args.output_height]
+    else:
+        # H.264 4:2:0 requires even dimensions. Native renderer exports can be odd.
+        video_filter = "pad=ceil(iw/2)*2:ceil(ih/2)*2"
+        output_size = [full_size[0] + full_size[0] % 2, full_size[1] + full_size[1] % 2]
     encoder = subprocess.Popen([
         args.ffmpeg, "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
         "-video_size", f"{full_size[0]}x{full_size[1]}", "-framerate", str(args.fps),
         "-i", "-",
+        "-vf", video_filter,
         "-c:v", "libx264", "-preset", "slow", "-crf", "12",
         "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(args.output_video),
     ], stdin=subprocess.PIPE)
@@ -204,6 +219,7 @@ def main() -> int:
         "output_video": str(args.output_video),
         "frame_count": len(frames),
         "frame_size": list(full_size),
+        "output_frame_size": output_size,
         "fps": args.fps,
         "locator": {
             "kind": "screen_space_motion_tracker",

@@ -11,6 +11,8 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -36,6 +38,39 @@ from cinema import sim_quality  # noqa: E402
 import omnisim_capture as capture_service  # noqa: E402
 
 
+@unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "requires ffmpeg")
+class AgentBuildConcatTimingTests(unittest.TestCase):
+    def test_fractional_second_cuts_keep_every_frame_on_the_cfr_grid(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = agent_build.RenderProfile("timing_test", 96, 54, 30, "veryfast", 22)
+            clips = []
+            for index, count in enumerate((37, 41, 58)):
+                path = root / f"{index}.mp4"
+                subprocess.run([
+                    "ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+                    "testsrc2=size=96x54:rate=30", "-frames:v", str(count),
+                    "-c:v", "libx264", "-preset", "veryfast", "-threads", "2",
+                    "-pix_fmt", "yuv420p", str(path),
+                ], check=True)
+                clips.append(path)
+            output = root / "joined.mp4"
+            cache = agent_build.ArtifactCache(root, profile)
+            with mock.patch.object(agent_build, "_run", wraps=agent_build._run) as run:
+                agent_build._concat(clips, output, profile, cache, 136 / 30)
+            self.assertEqual(run.call_count, 1, "CFR clips should join without re-encoding")
+            result = json.loads(subprocess.run([
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=avg_frame_rate,nb_frames:packet=pts,duration",
+                "-of", "json", str(output),
+            ], text=True, capture_output=True, check=True).stdout)
+            self.assertEqual(result["streams"][0]["avg_frame_rate"], "30/1")
+            self.assertEqual(int(result["streams"][0]["nb_frames"]), 136)
+            pts = sorted(packet["pts"] for packet in result["packets"])
+            step = result["packets"][0]["duration"]
+            self.assertEqual(pts, [pts[0] + index * step for index in range(136)])
+
+
 class AgentBuildContractTests(unittest.TestCase):
     def test_starter_manifest_obeys_locked_story_and_delivery_contracts(self) -> None:
         spec = agent_build.parse(agent_build.template("A Build Story"))
@@ -43,7 +78,7 @@ class AgentBuildContractTests(unittest.TestCase):
         self.assertEqual(spec.fps, 30)
         self.assertEqual((spec.width, spec.height), (1920, 1080))
         self.assertEqual(spec.repository, "github.com/omnilink-tech/omnisim")
-        self.assertEqual(agent_build.STYLE_VERSION, "agent_build_v8")
+        self.assertEqual(agent_build.STYLE_VERSION, "agent_build_v9")
         self.assertEqual(spec.voice.blocks[0].start_s, 10.0)
         self.assertEqual(spec.structure, "three_act")
         self.assertGreaterEqual(spec.simulator_footage_ratio, 0.75)
@@ -57,7 +92,7 @@ class AgentBuildContractTests(unittest.TestCase):
             "question", "attempt", "control", "evidence", "method", "boundary", "conclusion"
         ])
 
-    def test_edl_hard_codes_silent_two_screen_intro_and_github_outro(self) -> None:
+    def test_edl_hard_codes_silent_two_screen_intro_and_no_outro(self) -> None:
         spec = agent_build.parse(agent_build.template())
         edl = agent_build.build_edl(spec)
         entries = edl["entries"]
@@ -73,14 +108,35 @@ class AgentBuildContractTests(unittest.TestCase):
             ("story_intro", "MOTION_GRAPHIC:story_intro", 5.0, 10.0),
         )
         self.assertEqual(entries[2]["master_in_s"], 10.0)
-        self.assertEqual(entries[-1]["source"], "MOTION_GRAPHIC:locked_outro")
+        self.assertEqual(entries[-1]["id"], spec.segments[-1].id)
         self.assertEqual(entries[-1]["master_out_s"], spec.duration_s)
+        self.assertNotIn("MOTION_GRAPHIC:locked_outro", {entry["source"] for entry in entries})
         self.assertEqual(edl["transition_vocabulary"], ["direct_cut"])
 
     def test_missing_or_reordered_evidence_beats_fail_closed(self) -> None:
         payload = agent_build.template()
         payload["segments"] = [item for item in payload["segments"] if item["beat"] != "control"]
         with self.assertRaisesRegex(ValueError, "missing required beats: control"):
+            agent_build.parse(payload)
+
+    def test_action_opening_starts_picture_and_voice_at_zero_without_spoiling_result(self) -> None:
+        payload = agent_build.template()
+        payload['editorial']['opening'] = 'action'
+        payload['segments'][3], payload['segments'][4] = payload['segments'][4], payload['segments'][3]
+        for block in payload['voice']['blocks']:
+            block['start_s'] -= 10
+            block['window_end_s'] -= 10
+        spec = agent_build.parse(payload)
+        entries = agent_build.build_edl(spec)['entries']
+        self.assertEqual(spec.intro_duration_s, 0)
+        self.assertEqual(spec.duration_s, spec.content_duration_s)
+        self.assertEqual(spec.voice.blocks[0].start_s, 0)
+        self.assertEqual(entries[0]['master_in_s'], 0)
+        self.assertEqual(entries[0]['id'], spec.segments[0].id)
+        self.assertEqual(entries[-1]['master_out_s'], spec.duration_s)
+        self.assertFalse(any(e['beat'] == 'intro' for e in entries))
+        payload['segments'][3], payload['segments'][4] = payload['segments'][4], payload['segments'][3]
+        with self.assertRaisesRegex(ValueError, 'required beats must first appear in order'):
             agent_build.parse(payload)
 
         payload = agent_build.template()
@@ -146,7 +202,7 @@ class AgentBuildContractTests(unittest.TestCase):
         self.assertEqual(result["locked_intro"], {
             "disclosure_s": [0, 5], "story_signature_s": [5, 10], "voiceover": False,
         })
-        self.assertEqual(result["locked_outro"], agent_build.GITHUB_DESTINATION)
+        self.assertFalse(result["outro"])
         self.assertEqual(result["structure"], "three_act")
         self.assertGreaterEqual(result["simulator_footage_ratio"], 0.75)
 
@@ -235,6 +291,18 @@ class AgentBuildContractTests(unittest.TestCase):
         payload["segments"][0]["source_tail_hold_s"] = 3.1
         with self.assertRaisesRegex(ValueError, "source_tail_hold_s"):
             agent_build.parse(payload)
+
+    def test_prerendered_diagram_keeps_plate_classification_and_media_checks(self) -> None:
+        payload = agent_build.template()
+        original = agent_build.parse(payload)
+        plate = next(item for item in payload["segments"] if item["kind"] == "plate")
+        plate["source"] = "missing_diagram.mp4"
+        spec = agent_build.parse(payload)
+        self.assertEqual(spec.simulator_footage_ratio, original.simulator_footage_ratio)
+        entry = next(item for item in agent_build.build_edl(spec)["entries"] if item["id"] == plate["id"])
+        self.assertEqual(entry["source"], "missing_diagram.mp4")
+        with self.assertRaisesRegex(ValueError, "missing_diagram.mp4"):
+            agent_build.preflight(spec)
 
     def test_proxy_motion_metric_separates_held_frame_from_small_moving_subject(self) -> None:
         still = np.full((180, 320, 3), 80, dtype=np.uint8)

@@ -16,7 +16,7 @@ URDFRobot {
 }
 ```
 
-`supervisor TRUE` lets the bridge read pose with `getSelf()`, lidar-raycast against `Wall` AABBs, and teleport the husky on `reset` / `snap_to_cell`.
+`supervisor TRUE` lets the bridge read pose with `getSelf()`, lidar-raycast against `Wall` AABBs, and teleport the husky on `reset` (`snap_to_cell` also used to teleport; it is removed and returns 410).
 
 The URDFRobot wrapper itself has no physics body, so its `getPosition()` returns NaN; the bridge walks the URDF subtree at startup and locks onto `base_link` for pose reads.
 
@@ -39,7 +39,7 @@ Bind: `127.0.0.1:6070` (loopback only).
 |-------------------|------------------------------------|--------|
 | `stop`            | —                                  | zero both wheels, mode → `stopped`. Always available. |
 | `reset`           | —                                  | teleport husky to `(MAZE.start.x, MAZE.start.y, yaw=0)` |
-| `snap_to_cell`    | `{col, row, yaw}`                  | teleport husky to cell centre at the given cardinal yaw. **Demo concession**: skid-steer pivots in OmniSim accumulate ~0.5 m of drift per 90° turn, which compounds across cells. The agent (and `solve.py`) call this after each successful step to re-anchor to the grid. Real-world nav would use a better controller. |
+| `snap_to_cell`    | `{col, row, yaw}`                  | **REMOVED — returns `410`.** Teleport-snapping is gone; the husky navigates entirely under wheel control. It used to re-anchor the husky to the cell centre after each step, a concession to the drift a pivot accumulated. Verify moves instead: `get_state` after each move, compare against the cell centre, re-issue the residual. |
 | `set_velocity`    | `{linear, angular}`                | open-loop body twist; held until next action |
 | `drive_forward`   | `{distance, speed?}`               | closed-loop drive along current heading; **signed-progress** controller — overshoot triggers reverse to settle on the commanded distance |
 | `turn`            | `{angle, speed?}`                  | closed-loop rotation, settle gate |

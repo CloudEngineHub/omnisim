@@ -35,7 +35,7 @@ import time
 T_START = time.time()
 HERE = os.path.abspath(os.path.dirname(__file__))
 
-from controller import Robot  # noqa: E402
+from omnisim import Robot  # noqa: E402
 
 WHEELS = ("fl", "fr", "rl", "rr")
 

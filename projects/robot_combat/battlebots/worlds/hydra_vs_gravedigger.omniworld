@@ -10,20 +10,30 @@
 # bot with a front lifting arm that fires up with massive impulse from
 # a compressed-CO2 tank. Tombstone has the bar.
 #
-# Spec sheet (publicly-known approximations):
+# Spec sheet (publicly-known approximations; re-derived 2026-09-09 for the
+# realism pass -- see the WorldInfo comments for the contact model):
 #
 #   Hydra (flipper)
-#     mass            ~108 kg
+#     mass            108 kg total (92 chassis + 8 arm + 4 x 2 wheels)
 #     wheel base       0.85 x 0.55 x 0.22 m
+#     drive            4 x 40 N.m, 45 rad/s on 0.10 m wheels = 4.5 m/s top speed
 #     flipper arm     0.45 m long, 8 kg, hinge axis lateral, anchor
 #                     at front-bottom of chassis
 #     arm travel       -0.1 to +1.4 rad (~85 deg sweep upward)
-#     motor stall T    ~1000 N.m (pneumatic-equivalent)
-#     no-load omega    ~40 rad/s (tip speed ~18 m/s at full velocity)
-#     KE at full       ~430 J (enough to throw a 100 kg opponent
-#                     ~1-2 m straight up — Hydra's signature)
+#     ram              2500 N.m stall, 55 rad/s no-load: 8.3 kN at the 0.3 m
+#                     mid-plate, ~7 g on a 113 kg opponent over the stroke,
+#                     which is what throws a heavyweight 2-3 m -- Hydra's
+#                     signature. (The old 1000 N.m threw 0.7 m.)
 #
-#   Gravedigger        (see gravedigger_vs_biteforce.omniworld for full spec)
+#   Gravedigger (bar spinner)
+#     mass            113 kg total (75 chassis + 30 bar + 4 x 2 wheels),
+#                     the heavyweight limit
+#     bar              1.00 x 0.06 x 0.04 m, 30 kg, I = 2.5 kg m^2
+#     bar speed        160 rad/s (1530 rpm), tip 80 m/s, stored 32 kJ
+#                     (real Tombstone: ~230 rad/s, ~60 kJ; halved so the tip
+#                     travels < 3 cm per solver sub-step)
+#     bar motor        150 N.m: spin-up from rest in ~2.7 s, so a big hit
+#                     costs it seconds of RPM, exactly like the real bar
 
 EXTERNPROTO "omnisim://projects/robot_combat/battlebots/protos/BattleBox.proto"
 EXTERNPROTO "omnisim://projects/objects/backgrounds/protos/OmniSimSky.proto"
@@ -33,15 +43,6 @@ EXTERNPROTO "omnisim://projects/objects/lights/protos/OmniSimSunMarker.proto"
 WorldInfo {
   basicTimeStep 4
   title "Hydra vs Gravedigger — Flipper vs Bar Spinner"
-  contactProperties [
-    ContactProperties {
-      material1 "default"
-      material2 "default"
-      coulombFriction [ 0.9 ]
-      bounce 0.05
-      bounceVelocity 0.5
-    }
-  ]
   # Newton combat config. MuJoCo solver REQUIRED -- the default XPBD solver structurally
   # cannot drive a multi-wheel rover (lateral left/right wheel pairs lock; proven in pure
   # Python via scripts/dev/wheel_model_diff.py). MuJoCo + ODE drive them; MuJoCo also gives
@@ -52,8 +53,21 @@ WorldInfo {
   # Give each bot's chassis Box a real collider so ramming registers chassis contacts
   # (without it a Robot wrapper gets a 1 mm placeholder and bots phase through each other):
   newtonRobotColliders TRUE
-  # 4 sub-steps keep high closing-speed ram impacts from diverging XPBD to NaN:
-  newtonSubsteps 4
+  # Friction. contactProperties/coulombFriction is NOT read on Newton (the engine warned
+  # on every load and ran at mu 1.0); this is the field that sets it. Rubber on steel plate.
+  newtonGroundMu 0.9
+  # CONTACT HARDNESS (the realism pass, 2026-09-09). Newton maps (ke, kd) onto MuJoCo's
+  # contact solref as timeconst = 2/kd and dampratio = kd/(2*sqrt(ke)); the engine defaults
+  # 2500/100 reproduce MuJoCo stock (20 ms, critically damped). A 20 ms contact is a
+  # cushion: measured on this world it let the bar sink 66 mm into a chassis and
+  # swallowed ~98% of the spin energy a hit gave up. 667/111000 is a 3 ms contact, still
+  # critically damped (raising ke ALONE drops the damping ratio and parts bounce off --
+  # the trap docs/guide/friction-grasp.md fell into). MuJoCo needs timeconst >= 2 sub-steps.
+  newtonContactKe 111000
+  newtonContactKd 667
+  # 12 sub-steps = 0.33 ms: the 80 m/s bar tip moves < 3 cm per sub-step, and the 3 ms
+  # contact above stays > 2 sub-steps. (4 sub-steps was 1 ms; the old bar tip moved 5 cm.)
+  newtonSubsteps 12
 }
 Viewpoint {
   orientation -0.5773 0.5773 0.5773 2.0944
@@ -84,7 +98,7 @@ DEF HYDRA Robot {
   rotation 0 0 1 3.14159265
   name "hydra"
   controller "battlebot_brain"
-  controllerArgs [ "--opponent" "gravedigger" "--strategy" "aggressor" "--weapon-mode" "pulse" "--pulse-range" "1.2" ]
+  controllerArgs [ "--opponent" "gravedigger" "--strategy" "aggressor" "--weapon-mode" "pulse" "--pulse-range" "1.2" "--tune" "charge_speed=40" "--tune" "seek_speed=24" ]
   supervisor TRUE
   physicsBackend "newton"
   children [
@@ -161,7 +175,7 @@ DEF HYDRA Robot {
     DEF HYDRA_FL_JOINT HingeJoint {
       jointParameters HingeJointParameters { axis 0 1 0 anchor 0.30 0.30 -0.05 }
       device [
-        RotationalMotor { name "front_left_wheel_motor" maxVelocity 28 maxTorque 28 }
+        RotationalMotor { name "front_left_wheel_motor" maxVelocity 45 maxTorque 40 }
         PositionSensor { name "front_left_wheel_sensor" }
       ]
       endPoint DEF HYDRA_FL_WHEEL Solid {
@@ -179,7 +193,7 @@ DEF HYDRA Robot {
     DEF HYDRA_FR_JOINT HingeJoint {
       jointParameters HingeJointParameters { axis 0 1 0 anchor 0.30 -0.30 -0.05 }
       device [
-        RotationalMotor { name "front_right_wheel_motor" maxVelocity 28 maxTorque 28 }
+        RotationalMotor { name "front_right_wheel_motor" maxVelocity 45 maxTorque 40 }
         PositionSensor { name "front_right_wheel_sensor" }
       ]
       endPoint DEF HYDRA_FR_WHEEL Solid {
@@ -197,7 +211,7 @@ DEF HYDRA Robot {
     DEF HYDRA_RL_JOINT HingeJoint {
       jointParameters HingeJointParameters { axis 0 1 0 anchor -0.30 0.30 -0.05 }
       device [
-        RotationalMotor { name "rear_left_wheel_motor" maxVelocity 28 maxTorque 28 }
+        RotationalMotor { name "rear_left_wheel_motor" maxVelocity 45 maxTorque 40 }
         PositionSensor { name "rear_left_wheel_sensor" }
       ]
       endPoint DEF HYDRA_RL_WHEEL Solid {
@@ -215,7 +229,7 @@ DEF HYDRA Robot {
     DEF HYDRA_RR_JOINT HingeJoint {
       jointParameters HingeJointParameters { axis 0 1 0 anchor -0.30 -0.30 -0.05 }
       device [
-        RotationalMotor { name "rear_right_wheel_motor" maxVelocity 28 maxTorque 28 }
+        RotationalMotor { name "rear_right_wheel_motor" maxVelocity 45 maxTorque 40 }
         PositionSensor { name "rear_right_wheel_sensor" }
       ]
       endPoint DEF HYDRA_RR_WHEEL Solid {
@@ -236,11 +250,12 @@ DEF HYDRA Robot {
     # ~80 degrees from horizontal).
     #
     # Motor is wildly over-spec compared to an electric motor —
-    # maxTorque 1000 N.m and maxVelocity 40 rad/s — because it
+    # maxTorque 2500 N.m and maxVelocity 55 rad/s — because it
     # approximates a CO2-driven pneumatic ram that delivers all of its
     # impulse in ~50 ms. With arm inertia I = (1/3) m L^2 = 0.54 kg m^2
-    # and 1000 N.m of torque, alpha = 1851 rad/s^2: full 1.5 rad sweep
-    # in ~40 ms — that's the right ballpark for a real flipper.
+    # the unloaded arm completes its 1.5 rad sweep in ~30 ms; loaded with
+    # a 113 kg opponent on the plate it pushes ~8 kN, the figure that
+    # throws a heavyweight 2-3 m. (1000 N.m measured a 0.7 m throw.)
     DEF HYDRA_WEAPON_JOINT HingeJoint {
       jointParameters HingeJointParameters {
         axis 0 1 0
@@ -249,7 +264,7 @@ DEF HYDRA Robot {
         maxStop 1.4
       }
       device [
-        RotationalMotor { name "weapon_motor" maxVelocity 40 maxTorque 1000 }
+        RotationalMotor { name "weapon_motor" maxVelocity 55 maxTorque 2500 }
         PositionSensor { name "weapon_sensor" }
       ]
       endPoint DEF HYDRA_WEAPON Solid {
@@ -282,7 +297,7 @@ DEF HYDRA Robot {
     }
   ]
   boundingObject Box { size 0.78 0.50 0.18 }
-  physics Physics { density -1 mass 75.0 }
+  physics Physics { density -1 mass 92.0 }
 }
 
 # ===========================================================================
@@ -294,7 +309,7 @@ DEF GRAVEDIGGER Robot {
   rotation 0 0 1 0
   name "gravedigger"
   controller "battlebot_brain"
-  controllerArgs [ "--opponent" "hydra" "--strategy" "aggressor" ]
+  controllerArgs [ "--opponent" "hydra" "--strategy" "aggressor" "--tune" "charge_speed=40" "--tune" "seek_speed=24" "--tune" "weapon_hold=1.0" ]
   supervisor TRUE
   physicsBackend "newton"
   children [
@@ -370,7 +385,7 @@ DEF GRAVEDIGGER Robot {
     DEF GRAVEDIGGER_FL_JOINT HingeJoint {
       jointParameters HingeJointParameters { axis 0 1 0 anchor 0.35 0.32 -0.05 }
       device [
-        RotationalMotor { name "front_left_wheel_motor" maxVelocity 30 maxTorque 30 }
+        RotationalMotor { name "front_left_wheel_motor" maxVelocity 45 maxTorque 40 }
         PositionSensor { name "front_left_wheel_sensor" }
       ]
       endPoint DEF GRAVEDIGGER_FL_WHEEL Solid {
@@ -388,7 +403,7 @@ DEF GRAVEDIGGER Robot {
     DEF GRAVEDIGGER_FR_JOINT HingeJoint {
       jointParameters HingeJointParameters { axis 0 1 0 anchor 0.35 -0.32 -0.05 }
       device [
-        RotationalMotor { name "front_right_wheel_motor" maxVelocity 30 maxTorque 30 }
+        RotationalMotor { name "front_right_wheel_motor" maxVelocity 45 maxTorque 40 }
         PositionSensor { name "front_right_wheel_sensor" }
       ]
       endPoint DEF GRAVEDIGGER_FR_WHEEL Solid {
@@ -406,7 +421,7 @@ DEF GRAVEDIGGER Robot {
     DEF GRAVEDIGGER_RL_JOINT HingeJoint {
       jointParameters HingeJointParameters { axis 0 1 0 anchor -0.35 0.32 -0.05 }
       device [
-        RotationalMotor { name "rear_left_wheel_motor" maxVelocity 30 maxTorque 30 }
+        RotationalMotor { name "rear_left_wheel_motor" maxVelocity 45 maxTorque 40 }
         PositionSensor { name "rear_left_wheel_sensor" }
       ]
       endPoint DEF GRAVEDIGGER_RL_WHEEL Solid {
@@ -424,7 +439,7 @@ DEF GRAVEDIGGER Robot {
     DEF GRAVEDIGGER_RR_JOINT HingeJoint {
       jointParameters HingeJointParameters { axis 0 1 0 anchor -0.35 -0.32 -0.05 }
       device [
-        RotationalMotor { name "rear_right_wheel_motor" maxVelocity 30 maxTorque 30 }
+        RotationalMotor { name "rear_right_wheel_motor" maxVelocity 45 maxTorque 40 }
         PositionSensor { name "rear_right_wheel_sensor" }
       ]
       endPoint DEF GRAVEDIGGER_RR_WHEEL Solid {
@@ -442,7 +457,7 @@ DEF GRAVEDIGGER Robot {
     DEF GRAVEDIGGER_WEAPON_JOINT HingeJoint {
       jointParameters HingeJointParameters { axis 0 0 1 anchor 0 0 0.13 }
       device [
-        RotationalMotor { name "weapon_motor" maxVelocity 80 maxTorque 300 }
+        RotationalMotor { name "weapon_motor" maxVelocity 160 maxTorque 150 }
         PositionSensor { name "weapon_sensor" }
       ]
       endPoint DEF GRAVEDIGGER_WEAPON Solid {
@@ -451,7 +466,7 @@ DEF GRAVEDIGGER Robot {
         children [
           Shape {
             appearance PBRAppearance { baseColor 0.78 0.78 0.80 metalness 0 roughness 1 }
-            geometry Box { size 1.20 0.06 0.04 }
+            geometry Box { size 1.00 0.06 0.04 }
           }
           Transform {
             translation 0 0 0
@@ -468,27 +483,27 @@ DEF GRAVEDIGGER Robot {
             } ]
           }
           Transform {
-            translation 0.55 0 0
+            translation 0.46 0 0
             children [ Shape {
               appearance PBRAppearance { baseColor 0.95 0.20 0.05 metalness 0 roughness 1 }
               geometry Box { size 0.10 0.08 0.06 }
             } ]
           }
           Transform {
-            translation -0.55 0 0
+            translation -0.46 0 0
             children [ Shape {
               appearance PBRAppearance { baseColor 0.95 0.20 0.05 metalness 0 roughness 1 }
               geometry Box { size 0.10 0.08 0.06 }
             } ]
           }
         ]
-        boundingObject Box { size 1.20 0.06 0.04 }
-        physics Physics { density -1 mass 40.0 }
+        boundingObject Box { size 1.00 0.06 0.04 }
+        physics Physics { density -1 mass 30.0 }
       }
     }
   ]
   boundingObject Box { size 0.90 0.60 0.15 }
-  physics Physics { density -1 mass 70.0 }
+  physics Physics { density -1 mass 75.0 }
 }
 
 DEF DIRECTOR Robot {

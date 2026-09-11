@@ -234,9 +234,19 @@ Stated plainly, because a principle without limits is marketing.
   the other way (CooperBench: two agents ~25% vs a single agent ~50% on the same work;
   [arXiv 2601.13295](https://arxiv.org/abs/2601.13295)). Fixing tools and adding agents are not
   the same intervention, and only one of them has evidence behind it here.
-- **Latency is a real cost and must be reported.** The fixed turn takes 8–55 s against ~3 s
-  before. That is close to the physical floor — an achieved ~0.10 rad/s means a 270° turn needs
-  ~46 s of actual spinning — but "correct and slower" is a trade to state, not to hide.
+- **Latency is a real cost and must be reported.** The fixed turn took 8–55 s against ~3 s
+  before. ⚠️ That paragraph used to call the 8–55 s "close to the physical floor" on the
+  grounds that an achieved ~0.10 rad/s makes a 270° turn ~46 s of actual spinning. **That is
+  withdrawn.** 0.10 rad/s was not a physical floor: `69b4b024b` (2026-09-11) found the solver
+  bounding a velocity servo's gain at `kv <= M_ii/dt`, which capped a wheel's stall torque at
+  its own rotational inertia, and the Husky's open-loop chassis yaw ratio went 0.0069 → 0.532
+  when that was lifted (see
+  [agents-hard-won-rules.md § Wheel stall torque](agents-hard-won-rules.md#wheel-stall-torque)).
+  The residual latency cost of the fixed turn has **not been re-measured** on the current
+  engine. The lesson is unchanged and arguably stronger: the tool fix delivered a mean
+  |error| of 0.44° with the model held constant **on top of a broken solver**, so none of the
+  A/B above is contaminated by the actuator defect — both arms ran on it. "Correct and slower"
+  remains a trade to state, not to hide; just don't quote a spin rate as a floor.
 
 ---
 

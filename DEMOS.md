@@ -80,6 +80,11 @@ no in-hand manipulation**.
 | Demo | World | Bridge controller |
 |---|---|---|
 | OmniQuad *(poses only)* | [`omnilink_omniquad.omniworld`](projects/samples/demos/worlds/chat/omnilink_omniquad.omniworld) | [`omnilink_quadruped_bridge`](projects/samples/demos/controllers/omnilink_quadruped_bridge/) |
+| Deep Robotics Lite3 *(stands on its own physics; stand / sit / wave; "walk" cycles the legs in place)* | [`omnilink_lite3.omniworld`](projects/samples/demos/worlds/chat/omnilink_lite3.omniworld) | same bridge, `--robot lite3` ([`_quadruped_configs.py`](projects/samples/demos/controllers/omnilink_quadruped_bridge/_quadruped_configs.py)) |
+| Deep Robotics X30 *(same surface as the Lite3)* | [`omnilink_x30.omniworld`](projects/samples/demos/worlds/chat/omnilink_x30.omniworld) | same bridge, `--robot x30` |
+| Deep Robotics M20 *(wheeled-legged: "drive forward" rolls the wheels, real physics — 0.48 m/s measured)* | [`omnilink_m20.omniworld`](projects/samples/demos/worlds/chat/omnilink_m20.omniworld) | same bridge, `--robot m20` |
+| Deep Robotics M20S | [`omnilink_m20s.omniworld`](projects/samples/demos/worlds/chat/omnilink_m20s.omniworld) | same bridge, `--robot m20s` |
+| Deep Robotics M20 + AgileX Piper arm *(base drives; the arm holds its zero pose)* | [`omnilink_m20_piper.omniworld`](projects/samples/demos/worlds/chat/omnilink_m20_piper.omniworld) | same bridge, `--robot m20_piper` |
 
 ### Aerial
 
@@ -174,6 +179,7 @@ RL-deploy walking / recovery under OmniSim Newton (MuJoCo solver). Launch each v
 | OmniQuad jump | `scripts/dev/run_omniquad_jump_deploy.ps1` | ⚠️ experimental deploy harness |
 | OmniQuad / B2 hill walk | `scripts/dev/run_omniquad_hill_deploy.ps1`, `run_b2_hill_deploy.ps1` | ⚠️ ghost pipeline done + owner-approved — **BLOCKED** at the flat→ramp transition + slope roll-instability (~2.3 m cap) |
 | B2 hill-walk ghost preview *(ghost only)* | `scripts/dev/run_b2_hill_ghost_preview.ps1` (`-Duration 60`, `-Fast` skips real-time pacing) | no RL, no physics — a translucent, physics-free B2 hologram replays its generated up-over-down 15° hill ghost (Shadowing Component 1): flat → pitch up → crest → pitch down → flat. It is the reference the tracker shadows and the ghost-first sign-off view for the hill row above |
+| Deep Robotics Lite3 / X30 terrain crawl *(SCRIPTED, not learned — listed here so nobody looks for it under RL)* | [`lite3_terrain.omniworld`](projects/robots/deep_robotics/worlds/lite3_terrain.omniworld), [`x30_terrain.omniworld`](projects/robots/deep_robotics/worlds/x30_terrain.omniworld), [`x30_extreme_terrain.omniworld`](projects/robots/deep_robotics/worlds/x30_extreme_terrain.omniworld) — `python -m omnisim run-headless <world> --duration 240` (the extreme course needs 320) | ✅ both cross 10 m of 2–6 cm rolling hills on real contact physics with a statically stable creep gait through leg IK (no supervisor pin); heading held from the robot's own pose. ✅ The X30 also crosses the 16 m EXTREME course (6–14 cm hills, 2–4 cm rubble plateaus, a 12° ramp up to 0.64 m and down) with the terrain-AWARE version of the gait: it reads the world's height map through the Supervisor and plants feet, body height, pitch and swing clearance on it — still no contact sensing, no balance feedback, no policy. Learned Deep Robotics locomotion is open — see the §9 rows |
 | Go2 velocity-conditioned walk / stop / walk beside its ghost | `scripts/dev/run_go2_walk_vc_ghost_demo.ps1` (`-WalkFor 6 -StandFor 4 -Duration 60 -Fast`) | the real Go2 (VC policy + trot model, Newton) walks, STOPS and resumes on a schedule while the translucent ghost plays the same schedule beside it in lock-step, standing on four feet during the stop windows — the gap between the two is the RL correction |
 
 ### Humanoid (RL deploy)
@@ -240,6 +246,7 @@ Flagship-directory worlds that were authored but never catalogued; load-checked 
 
 | Demo | World | Controllers -- what the file says it is |
 |---|---|---|
+| Husky Extreme Terrain | [`husky_extreme_terrain.omniworld`](projects/samples/demos/worlds/flagship/husky_extreme_terrain.omniworld) | `husky_extreme_terrain` — Matched fixed-throttle and pose-feedback runs through a three-gate boulder course; the feedback mode uses exact simulated pose and a frozen known centerline. |
 | Husky Unseen Maze — b1aa122b97 | [`husky_unseen_maze.omniworld`](projects/samples/demos/worlds/flagship/husky_unseen_maze.omniworld) | `husky_unseen_maze` — A frozen sensor-only planner must reach the southeast beacon. |
 | Industrial Warehouse | [`warehouse_industrial.omniworld`](projects/samples/demos/worlds/flagship/warehouse_industrial.omniworld) | no controller |
 
@@ -277,7 +284,7 @@ then verifies and reports real measured positions.
 | Agent | [`agents/production/husky_swarm/`](agents/production/husky_swarm/) — 45 tools, parallel execution, persistent waypoints/routines/memory |
 | Run | `python -m omnisim run-agent --agent husky_swarm`, then [`scripts/chat_drive.py`](agents/production/husky_swarm/scripts/chat_drive.py) |
 | Engine | `g1-engine` (Gemini). Other engines need their own BYOK key or return 402. |
-| Status | Verified end-to-end (drives): all four drive in parallel with calibrated accuracy (−0.7%..−0.1% over 1–2 m), agent reports ground-truth positions. ⚠️ Open-loop `turn_husky` is **still broken** (~43% undershoot at 90°; an earlier ~18.7% figure did not reproduce) — the closed-loop geometry tools (`drive_to_xy`, `drive_radial`, `move_swarm_to`) are the accurate path. See the README's *Measured behaviour and known gaps*. |
+| Status | Verified end-to-end (drives): all four drive in parallel with calibrated accuracy (−0.7%..−0.1% over 1–2 m), agent reports ground-truth positions. ⚠️ The open-loop `turn_husky` figures on this page (~43% undershoot at 90°; an earlier ~18.7% that did not reproduce) are **pre-`69b4b024b` and withdrawn** — they were taken while the solver capped a wheel's stall torque at its own rotational inertia, and they will not reproduce on the current engine. The turn has **not been re-measured through the bridge** since. Prefer the closed-loop geometry tools (`drive_to_xy`, `drive_radial`, `move_swarm_to`) on their own merit: they measure against ground truth and return `error_m` / `arrived`, so you get a verdict rather than a hope. See the README's *Measured behaviour and known gaps*. |
 
 ### Smart House — a home run by an OmniLink agent ⭐ *the persistence showcase*
 
@@ -307,6 +314,19 @@ An operator (or the OmniLink agent) tells the rover, in plain language, which pa
 | World | [`omnitug500_courier.omniworld`](projects/robots/omnisim/omnitug500/worlds/omnitug500_courier.omniworld) |
 | Controller | [`omnitug500_courier`](projects/robots/omnisim/omnitug500/controllers/omnitug500_courier/) — A*-routes the aisle grid from a known facility map, loads the package onto its deck, drives to the dock and sets it down; multi-stop routes supported |
 | Run | `powershell -File scripts/dev/run_omnitug500_courier.ps1` (windowed, interactive chat). Offline it uses the controller's regex router; set `OMNI_KEY` for the OmniLink agent |
+
+---
+
+### Blockworld — a Minecraft-style block world for agents
+
+A 32 × 32 field of one-metre cubes (2,666 blocks: grass, dirt, stone, ore, six trees, a probe ball) where **every block is its own static Solid named by grid coordinate**, so an agent mines and builds over the harness: `GET /scene/node/B_x_y_z`, `POST /scene/delete` / `POST /scene/spawn` with `{"physics": "rebuild"}`, `GET /sim/contacts`, `POST /world/screenshot`. No robot, no keyboard: the agent is the player. Possible since 2026-09-07, when plain static colliders moved onto Newton's world body (thousands of blocks finalise in seconds instead of overflowing MuJoCo's broadphase).
+
+| | |
+|---|---|
+| World | [`projects/samples/demos/worlds/environments/blockworld.omniworld`](projects/samples/demos/worlds/environments/blockworld.omniworld) *(generated — edit [`gen_blockworld.py`](projects/samples/demos/worlds/environments/gen_blockworld.py), not the file)* |
+| Guide | [`docs/guide/blockworld-agent-environment.md`](docs/guide/blockworld-agent-environment.md) — the mine / build loop with measured costs |
+| Load check | `python -m omnisim run-headless projects/samples/demos/worlds/environments/blockworld.omniworld --until-finalized --fail-on-warning` |
+| Agent loop | `python -m omnisim harness` → `POST /world/load {"path": ..., "light": true}` → edit blocks → `POST /world/screenshot` |
 
 ---
 
@@ -444,6 +464,17 @@ Worlds that load (`python -m omnisim validate-worlds`, one engine hot-reloading 
 
 | World | File | Controllers -- what the file says it is |
 |---|---|---|
+| Deep Robotics showroom — all seven robots side by side (Lite3, X30, M20, M20S, M20 + Piper, DR02 Standard, DR02 Pro) | [`deep_robotics_showroom.omniworld`](projects/robots/deep_robotics/worlds/deep_robotics_showroom.omniworld) | `deep_robotics_stand` — every robot settles from its spawn pose into its stance and holds it on its own physics (`newtonSubsteps 8` + `newtonCompoundColliders TRUE` + `newtonGroundMu 2`; why: [PROVENANCE.md](projects/robots/deep_robotics/PROVENANCE.md)). Package added 2026-09-08 from [DeepRoboticsLab/deep_robotics_model](https://github.com/DeepRoboticsLab/deep_robotics_model), BSD-3 |
+| Deep Robotics Lite3 — 12 kg quadruped, stands at 0.262 m | [`lite3.omniworld`](projects/robots/deep_robotics/worlds/lite3.omniworld) | `deep_robotics_stand` |
+| Deep Robotics X30 — 56 kg quadruped, stands at 0.395 m | [`x30.omniworld`](projects/robots/deep_robotics/worlds/x30.omniworld) | `deep_robotics_stand` |
+| Deep Robotics M20 — wheeled-legged quadruped on its four wheels | [`m20.omniworld`](projects/robots/deep_robotics/worlds/m20.omniworld) | `deep_robotics_stand` |
+| Deep Robotics M20S — the higher-torque M20 | [`m20s.omniworld`](projects/robots/deep_robotics/worlds/m20s.omniworld) | `deep_robotics_stand` |
+| Deep Robotics M20 + AgileX Piper 6-DoF arm and gripper | [`m20_piper.omniworld`](projects/robots/deep_robotics/worlds/m20_piper.omniworld) | `deep_robotics_stand` |
+| Deep Robotics DR02 Standard — 21-DoF humanoid standing at q=0 | [`dr02_std.omniworld`](projects/robots/deep_robotics/worlds/dr02_std.omniworld) | `deep_robotics_stand` |
+| Deep Robotics DR02 Pro — 33-DoF humanoid (waist, neck, wrists) standing at q=0 | [`dr02_pro.omniworld`](projects/robots/deep_robotics/worlds/dr02_pro.omniworld) | `deep_robotics_stand` |
+| Deep Robotics Lite3 — terrain crawl: 10 m of rolling ElevationGrid hills (2 → 6 cm) on real contact physics | [`lite3_terrain.omniworld`](projects/robots/deep_robotics/worlds/lite3_terrain.omniworld) | [`deep_robotics_crawl`](projects/robots/deep_robotics/controllers/deep_robotics_crawl/) — a SCRIPTED statically stable creep gait through closed-form leg IK (the B2 crawl model re-parameterised), heading held from the robot's own pose; no supervisor pin, no policy. Measured 2026-09-08: crossed the whole strip, 0.045 m/s, centreline within 12 cm (20 cm under the map-aware gait), never tilted (min up_z 0.97), stops and holds 1.5 m past the strip |
+| Deep Robotics X30 — the same terrain crawl on the 56 kg X30 | [`x30_terrain.omniworld`](projects/robots/deep_robotics/worlds/x30_terrain.omniworld) | `deep_robotics_crawl --robot x30` — crossed the strip at 0.07–0.10 m/s, centreline within 4 cm, min up_z 0.99, stops and holds at x = 11.5 m |
+| Deep Robotics X30 — EXTREME terrain: a 16 m obstacle course (6–14 cm rolling hills, a field of 2–4 cm rubble plateaus, a 12° ramp up to a 0.64 m plateau and a 12° ramp down) on real contact physics | [`x30_extreme_terrain.omniworld`](projects/robots/deep_robotics/worlds/x30_extreme_terrain.omniworld) | `deep_robotics_crawl --robot x30 --step-height 0.12` — the same SCRIPTED creep gait made terrain-AWARE: the ElevationGrid is read once through the Supervisor (standing in for the elevation map a real robot builds from depth sensing), feet are planted on it, the body rides at a set height above the mean ground under the four feet and pitches to sustained grades, each swing picks the flattest of three footholds along the stride and lifts over the highest ground on its path, and the gait slows on descents. No contact sensing, no balance feedback, no policy. Measured 2026-09-08: crossed the whole course including the descent — 18 m in 320 s (0.056 m/s), min up_z 0.91, centreline within 25 cm, stops and holds at x = 16.5 m. Its ceiling is real: 3–6 cm and 4–8 cm rubble plateaus tip it in the rubble field, and the Lite3 is thrown at the 7 cm hill of a half-scale copy of the course (not shipped) |
 | OmniSim alife - evolved champions | [`alife_champions.omniworld`](projects/alife/worlds/alife_champions.omniworld) | `terrarium_showcase` |
 | Alife terrarium - probe 0 | [`terrarium_probe_0.omniworld`](projects/alife/worlds/terrarium_probe_0.omniworld) | `terrarium_director` |
 | Omniscience | [`example.omniworld`](projects/languages/cpp/worlds/example.omniworld) | `slave`, `driver` — The user drives a Supervisor by the Keyboard which drives slaves robots by using an emitter device. |
@@ -487,6 +518,7 @@ Worlds that load (`python -m omnisim validate-worlds`, one engine hot-reloading 
 | OmniArm 7 | [`omniarm7.omniworld`](projects/robots/omnisim/omniarm7/worlds/omniarm7.omniworld) | `omniarm7_wave` |
 | OmniTug 500 - Explore & Map (physics collision) | [`omnitug500_explore_physics.omniworld`](projects/robots/omnisim/omnitug500/worlds/omnitug500_explore_physics.omniworld) | `omnitug500_explore`, `omnitug500_explore_cam` — OMNITUG500 explores an unknown two-room space; rover is a dynamic Newton body. |
 | OmniTug 500 - Live Laser Scanners | [`omnitug500_lidar.omniworld`](projects/robots/omnisim/omnitug500/worlds/omnitug500_lidar.omniworld) | `omnitug500_lidar` — OMNITUG500 rover with its two corner safety laser scanners wired as real Lidar devices. |
+| OmniTug 500 - MCL Dataset Recorder | [`omnitug500_mcl_record.omniworld`](projects/robots/omnisim/omnitug500/worlds/omnitug500_mcl_record.omniworld) | `omnitug500_mcl_record` — OMNITUG500 drives the patrol ellipse for 60 s and writes a seeded Monte-Carlo-localization dataset (ground-truth pose, noisy wheel odometry, 512-beam scans, one kidnapped-robot teleport at t = 30 s) to the controller's `out/` directory; two runs of the same build produce identical files. |
 | OmniTug 500 - Moving Laser-Scanner Coverage | [`omnitug500_lidar_patrol.omniworld`](projects/robots/omnisim/omnitug500/worlds/omnitug500_lidar_patrol.omniworld) | `omnitug500_lidar_patrol`, `omnitug500_cam` — OMNITUG500 drives an elliptical patrol while its two corner laser scanners stay live; the fused red coverage area follows the rover around the room. |
 | OmniTug 500 - Patrol Demo | [`omnitug500_patrol.omniworld`](projects/robots/omnisim/omnitug500/worlds/omnitug500_patrol.omniworld) | `omnitug500_patrol` — OMNITUG500 (URDF from STEP CAD) patrolling a floor loop, driven kinematically by the omnitug500_patrol supervisor controller. |
 | OmniTug 500 - Showroom | [`omnitug500_wall.omniworld`](projects/robots/omnisim/omnitug500/worlds/omnitug500_wall.omniworld) | no controller — OmniTug 500 rover (URDF converted from STEP CAD) on a display dais in front of a designed wall. |

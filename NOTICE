@@ -330,6 +330,15 @@ grant any rights in third-party robot geometry.
     ("Unitree Robotics"). All rights reserved.
     License text: projects/robots/unitree/LICENSE.upstream.
 
+- Deep Robotics — Lite3, X30, M20, M20S, M20 + Piper, DR02 Standard, DR02 Pro
+    From https://github.com/DeepRoboticsLab/deep_robotics_model
+    (the urdf/ tree of each robot; commit 549eb9ac, 2026-09-08).
+    BSD 3-Clause License.
+    Copyright (c) 2024, DeepRoboticsLab.
+    License text: projects/robots/deep_robotics/LICENSE.upstream.
+    Every change to the upstream files is recorded in
+    projects/robots/deep_robotics/PROVENANCE.md.
+
 - OmniQuad (kinematic skeleton) — from Clearpath Robotics' spot_description
     From https://github.com/clearpathrobotics/spot_ros (spot_description).
     BSD 3-Clause License.
@@ -503,6 +512,13 @@ Documentation webfonts (docs/css/fonts/, loaded by docs/css/omnisim-doc.css):
 - Raleway Thin — SIL Open Font License 1.1. Copyright (c) 2010-2013 Matt
     McInerney, Pablo Impallari, Rodrigo Fuenzalida, with Reserved Font Name
     "Raleway". License text: docs/css/fonts/LICENSE-Raleway-OFL-1.1.txt.
+
+Brand fonts (resources/branding/omnisim/fonts/):
+- Space Grotesk (variable, weights 300-700) — SIL Open Font License 1.1.
+    Copyright 2020 The Space Grotesk Project Authors
+    (https://github.com/floriankarsten/space-grotesk); designed by Florian
+    Karsten; the OFL header declares no Reserved Font Name. License text:
+    resources/branding/omnisim/fonts/OFL-SpaceGrotesk.txt.
 
 Brand fonts (resources/branding/omnilink/fonts/):
 - Montserrat (Light / Regular / Medium / SemiBold / Bold) — SIL Open Font

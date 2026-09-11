@@ -70,6 +70,30 @@ If this field is empty, OmniSim will compute the inertia matrix automatically ac
     Newton path. That bug is fixed; the automatic computation now derives from
     the `boundingObject` as documented.
 
+    ⚠️ `Robot` nodes (including a `URDFRobot`'s wrapper) were EXCLUDED from that
+    fix until 2026-09-10, so a robot root's rotational inertia was
+    **geometry-independent**: a 0.20×0.16×0.10 m robot and a 1.60×1.20×0.80 m
+    robot both reported `m*(0.0167, 0.0094, 0.0094)`. They now derive from their
+    own `boundingObject` like every other `Solid` — independently of
+    `WorldInfo.newtonRobotColliders`, which governs only whether that bounding
+    object is also registered as a COLLIDER and is unchanged.
+    `OMNISIM_NEWTON_ROBOT_GEOM_INERTIA=0` restores the preset.
+
+    Where each body's inertia came from is reported once per load:
+    `[OmNewtonBackend] inertia provenance: N declared, M from geometry, K from
+    the mass preset`.
+
+    ⚠️ Because the matrix is defined about the `centerOfMass`, a declared
+    `inertiaMatrix` now travels to the solver **together with** the declared
+    `centerOfMass`. Before 2026-09-10 the COM was pinned at the Solid's origin
+    unless `OMNISIM_NEWTON_USE_LINK_COM` was set, which silently reinterpreted
+    I_com as I_origin: it understated the body's inertia about every joint by
+    m·d² and zeroed the gravity torque on any pendulum-shaped link (a 0.2 m rod
+    on a hinge did not fall at all). `OMNISIM_NEWTON_INERTIA_COM=0` reverts.
+    `OMNISIM_NEWTON_USE_LINK_COM` is unchanged and still governs only the
+    geometry-derived case, whose tensor is composed about the Solid ORIGIN and
+    must therefore keep its COM there.
+
 - ⚠️ The `damping` field has **no effect**. It names a Damping (archived 2026-09-02, see [docs/ARCHIVE.md](../ARCHIVE.md)) node describing velocity damping for the [Solid](solid.md), but damping was implemented only on the ODE path and is not plumbed to Newton — `OmSolidMerger::setOdeDamping()` is now an empty function. The field still parses so legacy worlds load. See Damping.
 
 ### How to use Physics Nodes?

@@ -21,7 +21,7 @@ The original demo only handled "drive A → B with a known map" — a script cou
   - Strategy B — right-hand-rule wall-follow on `read_lidar`
 - [x] Solver `solve.py` demonstrates both strategies (selected at runtime)
 - [x] Bridge `/admin/reload` endpoint so the operator (and the agent) can hot-reload or world-swap without touching the OmniSim window
-- [x] `snap_to_cell` action to re-anchor pose after each step (skid-steer pivots in OmniSim accumulate ~0.5 m drift per 90° turn — see `docs/why-an-agent.md`)
+- [x] `snap_to_cell` action to re-anchor pose after each step (skid-steer pivots accumulated ~0.5 m drift per 90° turn — see `docs/why-an-agent.md`). ⚠️ **Since removed** (returns 410), and the drift was never wheel friction: the solver capped a wheel's stall torque at its own rotational inertia, so a pivot could not generate traction and the base slid rather than turning. Fixed 2026-09-11, `69b4b024b`.
 - [x] Signed-progress `drive_forward` controller with active brake + settle gate
 - [x] End-to-end verification on both worlds — see `docs/RESULTS.md`
 

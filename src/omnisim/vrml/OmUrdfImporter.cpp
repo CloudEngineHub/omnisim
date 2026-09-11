@@ -28,7 +28,12 @@
 #include <QtCore/QStringList>
 #include <QtCore/QTextStream>
 
+#include <algorithm>
 #include <cmath>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 namespace {
 
@@ -209,15 +214,72 @@ bool urdfDebugEnabled() {
   return !value.isEmpty() && value != "0" && value != "false" && value != "off";
 }
 
-// URDF inertia tensors are imported only when this is set. Even URDF tensors
-// that pass every PD + triangle-inequality check still trip an ODE/Webots
-// crash on small-mass child links (e.g. Jackal wheels at mass=0.477 with
-// 0.0013/0.0024/0.0013 inertia). Until that's diagnosed, we default to
-// bounding-object-derived inertia — historically what the importer did —
-// and let advanced users opt back in with OMNISIM_URDF_USE_INERTIA=1.
+// URDF inertia tensors USED to be imported only under
+// OMNISIM_URDF_USE_INERTIA=1. That default-OFF was an ODE-era workaround: ODE's
+// `dMassSetParameters` crashed on small-mass child links (e.g. Jackal wheels at
+// mass=0.477 with 0.0013/0.0024/0.0013 inertia), so the importer dropped every
+// <inertia> tensor and let the bounding object supply one instead.
+//
+// ⚠️ WHAT THAT COST, measured 2026-09-10 on a two-link cart-pole URDF: with the
+// flag unset the declared tensor NEVER reached the solver. The Newton runtime's
+// `add_body` sees ixx=iyy=izz=0 and substitutes its Husky-tuned preset
+// (0.0094m, 0.0167m, 0.0094m under 10 kg), so a pole declaring 0.0667 kg·m²
+// about its COM was integrated at 0.00334 — and multiplying the URDF tensor by
+// 4.5× produced a BYTE-IDENTICAL mjModel. The tensor was not merely ignored, it
+// was masked by a number with no relation to the robot.
+//
+// ODE was deleted (src/ode is gone; `dMassSetParameters` no longer exists), so
+// the reason for the OFF default died with it. Newton/MuJoCo consumes the tensor
+// directly. Default is now ON; `OMNISIM_URDF_USE_INERTIA=0` restores the
+// bounding-object-derived import for a bisect. Value-parsed, as every boolean
+// hatch in this engine must be.
 bool urdfUseInertiaEnabled() {
   const QString value = QString::fromUtf8(qgetenv("OMNISIM_URDF_USE_INERTIA")).trimmed().toLower();
-  return !value.isEmpty() && value != "0" && value != "false" && value != "off";
+  if (value.isEmpty())
+    return true;
+  return value != "0" && value != "false" && value != "off" && value != "no";
+}
+
+// Principal moments (eigenvalues of the symmetric 3x3 inertia tensor), ascending.
+// Closed form (Smith 1961) -- the C++ mirror of `principal_moments()` in
+// scripts/dev/urdf_import.py, so the offline preflight and the native importer
+// judge a tensor by the same rule.
+void urdfPrincipalMoments(double ixx, double ixy, double ixz,
+                          double iyy, double iyz, double izz, double out[3]) {
+  const double p1 = ixy * ixy + ixz * ixz + iyz * iyz;
+  if (p1 == 0.0) {
+    out[0] = ixx; out[1] = iyy; out[2] = izz;
+  } else {
+    const double q = (ixx + iyy + izz) / 3.0;
+    const double p2 = (ixx - q) * (ixx - q) + (iyy - q) * (iyy - q) + (izz - q) * (izz - q) + 2.0 * p1;
+    const double p = std::sqrt(p2 / 6.0);
+    const double b11 = (ixx - q) / p, b22 = (iyy - q) / p, b33 = (izz - q) / p;
+    const double b12 = ixy / p, b13 = ixz / p, b23 = iyz / p;
+    const double det = b11 * (b22 * b33 - b23 * b23)
+                     - b12 * (b12 * b33 - b23 * b13)
+                     + b13 * (b12 * b23 - b22 * b13);
+    double r = det / 2.0;
+    if (r < -1.0) r = -1.0;
+    if (r > 1.0) r = 1.0;
+    const double phi = std::acos(r) / 3.0;
+    const double eig1 = q + 2.0 * p * std::cos(phi);
+    const double eig3 = q + 2.0 * p * std::cos(phi + 2.0 * M_PI / 3.0);
+    out[0] = eig1; out[1] = 3.0 * q - eig1 - eig3; out[2] = eig3;
+  }
+  std::sort(out, out + 3);
+}
+
+// A rigid body's principal moments must satisfy a + b >= c. A tensor can be
+// positive definite and still describe no physical body, and MuJoCo's own
+// compiler REJECTS such a body ("inertia must satisfy A + B >= C") -- which,
+// now that the tensor actually reaches the solver, would turn a sloppy URDF
+// into a hard load failure instead of a silent approximation. Falling back to
+// the bounding object (loudly) keeps such a robot loadable.
+bool urdfInertiaSatisfiesTriangleInequality(double ixx, double ixy, double ixz,
+                                            double iyy, double iyz, double izz,
+                                            double moments[3]) {
+  urdfPrincipalMoments(ixx, ixy, ixz, iyy, iyz, izz, moments);
+  return (moments[0] + moments[1]) >= moments[2] * (1.0 - 1e-9);
 }
 
 // URDF gazebo-extension sensors (IMU/GPS/Camera/Lidar) are imported only when
@@ -1209,20 +1271,45 @@ QString emitLinkPhysics(const UrdfLink &link, const QString &indent, bool allowS
     // when the URDF origin is the link origin (0 0 0) — otherwise the tensor
     // would be silently ignored.
     //
-    // Also clamp out vanishingly-small tensors: ODE's dMassSetParameters has
-    // been observed to crash on inertia values below ~1e-4 even though the
-    // tensor satisfies positive-definiteness and the triangle inequality
-    // (Jackal wheels at ixx=iyy=0.0013 are right on the threshold; URDFs that
-    // declare 1e-9 placeholder inertias for sensor-mount frames are
-    // unambiguously past it). Below the threshold we drop the explicit tensor
-    // and let OmniSim derive inertia from the bounding object.
-    constexpr double kMinInertia = 1e-4;
+    // Also clamp out vanishingly-small tensors. The threshold USED to be 1e-4,
+    // because ODE's dMassSetParameters was observed to crash below roughly
+    // that even on tensors that satisfy positive-definiteness and the triangle
+    // inequality. ODE is deleted; MuJoCo's own floor is mjMINVAL (1e-15), so a
+    // 1e-4 clamp is no longer a crash guard -- it is a second silent mask on
+    // top of the one this file just removed. A 100 g gripper finger's real
+    // tensor is ~1e-5 and would have been thrown away. The clamp survives only
+    // as a numerical-sanity floor at 1e-9, and dropping a tensor now WARNS
+    // instead of doing it quietly.
+    constexpr double kMinInertia = 1e-9;
     const bool tensorTooSmall = link.inertial.hasInertiaMatrix
                                 && (link.inertial.ixx < kMinInertia
                                     || link.inertial.iyy < kMinInertia
                                     || link.inertial.izz < kMinInertia);
+    // A tensor can be positive definite (the gate parseLink already applied)
+    // and still describe no physical body. Now that the tensor actually reaches
+    // the solver, MuJoCo's compiler would REJECT such a body outright -- so
+    // catch it here and fall back to the bounding object, loudly.
+    double moments[3] = {0.0, 0.0, 0.0};
+    const bool tensorImpossible =
+      link.inertial.hasInertiaMatrix && !tensorTooSmall &&
+      !urdfInertiaSatisfiesTriangleInequality(link.inertial.ixx, link.inertial.ixy,
+                                              link.inertial.ixz, link.inertial.iyy,
+                                              link.inertial.iyz, link.inertial.izz, moments);
+    if (link.inertial.hasInertiaMatrix && urdfUseInertiaEnabled() && mass > 0.0) {
+      if (tensorTooSmall)
+        OmLog::warning(QObject::tr("URDF link '%1': inertia tensor has a principal moment below "
+                                   "%2 kg.m^2 (%3 %4 %5); falling back to bounding-object inertia.")
+                         .arg(link.name).arg(kMinInertia)
+                         .arg(link.inertial.ixx).arg(link.inertial.iyy).arg(link.inertial.izz));
+      else if (tensorImpossible)
+        OmLog::warning(QObject::tr("URDF link '%1': inertia tensor violates the triangle inequality "
+                                   "for principal moments (a+b >= c): principal moments are "
+                                   "(%2 %3 %4). No rigid body has this tensor, and MuJoCo would "
+                                   "refuse the model; falling back to bounding-object inertia.")
+                         .arg(link.name).arg(moments[0]).arg(moments[1]).arg(moments[2]));
+    }
     const bool hasUrdfInertia = link.inertial.present && link.inertial.hasInertiaMatrix && mass > 0.0
-                                && !tensorTooSmall && urdfUseInertiaEnabled();
+                                && !tensorTooSmall && !tensorImpossible && urdfUseInertiaEnabled();
     const bool hasComOffset = link.inertial.present &&
                               (link.inertial.origin.x != 0.0 || link.inertial.origin.y != 0.0 ||
                                link.inertial.origin.z != 0.0);
@@ -1245,6 +1332,97 @@ QString emitLinkPhysics(const UrdfLink &link, const QString &indent, bool allowS
   return out;
 }
 
+// The joint's initial position, when the importer gives it one: the URDF
+// <rest> value, else the midpoint of a revolute range that excludes 0, else
+// the nearest stop of a prismatic range that excludes 0. ONE rule for both
+// the HingeJointParameters `position` line and the endPoint pose emitted by
+// emitSolidEndPoint, so the two can never disagree: the endPoint is written
+// ALREADY POSED at this angle (Webots semantics -- the endPoint fields are the
+// pose AT `position`), and the Newton bridge starts the joint there
+// (OmBasicJoint::flushPendingNewtonRegistrations, 2026-09-08). Before that the
+// endPoint was written at the URDF zero pose, so the scene, the joint's own
+// zero-pose bookkeeping and the first physics step all disagreed.
+bool initialJointPosition(const UrdfJoint &joint, double &q0) {
+  q0 = 0.0;
+  if (joint.type == "prismatic") {
+    if (joint.hasLower && joint.hasUpper && joint.upper > joint.lower &&
+        (joint.lower > 0.0 || joint.upper < 0.0)) {
+      q0 = joint.lower > 0.0 ? joint.lower : joint.upper;
+      return true;
+    }
+    return false;
+  }
+  if (joint.type != "revolute" || !joint.hasLower || !joint.hasUpper)
+    return false;
+  const double kPiLimit = M_PI - 0.01;
+  if (joint.lower <= -kPiLimit && joint.upper >= kPiLimit)
+    return false;  // full revolution: no stops, no seeded position
+  const double lo = std::max(-kPiLimit, std::min(kPiLimit, joint.lower));
+  const double hi = std::max(-kPiLimit, std::min(kPiLimit, joint.upper));
+  if (hi <= lo)
+    return false;
+  if (joint.hasRest) {
+    q0 = joint.rest;
+    return true;
+  }
+  if (lo > 0.0 || hi < 0.0) {
+    q0 = 0.5 * (lo + hi);
+    return true;
+  }
+  return false;
+}
+
+// Axis-angle of a rotation matrix (the extraction rpyToAxisAngle does after
+// building its matrix, kept separate so a composed matrix can use it).
+void matrixToAxisAngle(double m00, double m01, double m02, double m10, double m11, double m12,
+                       double m20, double m21, double m22, double &ax, double &ay, double &az, double &angle) {
+  const double trace = m00 + m11 + m22;
+  double cosAngle = (trace - 1.0) / 2.0;
+  if (cosAngle > 1.0)
+    cosAngle = 1.0;
+  if (cosAngle < -1.0)
+    cosAngle = -1.0;
+  angle = std::acos(cosAngle);
+  if (std::abs(angle) < 1e-9) {
+    ax = 0.0;
+    ay = 0.0;
+    az = 1.0;
+    angle = 0.0;
+    return;
+  }
+  if (std::abs(angle - M_PI) < 1e-6) {
+    if (m00 > m11 && m00 > m22) {
+      ax = std::sqrt(std::max(0.0, m00 - m11 - m22 + 1.0)) / 2.0;
+      ay = ax > 0 ? m01 / (2.0 * ax) : 0.0;
+      az = ax > 0 ? m02 / (2.0 * ax) : 0.0;
+    } else if (m11 > m22) {
+      ay = std::sqrt(std::max(0.0, m11 - m00 - m22 + 1.0)) / 2.0;
+      ax = ay > 0 ? m01 / (2.0 * ay) : 0.0;
+      az = ay > 0 ? m12 / (2.0 * ay) : 0.0;
+    } else {
+      az = std::sqrt(std::max(0.0, m22 - m00 - m11 + 1.0)) / 2.0;
+      ax = az > 0 ? m02 / (2.0 * az) : 0.0;
+      ay = az > 0 ? m12 / (2.0 * az) : 0.0;
+    }
+    angle = M_PI;
+    return;
+  }
+  const double s = 2.0 * std::sin(angle);
+  ax = (m21 - m12) / s;
+  ay = (m02 - m20) / s;
+  az = (m10 - m01) / s;
+}
+
+// Rotation matrix of `angle` about the unit axis (ux, uy, uz) -- Rodrigues.
+void axisAngleToMatrix(double ux, double uy, double uz, double angle,
+                       double &m00, double &m01, double &m02, double &m10, double &m11, double &m12,
+                       double &m20, double &m21, double &m22) {
+  const double c = std::cos(angle), s = std::sin(angle), t = 1.0 - c;
+  m00 = c + ux * ux * t;      m01 = ux * uy * t - uz * s; m02 = ux * uz * t + uy * s;
+  m10 = uy * ux * t + uz * s; m11 = c + uy * uy * t;      m12 = uy * uz * t - ux * s;
+  m20 = uz * ux * t - uy * s; m21 = uz * uy * t + ux * s; m22 = c + uz * uz * t;
+}
+
 void appendJointPhysicsParameters(QString &out, const UrdfJoint &joint, const QString &indent) {
   // PRISMATIC joints: emit the stops in METRES, with none of the angular
   // clamping below -- a linear travel of 0.0425 m has nothing to do with pi.
@@ -1260,10 +1438,11 @@ void appendJointPhysicsParameters(QString &out, const UrdfJoint &joint, const QS
       joint.upper > joint.lower) {
     out += indent + QString("minStop %1\n").arg(joint.lower);
     out += indent + QString("maxStop %1\n").arg(joint.upper);
-    if (joint.lower > 0.0 || joint.upper < 0.0) {
+    double q0 = 0.0;
+    if (initialJointPosition(joint, q0)) {
       // Same reasoning as the revolute case: the joint would otherwise start
       // outside its own stops, which the engine warns about on every load.
-      out += indent + QString("position %1\n").arg(joint.lower > 0.0 ? joint.lower : joint.upper);
+      out += indent + QString("position %1\n").arg(q0);
     }
     return;
   }
@@ -1292,10 +1471,12 @@ void appendJointPhysicsParameters(QString &out, const UrdfJoint &joint, const QS
         // preserve the original spawn pose -- e.g. Spot's hip_y was
         // limit [0.001, 0.60] (spawn midpoint 0.30) and is now widened
         // to [-2.50, 3.00] with <rest>0.30</rest> to keep walking.
-        if (joint.hasRest)
-          out += indent + QString("position %1\n").arg(joint.rest);
-        else if (lo > 0.0 || hi < 0.0)
-          out += indent + QString("position %1\n").arg(0.5 * (lo + hi));
+        //
+        // initialJointPosition is the single rule shared with emitSolidEndPoint,
+        // which writes the endPoint already posed at this angle.
+        double q0 = 0.0;
+        if (initialJointPosition(joint, q0))
+          out += indent + QString("position %1\n").arg(q0);
       }
     }
   }
@@ -1339,9 +1520,39 @@ QString emitSolidEndPoint(const UrdfLink &link, const UrdfJoint &joint, const QS
                           const QHash<QString, UrdfLink> &links,
                           const QHash<QString, QList<UrdfSensor>> &sensorsByLink) {
   QString out = indent + "endPoint Solid {\n";
-  out += indent + QString("  translation %1 %2 %3\n").arg(joint.origin.x).arg(joint.origin.y).arg(joint.origin.z);
+  // The endPoint is written AT the joint's initial position (Webots semantics:
+  // the endPoint fields are the pose at `position`, and the joint's zero-pose
+  // bookkeeping un-rotates them by it). For a revolute joint that is the URDF
+  // child frame rotated about the joint axis (given in that same child frame)
+  // by q0; for a prismatic joint it is the child frame translated along the
+  // axis by q0. The joint anchor coincides with the child origin in URDF, so
+  // a revolute pose keeps the translation.
+  double q0 = 0.0;
+  const bool posed = initialJointPosition(joint, q0) && q0 != 0.0;
+  double m00, m01, m02, m10, m11, m12, m20, m21, m22;
+  rpyToMatrix(joint.origin.roll, joint.origin.pitch, joint.origin.yaw, m00, m01, m02, m10, m11, m12, m20, m21, m22);
+  double tx = joint.origin.x, ty = joint.origin.y, tz = joint.origin.z;
+  if (posed) {
+    const double n = std::sqrt(joint.ax * joint.ax + joint.ay * joint.ay + joint.az * joint.az);
+    const double ux = n > 0.0 ? joint.ax / n : 0.0, uy = n > 0.0 ? joint.ay / n : 0.0, uz = n > 0.0 ? joint.az / n : 1.0;
+    if (joint.type == "prismatic") {
+      // R_rpy * (axis * q0), added to the child origin.
+      tx += (m00 * ux + m01 * uy + m02 * uz) * q0;
+      ty += (m10 * ux + m11 * uy + m12 * uz) * q0;
+      tz += (m20 * ux + m21 * uy + m22 * uz) * q0;
+    } else {
+      // R = R_rpy * R(axis_child, q0)
+      double a00, a01, a02, a10, a11, a12, a20, a21, a22;
+      axisAngleToMatrix(ux, uy, uz, q0, a00, a01, a02, a10, a11, a12, a20, a21, a22);
+      const double r00 = m00 * a00 + m01 * a10 + m02 * a20, r01 = m00 * a01 + m01 * a11 + m02 * a21, r02 = m00 * a02 + m01 * a12 + m02 * a22;
+      const double r10 = m10 * a00 + m11 * a10 + m12 * a20, r11 = m10 * a01 + m11 * a11 + m12 * a21, r12 = m10 * a02 + m11 * a12 + m12 * a22;
+      const double r20 = m20 * a00 + m21 * a10 + m22 * a20, r21 = m20 * a01 + m21 * a11 + m22 * a21, r22 = m20 * a02 + m21 * a12 + m22 * a22;
+      m00 = r00; m01 = r01; m02 = r02; m10 = r10; m11 = r11; m12 = r12; m20 = r20; m21 = r21; m22 = r22;
+    }
+  }
+  out += indent + QString("  translation %1 %2 %3\n").arg(tx).arg(ty).arg(tz);
   double ax, ay, az, ang;
-  rpyToAxisAngle(joint.origin.roll, joint.origin.pitch, joint.origin.yaw, ax, ay, az, ang);
+  matrixToAxisAngle(m00, m01, m02, m10, m11, m12, m20, m21, m22, ax, ay, az, ang);
   if (ang != 0.0)
     out += indent + QString("  rotation %1 %2 %3 %4\n").arg(ax).arg(ay).arg(az).arg(ang);
   out += indent + QString("  name \"%1\"\n").arg(link.name);

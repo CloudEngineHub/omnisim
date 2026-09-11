@@ -684,6 +684,24 @@ def main():
     _fd_t = float(os.environ.get("OMNISIM_DAMAGE_FORCE_DETACH_T", "2.0"))
     _fd_done = False
 
+    # Realism trace (default OFF). OMNISIM_DAMAGE_TRACE=<path> writes one JSON line
+    # per tick in which any bot-on-bot contact exists (plus one every _TRACE_EVERY
+    # ticks regardless): chassis pose/velocity, weapon angular speed, and for every
+    # part in contact its dv, impulse and penetration depth, plus HP deductions as
+    # "hits". Read by scripts/dev/combat_realism_report.py to score a physics
+    # configuration before/after a change on identical numbers.
+    _trace_path = os.environ.get("OMNISIM_DAMAGE_TRACE", "").strip()
+    _trace_f = None
+    _trace_hits = []
+    _TRACE_EVERY = max(1, int(round(0.1 / dt)))  # one row per 0.1 s of sim time
+    _tick = 0
+    if _trace_path:
+        try:
+            _trace_f = open(_trace_path, "w", buffering=1, encoding="utf-8")
+            sys.stderr.write(f"[damage_director] trace -> {_trace_path}\n")
+        except OSError as exc:
+            sys.stderr.write(f"[damage_director] trace open failed: {exc}\n")
+
     sim_t = 0.0
     match_over = False
     winner = None
@@ -705,6 +723,7 @@ def main():
 
     while sup.step(step_ms) != -1:
         sim_t += dt
+        _tick += 1
 
         if _force_detach and not _fd_done and sim_t >= _fd_t:
             _fd_done = True
@@ -818,6 +837,8 @@ def main():
                                    + (v[1] - pv[1]) ** 2
                                    + (v[2] - pv[2]) ** 2)
                     p["prev_v"] = v
+                    p["_dv"] = dv
+                    p["_J"] = 0.0
                     # Contact-point gate: only damage parts that are
                     # actually touching the opponent this step.
                     if part_id not in in_contact:
@@ -831,6 +852,7 @@ def main():
                         d_pen = depth_in_contact[f.name].get(part_id, 0.0)
                         if d_pen > 0.0:
                             impulse = p["mass"] * depth_scale * d_pen
+                    p["_J"] = impulse
                     if part_id == "chassis":
                         thr = th["chassis"]
                     elif part_id.endswith("wheel"):
@@ -850,6 +872,11 @@ def main():
                         before = p["hp"]
                         p["hp"] -= (impulse - thr)
                         p["last_damage_t"] = sim_t
+                        if _trace_f is not None:
+                            _trace_hits.append({
+                                "bot": f.name, "part": part_id,
+                                "J": round(impulse, 3), "thr": thr,
+                                "hp": [round(before, 2), round(p["hp"], 2)]})
                         if (impulse - thr) > 0.5 or p["hp"] <= 0:
                             sys.stderr.write(
                                 f"[damage_director] {f.name}.{part_id} "
@@ -874,6 +901,46 @@ def main():
                         f"[damage_director] {f.name} IMMOBILIZED at "
                         f"t={sim_t:.2f}s ({f.disqualify_reason})\n"
                     )
+
+            if _trace_f is not None:
+                _any_contact = any(parts_in_contact[f.name] for f in fighters)
+                if _any_contact or _trace_hits or (_tick % _TRACE_EVERY == 0):
+                    _row = {"t": round(sim_t, 4), "c": _any_contact, "f": {}}
+                    for f in fighters:
+                        try:
+                            _pos = list(f.node.getPosition())
+                            _vel = list(f.node.getVelocity())
+                        except Exception:
+                            continue
+                        _fd = {"p": [round(x, 4) for x in _pos],
+                               "v": [round(x, 4) for x in _vel[:3]],
+                               "w": [round(x, 4) for x in _vel[3:6]]}
+                        _wp = f.parts.get("weapon")
+                        if _wp is not None and not _wp["detached"]:
+                            try:
+                                _wv = list(_wp["node"].getVelocity())
+                                _fd["ww"] = round(math.sqrt(
+                                    _wv[3] ** 2 + _wv[4] ** 2 + _wv[5] ** 2), 3)
+                                _fd["wz"] = round(_wp["node"].getPosition()[2], 4)
+                            except Exception:
+                                pass
+                        _parts = {}
+                        for _pid in parts_in_contact[f.name]:
+                            _p = f.parts.get(_pid)
+                            if _p is None:
+                                continue
+                            _parts[_pid] = {
+                                "dv": round(_p.get("_dv", 0.0), 4),
+                                "J": round(_p.get("_J", 0.0), 3),
+                                "d": round(depth_in_contact[f.name].get(_pid, 0.0), 5),
+                                "hp": round(_p["hp"], 2)}
+                        if _parts:
+                            _fd["parts"] = _parts
+                        _row["f"][f.name] = _fd
+                    if _trace_hits:
+                        _row["hits"] = _trace_hits
+                    _trace_f.write(json.dumps(_row) + "\n")
+                _trace_hits = []
 
             # Match-end decision.
             alive = [f for f in fighters if not f.immobile]

@@ -204,3 +204,44 @@ def test_tag_isolates_intent_state_too(monkeypatch) -> None:
     assert production != tagged, "a tagged run shares the demo's intent store"
     assert os.path.basename(production) == "intents_tug_a.json"
     assert "hardtest" in os.path.basename(tagged)
+
+
+def test_mobile_motion_identity_survives_process_restarts() -> None:
+    """Every seq-bearing path must expose the process incarnation too.
+
+    A bridge restart resets ``motion_seq``.  Correlating on seq alone can
+    therefore attach a completion from process B to a dispatch made to
+    process A.  Keep the source-level gate cheap, but cover every distinct
+    result path where that identity is constructed.
+    """
+    path = BRIDGES[0]
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    mobile = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "MobileBridge"
+    )
+    methods = {
+        node.name: ast.get_source_segment(path.read_text(encoding="utf-8"), node)
+        for node in mobile.body if isinstance(node, ast.FunctionDef)
+    }
+
+    init = methods["__init__"]
+    assert "self.bridge_instance_id = str(uuid.uuid4())" in init
+    for name in ("_record_superseded", "_record_completion",
+                 "_await_completion", "act_drive_forward", "act_turn",
+                 "get_state"):
+        assert '"bridge_instance_id"' in methods[name], (
+            f"{name} drops the restart-safe motion identity"
+        )
+
+    source = path.read_text(encoding="utf-8")
+    assert '"id": bridge.bridge_instance_id' in source, (
+        "GET /protocol does not expose the process-incarnation id"
+    )
+
+
+def test_mobile_turn_correction_limit_is_not_reported_settled() -> None:
+    """Exhausting the pulse budget is a failed turn, not a settled success."""
+    source = BRIDGES[0].read_text(encoding="utf-8")
+    assert "settled=converged and not timed_out" in source
+    assert '"correction_limit"' in source

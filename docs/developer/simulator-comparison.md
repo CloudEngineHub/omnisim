@@ -334,7 +334,7 @@ rate. Quote which baseline you mean.
 | axis | result | scope |
 |---|---|---|
 | **Determinism** | **Bitwise** — `max_abs_dev = 0.0`, `first_div_step = -1`, 400 compared steps, **10/10 rows** — on **ODE** and on **Newton/XPBD in one light-contact sphere-drop world**. ⚠️ On the GPU `mujoco_warp` solver it is **refuted, not unmeasured**: 0 bitwise of 24 same-config cold pairs | `cold_cold` **and** `cold_warm` (worldReload in the same process), on M1, M2 and M3. Per-configuration scope, the `mujoco_warp` refutation and the CPU `mj_step` bitwise-5/5 counterpart: [determinism-scope.md](../benchmarks/determinism-scope.md) |
-| **Train↔deploy structural parity** (G1, `g1_golden_parity.py --structural`) | deploy-default: **1** real physics gap (`body_ipos`, the legacy COM-at-link-origin); with `OMNISIM_NEWTON_USE_LINK_COM=1`: **0** real gaps, 3 representational diffs, **pass** | M1 only — the sole rows with `p2_trustworthy: true` |
+| **Train↔deploy structural parity** (G1, `g1_golden_parity.py --structural`) | **0** real gaps, 3 representational diffs, **pass** on the deploy default since 2026-09-10 — a declared `inertiaMatrix` now carries its `centerOfMass` to the solver, closing the one gap (`body_ipos`, the legacy COM-at-link-origin) that used to need `OMNISIM_NEWTON_USE_LINK_COM=1`. ⚠️ The measured lane-3b score of **1** gap predates that change. `OMNISIM_NEWTON_INERTIA_COM=0` restores the 1-gap default. | M1 only — the sole rows with `p2_trustworthy: true` |
 | **Agent driveability of the HTTP harness** | **10/10, score 1.0** across 10 probes (load, hot-reload, scene tree, bounds, deterministic step, event cursor, joint state, verified framing, screenshot, structured diagnostic on a broken world) | M1, `omnisim-newton`. Probe list: [`lane3/DRIVEABILITY.md`](../../tests/benchmarks/omnibench/lane3/DRIVEABILITY.md) |
 
 **Determinism caveat that must travel with the claim** — the single most misquotable number
@@ -902,7 +902,10 @@ See [g1-single-source-of-truth.md](g1-single-source-of-truth.md).
 
 **What is new since 2026-07-10 is that the claim now has a number** 📊: OmniBench lane 3b
 scores the structural parity at **1 real physics gap** on the deploy default and **0** with
-`OMNISIM_NEWTON_USE_LINK_COM=1` (§1.3).
+`OMNISIM_NEWTON_USE_LINK_COM=1` (§1.3). ⚠️ **That measurement predates 2026-09-10**, when a
+declared `inertiaMatrix` began carrying its `centerOfMass` to the solver by default — the
+one gap it counts is closed on the current default, and the lane needs re-running to say so
+in its own numbers. `OMNISIM_NEWTON_INERTIA_COM=0` reproduces the measured configuration.
 
 **Do not add "and the simulation itself is bitwise-deterministic" to this claim** — an
 earlier edition did, and it does not hold for the configuration the G1 actually trains and

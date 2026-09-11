@@ -1,26 +1,50 @@
 # OmniSim Agent Build Films
 
 This is the locked workflow for videos in which an AI agent shows what it built
-in OmniSim. It generalizes the approved **Agent Build Story v8** film without
+in OmniSim. It generalizes the approved **Agent Build Story v9** film without
 loosening its visual, editorial, or evidence standards.
 
 The capture service and the ordinary Cinema storyboard system create real
 OmniSim footage. The Agent Build Film system is the story/edit layer above
 those captures.
 
-## The immutable signature
+## Action opening for YouTube
 
-Every film begins and ends the same way.
+The YouTube recuts authorized on 2026-09-08 use
+`"editorial": {"opening": "action", ...}`. They begin with real simulator action
+and narration at second zero, with AI-production disclosure over the first shot.
+They have no separate intro or outro. The story order is question, attempt,
+control, method, evidence, conclusion: the viewer sees the repair before its
+outcome is revealed. A required on-screen boundary beat can appear earlier,
+where the simulation assumptions first matter. The complete decisive run builds toward the
+first success reveal. Recorded-log diagrams and tracked traces are labeled as
+editorial explanations and never alter the underlying simulation result.
+
+The parser, edit-decision list, voice timing, mix, assembly receipt, and release
+verification all use this opening contract. The old silent signature remains
+available for existing manifests through the default `"opening": "signature"`.
+The silent-intro rules below apply only to that historical signature profile.
+
+An authored motion diagram can be a `kind: "plate"` segment with a `source`
+video. It receives the same media-range, hash, and delivery checks as a clip,
+while remaining excluded from the real-simulator-footage ratio. This allows
+custom brand typography and explanatory diagrams without misclassifying them
+as simulation evidence.
+
+## The historical signature
+
+Every film begins with the same ten-second signature. It ends on the final
+story image; there is no separate branded outro.
 
 | Time | Picture | Voiceover |
 |---|---|---|
 | 0:00–0:05 | Designed disclosure: “This video was made end-to-end by an AI agent under human monitoring.” | None |
 | 0:05–0:10 | Pure black screen: “A real build.” / “The story of an agent.” / “Told by an agent.” | None |
 | 0:10 | First real build shot | First narration line |
-| Final 4.5 s | OmniSim orb, “FROM EDIT TO EVIDENCE”, and `github.com/omnilink-tech/omnisim` | None by default |
+| Final story beat | A clean simulator image that resolves the build | Narration may finish naturally |
 
-The exact ranges, text, silence, GitHub destination, and first-footage time are
-code-enforced. They are not per-film options.
+The exact intro ranges, text, silence, first-footage time, and absence of an
+outro are code-enforced. They are not per-film options.
 
 ## The story contract
 
@@ -98,8 +122,8 @@ The manifest validator rejects a missing or out-of-order required beat.
   provenance must say how it was driven and that it changes no physics,
   sensing, planning, or result.
 - Build the Act III scale ladder deliberately: judgeable detail, moving
-  whole-workspace context, final-detail approach, unobstructed result. The last
-  build frame before the outro must show the achieved outcome clearly; do not
+  whole-workspace context, final-detail approach, unobstructed result. The
+  final build frame must show the achieved outcome clearly; do not
   resolve on an occluded robot, an empty corridor, or a generic establishing
   shot.
 - Every shot has a written `purpose`. Every cut is a direct cut and marks a real
@@ -303,7 +327,7 @@ and the last build frame. It also writes ordinary overview and exact cut-pair
 sheets. Pixel tests cannot establish the semantic truth of a goal or a claim,
 so the independent monitored review below remains mandatory.
 
-The renderer creates the locked intro/outro, trims and grades real captures,
+The renderer creates the locked intro, trims and grades real captures,
 renders safe cards and motion plates, generates the restrained score, ducks the
 score under narration, and emits:
 
@@ -316,7 +340,7 @@ score under narration, and emits:
 
 All expensive artifacts are content-addressed. A changed narration paragraph
 regenerates only that voice block; a changed shot regenerates only that part;
-audio-only work never rebuilds the picture; unchanged intro/outro, plates,
+audio-only work never rebuilds the picture; unchanged intro, plates,
 score, proxy, and final mix are reused. Every run writes cache hits, misses, and
 stage timings to `workflow_performance.json`.
 
@@ -346,8 +370,8 @@ The committed starting point is
 
 The release gate rejects intro timing drift, voice activity before second 10,
 source rewinds without replay disclosure, missing story beats, stale hashes,
-wrong frame count, subtitles, codec drift, or an outro other than the OmniSim
-GitHub slate.
+wrong frame count, subtitles, codec drift, or any outro appended after the final
+story segment.
 
 ### 6. Independent release review
 
@@ -364,8 +388,8 @@ The creative review is performed twice: first on regular overview sheets, then
 on exact before/after cut pairs. It must explicitly inspect the first frame at
 10 seconds, the negative-control failure, every information-card safe area, the
 Act III detail→wide→detail ladder, the visible moving subject in the wide, the
-goal/result frame, the claim boundary, and the last build frame before the
-outro. A regular contact sheet alone can miss a bad cut or obstructed ending.
+goal/result frame, the claim boundary, and the final build frame. A regular
+contact sheet alone can miss a bad cut or obstructed ending.
 
 ## What belongs in Git
 

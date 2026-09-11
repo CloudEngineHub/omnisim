@@ -216,14 +216,26 @@ pairs lock on a 4-wheel rover and a commanded straight 2 m drive became a
 0.868 m arc with −65° of yaw drift. Under MuJoCo the same command gives
 1.83 m with 0.000 rad drift. Don't remove that line.
 
-**Motion primitives: drives are FIXED, turns are NOT.** Commanded vs measured
-(supervisor ground-truth chassis pose), MuJoCo solver, re-measured 2026-07-25:
+**Motion primitives: drives were FIXED here; the turn verdict below is
+withdrawn.** Commanded vs measured (supervisor ground-truth chassis pose),
+MuJoCo solver, re-measured 2026-07-25:
 
 | Command | Before | After | Error |
 |---|---|---|---|
 | `drive_husky` 1.0 m | 0.787 m (−21.3%) | 0.993–0.999 m | **−0.7% … −0.1%** |
 | `drive_husky` 2.0 m | 1.788 m (−10.6%) | 1.997–1.999 m | **−0.2% … −0.1%** |
-| `turn_husky` 90° | 73.2° (−18.7%, 2026-07-22) | 51.0° | **−43% — still broken** |
+| `turn_husky` 90° | 73.2° (−18.7%, 2026-07-22) | 51.0° | ⚠️ **−43%, pre-`69b4b024b` — withdrawn** |
+
+⚠️ **The turn row is historical, not current.** Every turn figure on this
+page was measured before `69b4b024b` (2026-09-11), which lifted a solver cap
+that bounded a wheel's stall torque at its own rotational inertia
+(`kv <= M_ii/dt`) instead of at the effort the URDF declares — the Husky had
+9.5 N·m available against the ~25 N·m a four-tyre scrub pivot needs. Open
+loop, off the bridge, the Husky's chassis yaw ratio went **0.0069 → 0.532**.
+Drives were never affected (straight-line tracking 0.9991 before and after),
+so the drive rows stand as written. The turn has **not been re-measured
+through this agent's tools** since the fix; treat −43% as a record of what
+the actuator used to do, not as a property of the current engine.
 
 Root cause (measured, not calibration): under the Newton/MuJoCo solver the
 supervisor pose read *while the base is moving* leads the settled truth by a
@@ -246,15 +258,29 @@ sub-turns (`rotation_chunks` in the result), and reports `angle_achieved_deg`
 and `residual_error_deg` **unwrapped**. Same defect and same fix as
 `husky_omnilink_bridge` (`2e2471b8`).
 
-Turns have the same lead in yaw (~30° perceived lead while pivoting, and the
-true pivot rate is only ~0.05 rad/s), but the stop snap-back is large and
-state-dependent: the same settle-and-verify corrector measurably limit-cycled
-between −14% and +40% on repeated 90° commands, so it is NOT enabled for
-turns — they keep the original stable undershoot (−43% as measured today;
-the −18.7% recorded on 2026-07-22 did not reproduce). Sequential turn
-formations still accumulate large heading error. A pulse-and-settle turn loop
-(only trust settled yaw, fixed spin pulses) is the plausible fix but is slow
-(~0.05 rad/s true rate) and unimplemented.
+⚠️ **Withdrawn 2026-09-11 — the turn diagnosis below was built on a starved
+actuator.** This paragraph used to read: turns have the same pose lead in yaw
+(~30° perceived lead while pivoting), the true pivot rate is only
+~0.05 rad/s, the settle-and-verify corrector limit-cycled between −14% and
++40% on repeated 90° commands and is therefore NOT enabled for turns, and a
+pulse-and-settle turn loop is the plausible fix but is too slow to be worth
+it at ~0.05 rad/s. Four claims, all measured against a wheel that could not
+produce the torque a pivot needs (`69b4b024b`): the ~0.05 rad/s "true pivot
+rate" was a stall-torque ceiling, not a property of the base; a corrector
+limit-cycling around an actuator that delivers a load-dependent fraction of
+its command tells you nothing about the corrector; and the −43% "stable
+undershoot" is withdrawn with the table above. Re-enabling the corrector for
+turns is now a **measurement**, not a redesign — run the same A/B on the
+current engine and read the number.
+
+One part of the old paragraph may survive and must be checked rather than
+dropped: the **~30° in-motion yaw lead and the stop snap-back** are
+pose-*read* artefacts (what the supervisor reports while the base is moving
+versus after it settles), not torque artefacts, and the same mechanism is
+what the drive fix above was built around. Expect them to still be there;
+verify before relying on either figure. Sequential turn formations
+accumulating heading error is a consequence of whatever the turn actually
+does today — re-measure that too.
 
 **The model will fabricate success if you let it.** In an early run the agent
 called only `wait_for_husky_idle`, saw `idle: true`, and reported "the move is

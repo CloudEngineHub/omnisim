@@ -48,7 +48,7 @@ The loop:
 Anti-patterns that have wasted turns in past runs:
 - `read_lidar → turn → read_lidar → turn → read_lidar` — three reads, no driving. Forbidden.
 - `read_lidar → get_state → read_lidar` — pose unchanged, wasted read. Forbidden.
-- `turn → drive_forward → snap_to_cell` — the legacy three-call cell move; use `goto_cell` instead, which is one call.
+- `turn → drive_forward → snap_to_cell` — the legacy three-call cell move. `snap_to_cell` is removed (410), and `goto_cell` does the whole thing in one call. Use `goto_cell`.
 
 This is the discovery path. You will not know in advance how many steps it takes — perfect mazes have a guaranteed solution under right-hand-rule, but the path can be much longer than BFS.
 
@@ -94,7 +94,7 @@ The perception digest (returned by `scan_surroundings` and embedded in every `wa
 
 2. **`follow_corridor {cardinal, max_cells, stop_on_marker}`** — walks in one cardinal until a wall blocks, a marker becomes prominent, or `max_cells` is hit. Use this when the digest shows a long open corridor.
 
-After each move, read the digest in the response — do not call `scan_surroundings` again. The legacy `turn` / `drive_forward` / `snap_to_cell` primitives are also available but should NEVER be used on the blind world — every cell costs 4-5 chat round-trips that way.
+After each move, read the digest in the response — do not call `scan_surroundings` again. The legacy `turn` / `drive_forward` primitives are also available but should NEVER be used on the blind world — every cell costs 4-5 chat round-trips that way. (`snap_to_cell` is removed entirely and returns 410.)
 
 ## After you satisfy the brief
 
@@ -118,7 +118,8 @@ Without `complete_mission` the bridge stays at `mission_complete=false` regardle
 - **Never** drive to a cell that isn't an immediate 4-neighbour. The bridge will wedge against the wall between you.
 - **Never** claim success without `state.goal_reached == true`.
 - **Always** read pose before deciding the next step.
-- **Always** call `snap_to_cell {col, row, yaw}` after each successful cell move. Skid-steer pivots drift ~0.5 m per 90° turn; without snapping, the drift compounds and the husky wedges within ~10 cells. The standalone solver does this in `_drive_path` and `solve_unknown_map` — copy the pattern.
+- **Never** call `snap_to_cell`. Teleport-snapping has been removed; the bridge answers it with **410** and the husky does not move. The husky now navigates entirely under wheel control.
+- **Always verify each cell move instead of snapping.** After a move, `get_state`, compare the pose against the cell centre, and if the residual is large enough to matter, re-issue it (another `goto_cell`, or `drive_forward` with the remaining distance). A verified move is what replaced the snap — don't skip it and don't fake it.
 - On `fault`, call `stop_husky` immediately and re-evaluate. Don't keep issuing motion into a fault.
 - `stop_husky` is always available — never gate it.
 - For ambiguous operator input ("a bit further"), propose a concrete cell or distance and ask before executing.
@@ -129,10 +130,10 @@ For each cell transition `prev_cell` → `next_cell`:
 
 1. Compute `target_yaw` (cardinal heading from prev to next: east=0, north=+π/2, west=±π, south=-π/2).
 2. `get_state`. Compute heading delta = `wrap_pi(target_yaw - state.yaw)`.
-3. If `|delta| > 0.05`: `turn {angle: delta, speed: 0.6}`. Wait until `mode == "idle"`. Then `snap_to_cell {col: prev_cell.col, row: prev_cell.row, yaw: target_yaw}` to re-anchor after the pivot drift.
+3. If `|delta| > 0.05`: `turn {angle: delta, speed: 0.6}`. Wait until `mode == "idle"`. Then `get_state` and check the achieved yaw; if the residual is still `> 0.05`, issue the residual `turn` rather than assuming the first one landed.
 4. `get_state` again. Compute drive distance = projection of `(next_cell_centre - state.pose)` onto `target_yaw`.
 5. `drive_forward {distance, speed: 0.5}`. Wait until `mode == "idle"`.
-6. `snap_to_cell {col: next_cell.col, row: next_cell.row, yaw: target_yaw}` to re-anchor.
+6. `get_state` and compare the pose against `next_cell`'s centre. Re-issue the residual if it matters. (Do **not** call `snap_to_cell` — it is removed and returns 410.)
 7. Loop.
 
 This is the same pattern the standalone solver uses — see `solve.py`. It works for both BFS (known map) and the wall-follower (lidar). The strategy choice is *which next cell to pick*; the motion primitives are identical.
@@ -159,6 +160,7 @@ When you make a strategy decision (e.g. "map is available, switching to BFS" or 
 - World file: one of `husky_maze.omniworld` (known) or `husky_maze_unknown.omniworld` (unknown). The bridge tells you which via `world_title`.
 - Bridge: `http://127.0.0.1:6070`
 - Wheel radius: 0.1651 m, half-track: 0.2854 m
-- Max linear: ~0.99 m/s, max angular: ~3.47 rad/s
+- Max linear: ~0.99 m/s — the base tracks a linear command closely.
+- Max angular: the bridge clamps to ~3.47 rad/s, but that is the **kinematic** ceiling (wheel speed ÷ half-track), **not** a rate the chassis achieves. A skid-steer pivot scrubs all four tyres and delivers only a fraction of the commanded yaw rate. Treat any angular command as a request, read the achieved yaw back from `get_state`, and correct.
 - Goal radius: 0.8 m around `(10, -10)`
 - Lidar: 16 rays, max range 8 m, body frame

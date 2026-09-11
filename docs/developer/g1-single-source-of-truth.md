@@ -4,9 +4,11 @@
 > section) is the single source of truth. If a status claim here disagrees with that file,
 > that file is right — fix this one.
 
-> **VERIFIED (2026-06-18).** Trainer and deploy now provably run the **same physics**
-> (modulo the opt-in `OMNISIM_NEWTON_USE_LINK_COM` flag + documented representational /
-> residual diffs). Proven three independent ways: a structural compiled-`MjModel` field
+> **VERIFIED (2026-06-18; COM caveat retired 2026-09-10).** Trainer and deploy now provably
+> run the **same physics** (modulo documented representational / residual diffs). The link
+> COM used to be the one exception, behind the opt-in `OMNISIM_NEWTON_USE_LINK_COM`; a
+> declared `inertiaMatrix` now carries its `centerOfMass` to the solver by default, so it
+> is no longer an exception — see the Deploy COM bullet below. Proven three independent ways: a structural compiled-`MjModel` field
 > diff (0 real-physics gaps), a GPU golden trajectory (8.5 mm first-10-tick base drift),
 > and a live training run whose persisted physics config byte-matches the deploy
 > spec 11/11. See [Tier-2 golden parity](#tier-2-golden-parity--measured-on-cloud-gpu-2026-06-18)
@@ -237,12 +239,17 @@ rather than an unknown.
   children were fused away with `saveinertial=0`, losing ~1.28 kg on serialization) and
   `forcelimited/ctrllimited=FALSE`. The canonical MJCF now matches the trainer (P1 vs P3)
   on **all 31 structural fields** (34.1339 kg, unbounded force/ctrl).
-- **Deploy COM** (`24eeab2d`): the deploy `World.add_body` now accepts a COM
-  (`newton add_link(com=…)`), passed by `OmSolid::addBody` when
-  `OMNISIM_NEWTON_USE_LINK_COM` is set — **default off = legacy COM-at-origin, so every
-  other Newton robot is unchanged**. With the flag the structural verdict is **"NO REAL
-  PHYSICS GAPS"**: trainer ≡ deploy `body_ipos` PASS; only representational diffs
-  (`nbody`, mass-rollup, base-pos encoding) remain.
+- **Deploy COM** (`24eeab2d`): the deploy `World.add_body` accepts a COM
+  (`newton add_link(com=…)`), passed by `OmSolid::addBody`. ⚠️ **Updated 2026-09-10:
+  this is no longer gated on `OMNISIM_NEWTON_USE_LINK_COM`.** A declared
+  `inertiaMatrix` is by definition about the `centerOfMass`, so the two now travel to
+  the solver together for any Solid that declares a tensor — which, with the URDF
+  importer's inertia flip the same day, is every G1 link. The structural verdict is
+  therefore **"NO REAL PHYSICS GAPS"** by default: trainer ≡ deploy `body_ipos` PASS;
+  only representational diffs (`nbody`, mass-rollup, base-pos encoding) remain.
+  `OMNISIM_NEWTON_INERTIA_COM=0` restores legacy COM-at-origin for a policy that was
+  trained against it. Measured on `g1_stand_deploy`: 14 of 15 bodies moved,
+  max \|Δ`body_ipos`\| = 0.154 m.
 
 Post-fix golden run (A10G, `--use-link-com`), trainer ↔ deploy (P1↔P2):
 

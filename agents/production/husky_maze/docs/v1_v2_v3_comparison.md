@@ -3,6 +3,25 @@
 Three variants of the same maze-solving agent, each with a different
 allocation of work between **the LLM** and **the bridge**.
 
+> ⚠️ **Dated 2026-09-11: read the wall-clock and drift numbers as history.**
+> Every run on this page was measured before `69b4b024b`, which lifted a
+> solver cap that bounded a wheel's stall torque at its own rotational
+> inertia. A skid-steer pivot could not generate the traction force it needed
+> and the base **slid instead of turning** — that is what the ~0.5 m of
+> "drift per 90° pivot" was, and it is what made a single `goto_cell` blow
+> past its sim_time deadline. Open loop, the Husky's chassis yaw ratio has
+> since gone 0.0069 → 0.532. So the **drift figures, the sim_seconds, the
+> wall-clock and the snap counts are withdrawn** and none of them will
+> reproduce. Teleport-snapping itself has also been removed since (the verb
+> returns 410).
+>
+> **The architecture comparison is unaffected and stands.** LLM chat turns,
+> tool calls and token counts measure where the work sits between the model
+> and the bridge — 150 / 75 / 4 turns is a property of the agent loop, not of
+> the wheels. A faster actuator makes every variant finish sooner; it does
+> not move one tool call from the LLM to the bridge. Quote those columns
+> freely; re-measure anything with seconds or metres in it.
+
 | | LLM decides | Bridge does |
 |---|---|---|
 | **v1** | every cell move + every snap + every poll | one motor command at a time |
@@ -75,11 +94,13 @@ The LLM commits to the full BFS plan in one tool call. The bridge handles
 *everything* about locomotion: pre-snap to cell N's centre with the next
 cardinal yaw before each move, run goto_cell, settle, snap on drift.
 
-The pre-snap is what makes batched execution work — without it, the
-in-place 90° pivot inside a single `goto_cell` accumulates ~0.5 m of
-skid-steer drift and the move blows past its sim_time deadline. v1
-masked this by snapping after every pivot; v3 reproduces that anchor
-behaviour inside the bridge so the agent never has to think about it.
+The pre-snap is what made batched execution work — without it, the
+in-place 90° pivot inside a single `goto_cell` accumulated ~0.5 m of
+skid-steer drift and the move blew past its sim_time deadline. v1
+masked this by snapping after every pivot; v3 reproduced that anchor
+behaviour inside the bridge so the agent never had to think about it.
+(That drift was the stalled-pivot defect fixed in `69b4b024b` — see the
+banner at the top — and teleport-snapping has since been removed.)
 
 ## Measured metrics (clean runs, seed-7, lib v0.6.1, g1-engine)
 

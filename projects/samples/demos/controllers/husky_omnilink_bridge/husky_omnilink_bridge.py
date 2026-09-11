@@ -215,16 +215,44 @@ GOTO_TIMEOUT_S = 120.0    # safety abort. 120 s sim is deliberately
                           # ramp-up. 120 s comfortably covers worst-case
                           # 90° pivot + 2 m drive even at 1/4 speed.
 # Pivot angular speed is capped below MAX_ANGULAR_R_S so the wheels
-# don't break traction during in-place 90° turns. 1.5 rad/s = ~1.0 s sim
-# for a 90° pivot under nominal load, vs ~0.45 s at full speed which
-# tends to skid the body sideways and wedge against the next wall.
+# don't break traction during in-place 90° turns, then skid the body
+# sideways and wedge it against the next wall.
+#
+# ⚠ THE ARITHMETIC THIS COMMENT USED TO CARRY ASSUMED FULL DELIVERY, and
+# that assumption was false when it was written. It said "1.5 rad/s = ~1.0 s
+# sim for a 90° pivot under nominal load, vs ~0.45 s at full speed". That
+# reads the commanded rate as the achieved one. Before commit 69b4b024b the
+# solver delivered ~0.0343 of a commanded Husky pivot (the velocity servo's
+# gain was pinned at M_ii/dt, so its stall torque was ~9.5 N.m against the
+# ~25 N.m a four-tyre scrub pivot needs), meaning a commanded 1.5 rad/s
+# produced about 0.05 rad/s and a 90° pivot took ~30 s. THIS CAP WAS NEVER
+# THE BINDING CONSTRAINT, so it cannot have been the source of the slow
+# pivots -- the solver was.
+#
+# POST 69b4b024b the Husky delivers 0.520 of command (measured 2026-09-11),
+# so a commanded 1.5 rad/s is ~0.78 rad/s achieved and a 90° pivot is ~2 s,
+# comfortably inside GOTO_TIMEOUT_S. 1.5 is also still inside the base's
+# measured envelope (max_angular 1.805 rad/s), so it remains a legal,
+# conservative cap and is LEFT AS IT IS.
+#
+# ⚠ OPEN, needs a maze measurement before anyone changes it: whether 1.5 is
+# still the RIGHT cap is an empirical question about traction and wedging in
+# husky_maze specifically, and the traction margin has genuinely changed now
+# that the wheels can deliver real torque. Raising it toward the 1.805
+# ceiling would buy ~15% off each pivot; do not do so without running the
+# maze and counting wedges.
 PIVOT_ANGULAR_R_S_MAX = 1.5
 # Wheel command ramping. Original tuning was "effectively unlimited" (6.0)
 # because Webots' built-in motor torque limits smooth the diff-drive
 # transitions. Keep that: testing showed lower ramp values made the husky
 # arrive at the same wedge in the same sim time but slower wall time,
-# without improving the wedge rate. Slow pivots come from PIVOT_ANGULAR_R_S_MAX,
-# not from the wheel ramp.
+# without improving the wedge rate.
+# ⚠ The claim that used to end this block -- "slow pivots come from
+# PIVOT_ANGULAR_R_S_MAX, not from the wheel ramp" -- was a false dichotomy.
+# Neither was the cause: pre-69b4b024b the solver delivered ~3% of a
+# commanded pivot, so the pivot cap was never reached and the ramp was never
+# the limit either. The ramp finding above (lower values did not improve the
+# wedge rate) still stands on its own measurement.
 WHEEL_RAMP_PER_TICK = 6.0
 MAX_LINEAR_M_S = MAX_WHEEL_SPEED * WHEEL_RADIUS_M     # ~0.99 m/s
 MAX_ANGULAR_R_S = MAX_WHEEL_SPEED * WHEEL_RADIUS_M / HALF_TRACK_M  # ~3.47 rad/s

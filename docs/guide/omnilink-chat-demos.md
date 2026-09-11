@@ -41,6 +41,11 @@ the robot moves. The transcript shows the agent's reply
 | `omnilink_rosbot.omniworld`       | Husarion Rosbot            | 4-wheel diff-drive | same as Husky |
 | `omnilink_rosbot_xl.omniworld`    | Husarion Rosbot XL         | 4-wheel diff-drive | same as Husky |
 | `omnilink_omniquad.omniworld`         | OmniQuad       | quadruped (scripted gait) | `stand`, `sit`, `wave hello`, `walk forward`, `stop` |
+| `omnilink_lite3.omniworld`        | Deep Robotics Lite3        | quadruped (real stance physics; `walk` cycles the legs in place) | `stand`, `sit`, `wave hello`, `walk`, `stop` |
+| `omnilink_x30.omniworld`          | Deep Robotics X30          | quadruped (as the Lite3) | same as Lite3 |
+| `omnilink_m20.omniworld`          | Deep Robotics M20          | wheeled-legged quadruped (wheels are real physics) | `stand`, `sit`, `wave hello`, `drive forward`, `stop` |
+| `omnilink_m20s.omniworld`         | Deep Robotics M20S         | wheeled-legged quadruped | same as M20 |
+| `omnilink_m20_piper.omniworld`    | Deep Robotics M20 + Piper arm | wheeled-legged quadruped + 6-DoF arm (arm holds its zero pose) | same as M20 |
 | `omnilink_mavic.omniworld`        | DJI Mavic 2 Pro            | quadcopter (aerial) | `takeoff`, `forward 1 m`, `up 2 m`, `turn right 90 degrees`, `land` |
 | `omnilink_ur3e.omniworld`         | Universal Robots UR3e      | 6-DOF arm | same arm tool surface |
 | `omnilink_ur5e.omniworld`         | Universal Robots UR5e      | 6-DOF arm | same arm tool surface |
@@ -333,7 +338,12 @@ Three pieces of code, all in this repo:
   [projects/samples/demos/controllers/](../../projects/samples/demos/controllers/):
   - `omnilink_mobile_bridge/` — driven by every wheeled base.
     Parameterised by `_mobile_configs.py` (wheel layout, radii, max speed).
-  - `omnilink_quadruped_bridge/` — OmniQuad-specific poses plus a clearly labelled supervisor-assisted scripted gait.
+  - `omnilink_quadruped_bridge/` — every quadruped. Parameterised by
+    `_quadruped_configs.py` (leg motors, stand / sit poses, sign conventions,
+    `walk` mode). OmniQuad keeps its supervisor-pinned stance and its clearly
+    labelled scripted gait; the Deep Robotics Lite3 / X30 stand on their own
+    physics and only cycle their legs in place; the M20 family drives its
+    wheels for real.
   - `mavic_omnilink_bridge/` — the DJI Mavic 2 Pro (aerial).
 
 - **[projects/samples/demos/controllers/_omnilink_relay/](../../projects/samples/demos/controllers/_omnilink_relay/)** —

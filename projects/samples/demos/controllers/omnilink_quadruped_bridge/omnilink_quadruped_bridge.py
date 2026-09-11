@@ -12,21 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""omnilink_quadruped_bridge — OmniQuad-specific bridge.
+"""omnilink_quadruped_bridge — config-driven quadruped bridge.
 
-This bridge exposes the same soft-drop / crouch / stand sequence as
-`omniquad_simple_pose` plus an intent surface:
+`--robot <key>` selects an entry of `_quadruped_configs.QUADRUPED_CONFIGS`
+(OmniQuad, and the Deep Robotics Lite3 / X30 / M20 / M20S / M20 Piper). The
+config names the leg motors, the stand / sit poses and the sign conventions;
+this file is the motion and intent surface:
 
     stand       -- hold the standing stance with a tiny sway
     sit         -- crouch low (knees bent further)
     wave        -- exaggerate the sway for ~6 s
-    walk        -- wave-gait leg cycle + supervisor-driven forward
-                   body translation (the only way to keep OmniQuad
-                   upright while it locomotes -- pure-physics walking
-                   on this URDF reliably topples after 5-10 s; see
-                   `omniquad_simple_pose.py`)
-    stop        -- freeze the legs in current position
+    walk        -- per config: "gait" = wave-gait leg cycle + supervisor-
+                   driven forward body translation (OmniQuad: the only way
+                   to keep it upright while it locomotes -- pure-physics
+                   walking on that URDF reliably topples after 5-10 s; see
+                   `omniquad_simple_pose.py`); "wheels" = hold the stance
+                   and drive the wheel motors (the M20 family, real
+                   physics); "march" = the leg cycle in place
+    stop        -- freeze the legs (and wheels) in current position
     home        -- alias for stand
+
+Every robot starts with a settle: the motors are ramped from the pose the
+engine spawned them in to the stand pose over the config's `settle_s` (the
+Deep Robotics package notes why: projects/robots/deep_robotics/PROVENANCE.md).
 
 The HTTP surface is intentionally minimal: list_robots, get_robot_state,
 stop_robot, reset_to_home, prompt. set_joint_positions is also exposed
@@ -82,27 +90,19 @@ except Exception:
     def get_omni_key() -> str: return ""
 
 
-LEGS = ("front_left", "front_right", "rear_left", "rear_right")
-
-# Stance constants -- copied from omniquad_simple_pose.
-HIP_X_LEFT = 0.30
-HIP_X_RIGHT = -0.30
-HIP_Y_STAND = 0.30
-KNEE_STAND = -0.60
-HIP_Y_SIT = 0.55
-KNEE_SIT = -1.20
-EXTEND_HIP_Y = 0.15
-EXTEND_KNEE = -0.30
+from _quadruped_configs import LEGS, QUADRUPED_CONFIGS  # noqa: E402
 
 # Walk parameters (wave gait + supervisor-driven body translation; see
-# omniquad_simple_pose for the longer rationale and physics caveats).
+# omniquad_simple_pose for the longer rationale and physics caveats). The
+# deltas are MAGNITUDES; the config's hip_sweep_dir / knee_flex_dir give them
+# a sign per leg.
 WALK_PERIOD_S = 4.0
 SWING_FRACTION = 0.20
-SWING_KNEE_DELTA = -0.30
+SWING_KNEE_DELTA = 0.30        # extra knee flexion at mid-swing
 HIP_SWEEP_AMP = 0.18
-WALK_VELOCITY_MS = 0.30        # forward translation speed during walk
-WALK_VELOCITY_RAMP_S = 2.0     # accelerate from 0 to WALK_VELOCITY_MS
+WALK_VELOCITY_RAMP_S = 2.0     # accelerate from 0 to the config's walk_velocity_ms
 COM_SHIFT_AMP_Y = 0.08
+SETTLE_HOLD_S = 1.5            # OmniQuad only: hold the `extend` pose before the ramp
 
 LEG_PHASES = {
     "front_right": 0.00,
@@ -112,13 +112,14 @@ LEG_PHASES = {
 }
 
 
-def hip_x_for(leg: str) -> float:
-    return HIP_X_LEFT if "left" in leg else HIP_X_RIGHT
+def _smoothstep(x: float) -> float:
+    x = max(0.0, min(1.0, x))
+    return x * x * (3.0 - 2.0 * x)
 
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(add_help=False)
-    p.add_argument("--robot", default="omniquad")
+    p.add_argument("--robot", default="omniquad", choices=sorted(QUADRUPED_CONFIGS))
     p.add_argument("--port", type=int, default=8765)
     args, _ = p.parse_known_args()
     return args
@@ -128,22 +129,48 @@ class QuadrupedBridge:
     def __init__(self, robot: Supervisor, robot_id: str = "omniquad") -> None:
         self.robot = robot
         self.robot_id = robot_id
+        self.cfg = QUADRUPED_CONFIGS[robot_id]
+        self.model = self.cfg["model"]
         self.timestep = int(robot.getBasicTimeStep())
 
-        # 12 motors: <leg>_<hip_x|hip_y|knee>_motor
+        # 12 leg motors, named by the config (URDF joint name + "_motor",
+        # falling back to the bare joint name), plus their position sensors
+        # so the settle can start from the pose the engine actually spawned.
         self.motors = {}
+        self.sensors = {}
         for leg in LEGS:
             for joint in ("hip_x", "hip_y", "knee"):
-                name = f"{leg}_{joint}_motor"
+                name = self.cfg["legs"][leg][joint]
                 m = robot.getDevice(name)
+                if m is None and name.endswith("_motor"):
+                    m = robot.getDevice(name[:-len("_motor")])
                 if m is None:
                     print(f"[omnilink_quadruped_bridge] WARNING: missing {name}")
                 self.motors[(leg, joint)] = m
+                s = m.getPositionSensor() if m is not None else None
+                if s is not None:
+                    s.enable(self.timestep)
+                self.sensors[(leg, joint)] = s
+        # Wheel motors (M20 family): velocity-controlled, parked at spawn.
+        self.wheels = {}
+        for leg, name in self.cfg.get("wheels", {}).items():
+            w = robot.getDevice(name)
+            if w is None and name.endswith("_motor"):
+                w = robot.getDevice(name[:-len("_motor")])
+            if w is None:
+                print(f"[omnilink_quadruped_bridge] WARNING: missing wheel {name}")
+                continue
+            w.setPosition(float("inf"))
+            w.setVelocity(0.0)
+            self.wheels[leg] = w
 
         # Motion state.
         self.lock = threading.RLock()
         # ("settle"|"crouch"|"stand"|"sit"|"wave"|"walk"|"stop", params)
         self.motion = ("settle", {"t0": robot.getTime()})
+        # Per-(leg, joint) pose the settle ramps FROM: the config's `extend`
+        # pose when it has one (OmniQuad), else the measured spawn pose.
+        self.settle_from: Dict[Tuple[str, str], float] = {}
         self.last_tick_at = time.time()
 
         # Supervisor handles for walk-phase body translation + orientation lock.
@@ -176,29 +203,63 @@ class QuadrupedBridge:
         self.window_configured = False
 
         self.capabilities = {
+            "model": self.model,
             "legs": list(LEGS),
             "joints_per_leg": ["hip_x", "hip_y", "knee"],
-            "stand_pose": {"hip_y": HIP_Y_STAND, "knee": KNEE_STAND},
-            "sit_pose": {"hip_y": HIP_Y_SIT, "knee": KNEE_SIT},
-            "walk_velocity_ms": WALK_VELOCITY_MS,
+            "stand_pose": {leg: {"hip_y": hy, "knee": kn} for leg, (hy, kn) in self.cfg["stand"].items()},
+            "sit_pose": {leg: {"hip_y": hy, "knee": kn} for leg, (hy, kn) in self.cfg["sit"].items()},
+            "walk": self.cfg["walk"],
+            "walk_velocity_ms": self.cfg["walk_velocity_ms"],
+            "body_lock": bool(self.cfg["body_lock"]),
         }
 
     def queue_window(self, line: str) -> None:
         with self.lock:
             self.window_outbox.append(line)
 
-    def _set_all(self, hip_y: float, knee: float, hip_x_extra: float = 0.0) -> None:
+    def _pose(self, leg: str, base: str, hip_y_delta: float = 0.0, knee_delta: float = 0.0,
+              hip_x_extra: float = 0.0) -> Tuple[float, float, float]:
+        """Absolute (hip_x, hip_y, knee) for `leg`: the config's `base` pose
+        ("stand" / "sit") plus signed deltas. `hip_y_delta` > 0 moves the
+        foot backward, `knee_delta` > 0 flexes the knee, whatever the
+        robot's joint convention."""
+        hy, kn = self.cfg[base][leg]
+        return (self.cfg["hip_x"][leg] + hip_x_extra,
+                hy + self.cfg["hip_sweep_dir"][leg] * hip_y_delta,
+                kn + self.cfg["knee_flex_dir"][leg] * knee_delta)
+
+    def _apply(self, leg: str, hip_x: float, hip_y: float, knee: float) -> None:
+        for joint, value in (("hip_x", hip_x), ("hip_y", hip_y), ("knee", knee)):
+            m = self.motors[(leg, joint)]
+            if m is not None:
+                m.setPosition(value)
+
+    def _set_all(self, base: str = "stand", hip_y_delta: float = 0.0, knee_delta: float = 0.0,
+                 hip_x_extra: float = 0.0) -> None:
         for leg in LEGS:
-            base = hip_x_for(leg)
-            mx = self.motors[(leg, "hip_x")]
-            my = self.motors[(leg, "hip_y")]
-            mk = self.motors[(leg, "knee")]
-            if mx is not None:
-                mx.setPosition(base + hip_x_extra)
-            if my is not None:
-                my.setPosition(hip_y)
-            if mk is not None:
-                mk.setPosition(knee)
+            self._apply(leg, *self._pose(leg, base, hip_y_delta, knee_delta, hip_x_extra))
+
+    def _capture_settle_from(self) -> None:
+        """Where the settle ramp starts: the config's `extend` pose, else the
+        joints as the engine spawned them (they start at q=0 clamped into
+        range whatever the URDF's rest pose says -- PROVENANCE.md)."""
+        extend = self.cfg.get("extend")
+        for leg in LEGS:
+            for joint in ("hip_x", "hip_y", "knee"):
+                if extend is not None:
+                    hy, kn = extend[leg]
+                    v = {"hip_x": self.cfg["hip_x"][leg], "hip_y": hy, "knee": kn}[joint]
+                else:
+                    s = self.sensors[(leg, joint)]
+                    v = s.getValue() if s is not None else float("nan")
+                    if not math.isfinite(v):
+                        v = {"hip_x": self.cfg["hip_x"][leg], "hip_y": self.cfg["stand"][leg][0],
+                             "knee": self.cfg["stand"][leg][1]}[joint]
+                self.settle_from[(leg, joint)] = v
+
+    def _set_wheels(self, velocity_radps: float) -> None:
+        for w in self.wheels.values():
+            w.setVelocity(velocity_radps)
 
     def _ensure_anchor(self) -> None:
         """Capture the floating-base anchor once, from the live body pose."""
@@ -248,53 +309,73 @@ class QuadrupedBridge:
             self.last_tick_at = time.time()
 
         if kind == "settle":
-            # Hold extended for 1.5 s for soft drop.
-            self._set_all(EXTEND_HIP_Y, EXTEND_KNEE)
-            if sim_t - p["t0"] > 1.5:
+            # OmniQuad: hold its `extend` pose for a soft drop, then ramp.
+            # Every other robot: ramp from the measured spawn pose at once.
+            if not self.settle_from:
+                self._capture_settle_from()
+            hold = SETTLE_HOLD_S if self.cfg.get("extend") is not None else 0.0
+            if sim_t - p["t0"] < hold:
+                for leg in LEGS:
+                    self._apply(leg, *(self.settle_from[(leg, j)] for j in ("hip_x", "hip_y", "knee")))
+            else:
                 with self.lock:
                     self.motion = ("crouch", {"t0": sim_t})
         elif kind == "crouch":
-            # Ramp into standing stance over 3 s.
-            phase = min(1.0, (sim_t - p["t0"]) / 3.0)
-            hy = EXTEND_HIP_Y + (HIP_Y_STAND - EXTEND_HIP_Y) * phase
-            kn = EXTEND_KNEE + (KNEE_STAND - EXTEND_KNEE) * phase
-            self._set_all(hy, kn)
-            if phase >= 1.0:
+            # Smoothstep from the settle-from pose into the stand over settle_s.
+            a = _smoothstep((sim_t - p["t0"]) / max(1e-6, float(self.cfg["settle_s"])))
+            for leg in LEGS:
+                target = self._pose(leg, "stand")
+                start = tuple(self.settle_from[(leg, j)] for j in ("hip_x", "hip_y", "knee"))
+                self._apply(leg, *(s + (t - s) * a for s, t in zip(start, target)))
+            if a >= 1.0:
                 with self.lock:
                     self.motion = ("stand", {"t0": sim_t})
         elif kind == "stand":
             sway = 0.04 * math.sin(2 * math.pi * (sim_t - p["t0"]) / 3.0)
-            self._set_all(HIP_Y_STAND + sway, KNEE_STAND)
+            self._set_all("stand", hip_y_delta=sway)
         elif kind == "sit":
-            self._set_all(HIP_Y_SIT, KNEE_SIT)
+            self._set_all("sit")
         elif kind == "wave":
             t = sim_t - p["t0"]
             sway = 0.10 * math.sin(2 * math.pi * 0.8 * t)
-            self._set_all(HIP_Y_STAND + sway, KNEE_STAND, hip_x_extra=sway * 0.5)
+            self._set_all("stand", hip_y_delta=sway, hip_x_extra=sway * 0.5)
             if t > p["duration_s"]:
                 with self.lock:
                     self.motion = ("stand", {"t0": sim_t})
         elif kind == "walk":
-            self._tick_walk(sim_t, p)
+            if self.cfg["walk"] == "wheels":
+                self._tick_drive(sim_t, p)
+            else:
+                self._tick_walk(sim_t, p, translate=(self.cfg["walk"] == "gait"))
         elif kind == "stop":
             # Do nothing -- last setpoints stay applied.
             pass
 
         # Pin the floating base upright for every non-walk pose (walk runs its
         # own translation+rotation lock in _tick_walk). This is what keeps OmniQuad
-        # standing under Newton/XPBD; see _lock_body_upright.
-        if kind != "walk":
+        # standing under Newton/XPBD; see _lock_body_upright. Robots whose config
+        # says body_lock False stand on their own physics.
+        if kind != "walk" and self.cfg["body_lock"]:
             self._lock_body_upright()
 
-    def _tick_walk(self, sim_t: float, p: Dict[str, Any]) -> None:
-        """Joint-space wave gait + supervisor-driven forward translation.
+    def _tick_drive(self, sim_t: float, p: Dict[str, Any]) -> None:
+        """Wheeled-legged walk: hold the stance and roll the wheels. Real
+        physics -- no supervisor writes."""
+        self._set_all("stand")
+        v_cmd = self.cfg["walk_velocity_ms"] * max(0.0, min(1.0, (sim_t - p["t0"]) / WALK_VELOCITY_RAMP_S))
+        self._set_wheels(self.cfg.get("wheel_forward_sign", -1.0) * v_cmd / self.cfg["wheel_radius_m"])
+
+    def _tick_walk(self, sim_t: float, p: Dict[str, Any], translate: bool = True) -> None:
+        """Joint-space wave gait (+ supervisor-driven forward translation when
+        `translate`).
 
         Each leg cycles realistically through stance/swing (animated by
-        position-controlled motors). The body's X position is locked to
-        a straight forward line from the walk-start anchor, advancing at
-        WALK_VELOCITY_MS m/s (ramped from 0). Pure physics walking is
-        not stable on this URDF; supervisor translation lets OmniQuad
-        visibly walk while keeping the gait visually realistic.
+        position-controlled motors). With `translate`, the body's X position
+        is locked to a straight forward line from the walk-start anchor,
+        advancing at the config's walk_velocity_ms (ramped from 0). Pure
+        physics walking is not stable on the OmniQuad URDF; supervisor
+        translation lets it visibly walk while keeping the gait visually
+        realistic. Without it ("march") the legs cycle in place.
         """
         walk_t = sim_t - p["t0"]
         cycle_phase = (walk_t / WALK_PERIOD_S) % 1.0
@@ -306,36 +387,28 @@ class QuadrupedBridge:
         for leg in LEGS:
             offset = (cycle_phase - LEG_PHASES[leg]) % 1.0
             if offset < SWING_FRACTION:
-                # Swing: hip_y descends from STANCE+A to STANCE-A; knee flexes.
+                # Swing: the foot travels from back (+A) to front (-A); knee flexes.
                 pp = offset / SWING_FRACTION
                 smooth = pp * pp * (3.0 - 2.0 * pp)
-                hip_y = HIP_Y_STAND + HIP_SWEEP_AMP * (1.0 - 2.0 * smooth) * amp_scale
-                knee = KNEE_STAND + SWING_KNEE_DELTA * math.sin(math.pi * pp) * amp_scale
+                hip_y_delta = HIP_SWEEP_AMP * (1.0 - 2.0 * smooth) * amp_scale
+                knee_delta = SWING_KNEE_DELTA * math.sin(math.pi * pp) * amp_scale
             else:
-                # Stance: hip_y rises from STANCE-A to STANCE+A; foot stays
-                # planted -> body moves forward in world.
+                # Stance: the foot travels from front (-A) to back (+A); planted
+                # foot -> body moves forward in world.
                 pp = (offset - SWING_FRACTION) / (1.0 - SWING_FRACTION)
-                hip_y = HIP_Y_STAND + HIP_SWEEP_AMP * (-1.0 + 2.0 * pp) * amp_scale
-                knee = KNEE_STAND
+                hip_y_delta = HIP_SWEEP_AMP * (-1.0 + 2.0 * pp) * amp_scale
+                knee_delta = 0.0
+            self._apply(leg, *self._pose(leg, "stand", hip_y_delta, knee_delta, hip_x_extra=com_shift_y))
 
-            base = hip_x_for(leg)
-            mx = self.motors[(leg, "hip_x")]
-            my = self.motors[(leg, "hip_y")]
-            mk = self.motors[(leg, "knee")]
-            if mx is not None:
-                mx.setPosition(base + com_shift_y)
-            if my is not None:
-                my.setPosition(hip_y)
-            if mk is not None:
-                mk.setPosition(knee)
-
+        if not translate:
+            return
         # Advance the shared body anchor along +x by this tick's ramped
         # distance, then write it (level). Using the persistent anchor (rather
         # than a per-walk start offset) means a later 'stand' holds the
         # advanced position instead of snapping back to the spawn point.
         if self.self_node is not None and self.translation_field is not None:
             self._ensure_anchor()
-            v_cmd = WALK_VELOCITY_MS * max(0.0, min(1.0, walk_t / WALK_VELOCITY_RAMP_S))
+            v_cmd = self.cfg["walk_velocity_ms"] * max(0.0, min(1.0, walk_t / WALK_VELOCITY_RAMP_S))
             dt = max(0.0, self.timestep / 1000.0)
             ax, ay, az = self.body_anchor
             ax += v_cmd * dt
@@ -348,16 +421,19 @@ class QuadrupedBridge:
     def act_stop(self) -> dict:
         with self.lock:
             self.motion = ("stop", {})
+        self._set_wheels(0.0)
         return {"halted_at": time.time()}
 
     def act_stand(self) -> dict:
         with self.lock:
             self.motion = ("stand", {"t0": self.robot.getTime()})
+        self._set_wheels(0.0)
         return {"accepted": True, "pose": "stand"}
 
     def act_sit(self) -> dict:
         with self.lock:
             self.motion = ("sit", {})
+        self._set_wheels(0.0)
         return {"accepted": True, "pose": "sit"}
 
     def act_wave(self, duration_s: float = 6.0) -> dict:
@@ -368,7 +444,8 @@ class QuadrupedBridge:
     def act_walk(self) -> dict:
         with self.lock:
             self.motion = ("walk", {"t0": self.robot.getTime()})
-        return {"accepted": True, "pose": "walk", "velocity_ms": WALK_VELOCITY_MS}
+        return {"accepted": True, "pose": "walk", "walk": self.cfg["walk"],
+                "velocity_ms": self.cfg["walk_velocity_ms"]}
 
     def act_reset_to_home(self) -> dict:
         return self.act_stand()
@@ -376,10 +453,17 @@ class QuadrupedBridge:
     def get_state(self) -> dict:
         with self.lock:
             kind = self.motion[0]
+        pos = None
+        if self.self_node is not None:
+            try:
+                pos = [float(v) for v in self.self_node.getPosition()]
+            except Exception:
+                pos = None
         return {
             "id": self.robot_id,
-            "model": "OmniQuad",
+            "model": self.model,
             "mode": kind,
+            "position": pos,
             "last_tick_at": self.last_tick_at,
             "sim_time": self.robot.getTime(),
         }
@@ -405,12 +489,12 @@ class IntentRouter:
         if re.search(r"\b(wave|hello|dance|demo|show)\b", s):
             self.bridge.act_wave()
             return {"agent": "Waving — give me ~6 seconds.", "tools": [("wave", "ok", "0.8 Hz sway")]}
-        if re.search(r"\b(walk|forward|move|go)\b", s):
-            self.bridge.act_walk()
-            return {
-                "agent": f"Walking forward at {WALK_VELOCITY_MS:.2f} m/s.",
-                "tools": [("walk", "ok", f"v={WALK_VELOCITY_MS} m/s")],
-            }
+        if re.search(r"\b(walk|forward|move|go|drive|roll)\b", s):
+            r = self.bridge.act_walk()
+            v = r["velocity_ms"]
+            verb = {"wheels": "Driving", "march": "Marching in place", "gait": "Walking"}[r["walk"]]
+            msg = f"{verb} forward at {v:.2f} m/s." if v > 0 else f"{verb} (this robot's bridge does not translate the body)."
+            return {"agent": msg, "tools": [("walk", "ok", f"{r['walk']} v={v} m/s")]}
         if re.search(r"\b(status|state|where|pose)\b", s):
             st = self.bridge.get_state()
             return {"agent": f"mode={st['mode']}", "tools": [("get_robot_state", "ok", st["mode"])]}
@@ -546,7 +630,7 @@ def make_handler(bridge: QuadrupedBridge, router: IntentRouter, relay: Any = Non
                 return self._json(200, bridge.get_state())
             if self.path in ("/capabilities", "/list_robots"):
                 return self._json(200, [{
-                    "id": bridge.robot_id, "model": "OmniQuad",
+                    "id": bridge.robot_id, "model": bridge.model,
                     "capabilities": bridge.capabilities,
                 }])
             if self.path == "/usage":
@@ -564,7 +648,7 @@ def make_handler(bridge: QuadrupedBridge, router: IntentRouter, relay: Any = Non
                 return self._json(200, bridge.get_state())
             if p in ("/list_robots", "/capabilities"):
                 return self._json(200, [{
-                    "id": bridge.robot_id, "model": "OmniQuad",
+                    "id": bridge.robot_id, "model": bridge.model,
                     "capabilities": bridge.capabilities,
                 }])
             if p == "/stop_robot":
@@ -630,8 +714,11 @@ def build_quadruped_tools(bridge: QuadrupedBridge) -> List[Any]:
              parameters={"type": "object", "properties": {}},
              dispatch=lambda args: bridge.act_wave()),
         Tool(name="walk", description=(
-                "Walk forward at " + f"{WALK_VELOCITY_MS:.2f}" + " m/s with a "
-                "wave-gait leg cycle. Continues until 'stand' or 'stop' is called."),
+                {"gait": "Walk forward at %.2f m/s with a wave-gait leg cycle.",
+                 "wheels": "Drive forward at %.2f m/s on the wheels, legs held in the stance.",
+                 "march": "Cycle the legs through a walking gait in place (%.2f m/s of body motion)."}
+                [bridge.cfg["walk"]] % bridge.cfg["walk_velocity_ms"]
+                + " Continues until 'stand' or 'stop' is called."),
              parameters={"type": "object", "properties": {}},
              dispatch=lambda args: bridge.act_walk()),
         Tool(name="stop_robot", description="Freeze the legs at their current pose.",
@@ -650,10 +737,10 @@ def setup_omnilink_relay(bridge: QuadrupedBridge, http_port: int = 8765) -> Opti
         agent_name = f"OmniSim-{bridge.robot_id}"
         tools = build_quadruped_tools(bridge)
         main_task = (
-            "You operate OmniQuad in OmniSim through the OmniLink bridge. "
-            "Available actions: stand, sit, wave, walk (forward, ~0.3 m/s), "
-            "stop_robot. Translate operator requests into one tool call. "
-            "Keep responses short."
+            f"You operate the {bridge.model} in OmniSim through the OmniLink bridge. "
+            f"Available actions: stand, sit, wave, walk ({bridge.cfg['walk']}, "
+            f"{bridge.cfg['walk_velocity_ms']:.2f} m/s), stop_robot. Translate operator "
+            "requests into one tool call. Keep responses short."
         )
         relay = OmniLinkRelay(
             omni_key=get_omni_key(),
@@ -686,10 +773,11 @@ def push_configure(bridge: QuadrupedBridge, relay: Any) -> None:
         if relay is not None else "local intent (regex)"
     )
     cfg = {
-        "robot": "OmniQuad",
+        "robot": bridge.model,
         "robot_class": "quadruped",
         "agent": agent_label,
-        "suggestions": ["stand", "sit", "wave hello", "stop"],
+        "suggestions": ["stand", "sit", "wave hello",
+                        "drive forward" if bridge.cfg["walk"] == "wheels" else "walk", "stop"],
     }
     bridge.queue_window("configure:" + json.dumps(cfg))
     bridge.queue_window("status:connected")
@@ -765,7 +853,7 @@ def main() -> int:
     router = IntentRouter(bridge)
     relay = setup_omnilink_relay(bridge, http_port=args.port)
     start_http(bridge, router, args.port, relay)
-    print(f"[omnilink_quadruped_bridge] OmniQuad ready ({'OmniLink' if relay else 'local'}).")
+    print(f"[omnilink_quadruped_bridge] {bridge.model} ready ({'OmniLink' if relay else 'local'}).")
 
     timestep = bridge.timestep
     while robot.step(timestep) != -1:

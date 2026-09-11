@@ -168,6 +168,32 @@ def find_binary(omnisim_home: Path) -> Path:
 _NEWTON_TAG = r"\[(?:Wb|Om)NewtonBackend\]"
 _NEWTON_STEP_RE = re.compile(_NEWTON_TAG + r" step \d")
 _NEWTON_FINALISED_RE = re.compile(_NEWTON_TAG + r" world finalised")
+# The registration census the engine logs once its Solids are handed to the
+# runtime (OmSolid.cpp flushPendingNewtonRegistrations):
+#   INFO: [OmNewtonBackend] registered 1 dynamic + 5001 static Newton bodies (+5002 this pass) (...)
+_NEWTON_REGISTERED_RE = re.compile(
+    _NEWTON_TAG + r" registered (\d+) dynamic \+ (\d+) static Newton bodies")
+
+
+def registered_but_never_finalised(content: str) -> tuple[int, int] | None:
+    """(dynamic, static) when the engine registered Newton bodies and the log
+    holds NO 'world finalised' line; None otherwise.
+
+    This is the evidence that separates "a world that declares no physics
+    bodies" (Newton finalises nothing, PASS is right) from "a world whose
+    physics build never completed" -- measured 2026-09-07 on a 5000-block
+    world: the census landed at t+8.4 s, the build sat silent past the 30 s
+    ceiling, and the runner said PASS because the two cases used to leave
+    byte-identical evidence. The census line is what tells them apart.
+    """
+    if _NEWTON_FINALISED_RE.search(content):
+        return None
+    best = None
+    for m in _NEWTON_REGISTERED_RE.finditer(content):
+        best = (int(m.group(1)), int(m.group(2)))
+    if best is None or (best[0] + best[1]) <= 0:
+        return None
+    return best
 
 # The engine NAMES the GPU solver in its own log, twice and early:
 #   INFO: [OmNewtonBackend] solver preference set to 'mujoco_warp'      (pre-finalize)
@@ -1590,16 +1616,22 @@ def run_once(args) -> int:
                 have_sidecar = sidecar_path.exists()
                 print("[headless] note: --until-finalized never fired -- no 'world "
                       "finalised' line appeared, so the full --duration was paid.")
+                _reg = registered_but_never_finalised(completion_text)
+                if _reg is not None:
+                    print(f"[headless]   DIAGNOSED: the engine registered {_reg[0]} dynamic + "
+                          f"{_reg[1]} static Newton bodies and never finalised -- the physics "
+                          f"build did not complete inside the ceiling. This run FAILS below.")
                 print(f"[headless]   OBSERVED: no finalize line; verdict sidecar "
                       f"{'present' if have_sidecar else 'ABSENT'}; "
                       f"{'the engine named the mujoco_warp path' if warp_in_log else 'no GPU solver named'}"
                       f"; zero physics steps required for this verdict.")
-                print("[headless]   NOT DIAGNOSED: that evidence is equally consistent with a "
-                      "world that declares NO physics bodies (Newton finalises")
-                print("[headless]   nothing -- resources/projects/worlds/empty.omniworld is the "
-                      "canonical case, and its whole log is two lines) and with a")
-                print("[headless]   world that had simply not finished loading. Re-run with "
-                      "--duration N to tell them apart.")
+                if _reg is None:
+                    print("[headless]   NOT DIAGNOSED: that evidence is equally consistent with a "
+                          "world that declares NO physics bodies (Newton finalises")
+                    print("[headless]   nothing -- resources/projects/worlds/empty.omniworld is the "
+                          "canonical case, and its whole log is two lines) and with a")
+                    print("[headless]   world that had simply not finished loading. Re-run with "
+                          "--duration N to tell them apart.")
             elif completion_re is not None and completion_at is None:
                 print("[headless] note: the --completion-pattern never appeared, so the "
                       "full --duration was paid.")
@@ -1697,6 +1729,23 @@ def run_once(args) -> int:
     # tool before the prompt"). So: report the OBSERVATIONS, name the candidate
     # explanations as candidates, and claim none of them.
     verdict = sidecar_verdict(sidecar_path)
+    _reg = registered_but_never_finalised(content) if not verdict.get("finalised") else None
+    if _reg is not None:
+        print("[headless] FAIL: the engine registered Newton bodies but the world NEVER "
+              "FINALISED (no physics was built).")
+        print("[headless]   OBSERVED -- and nothing beyond this was measured:")
+        print(f"[headless]     * census: {_reg[0]} dynamic + {_reg[1]} static Newton bodies handed "
+              "to the runtime")
+        print("[headless]     * ZERO '[OmNewtonBackend] world finalised' lines and no verdict "
+              "sidecar: the solver build never completed")
+        print(f"[headless]     * the run ran {time.time() - start:.1f}s in total")
+        print("[headless]   A world that declares NO bodies finalises nothing and is a PASS; this "
+              "world declared bodies, so the")
+        print("[headless]   missing finalise is a build that hung or was still running at the "
+              "ceiling. Re-run with --duration N")
+        print("[headless]   (or --profile) to see how far it gets; a finalize ERROR line, had "
+              "there been one, would have FAILed above.")
+        return 1
     if sim_never_stepped(content, bool(verdict.get("finalised"))):
         device = sidecar_device(sidecar_path) or device_seen
         solver = verdict.get("solver") or "not recorded (no readable sidecar)"

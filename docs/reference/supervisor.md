@@ -1354,6 +1354,8 @@ class Node:
 *add force or torque to a Solid node.*
 
 The `wb_supervisor_node_add_force` function adds a force to the [Solid](solid.md) node at its center of mass, the `relative` argument defines if the force is expressed in world coordinate system (`relative` set to false) or relatively to the node (`relative` set to true).
+
+> **Python: prefer `omnisim.apply_wrench`.** Two properties of these three primitives are easy to get silently wrong, and getting them wrong yields a plausible wrong trajectory rather than an error: `relative` selects the frame of the force vector *only* (the `offset` of `addForceWithOffset` is always in the node's local frame), and a supervisor wrench is consumed by the solver on the next step and then cleared, so one call is a single-step impulse and anything lasting must be re-applied every step. `omnisim.wrench.apply_wrench(node, force=..., torque=..., offset=..., frame="world"|"body", duration_s=...)` states the frame at the call site, validates the target (a Solid with a non-NULL `physics`) and the vectors, warns once when a force exceeds ten times the body's weight (`clamp=` for a hard ceiling), and returns a `Wrench` whose `tick()` re-applies it each step until `duration_s` of simulation time has elapsed. `tests/test_wrench_api.py` pins the delivered impulse against the analytic value on a zero-gravity world. Contributed in public PR #19.
 The `wb_supervisor_node_add_force_with_offset` function adds a force to the [Solid](solid.md) node at the location (expressed in the node coordinate system) defined by the `offset` argument.
 The `wb_supervisor_node_add_torque` function adds a torque to the [Solid](solid.md) node.
 

@@ -49,6 +49,12 @@ The acceleration can be changed at run-time with the `wb_motor_set_acceleration`
 - The `consumptionFactor` field defines how much energy is consumed by the motor if battery simulation is enabled in the ancestor [Robot](robot.md) node.
 The details on motor energy consumption are provided [below](#energy-consumption).
 
+- ⚠️ **The `controlPID` field is NOT READ by the physics on the current engine, and neither is `wb_motor_set_control_pid`.** It parses, it is range-checked, and it still feeds `OmMotor::computeCurrentDynamicVelocity` — but the ODE deletion (2026-08-08, commit `5b3801758c`) removed the *consumer of that computation's result*. `OmHingeJoint::prePhysicsStep` and `OmSliderJoint::prePhysicsStep` now call it only for its side effects (motor sound, muscle visuals, the kinematic differential-wheels model), and `OmBasicJoint` pushes the raw *target position* to the Newton/MuJoCo actuator instead. The gains that replaced *P* and *D* are derived from the motor's force/torque ceiling, never from `controlPID`: `ke = maxTorque`/`maxForce` × 10 and `kd = maxTorque`/`maxForce` × 0.5 ([`OmBasicJoint.cpp:812`](../../src/omnisim/nodes/OmBasicJoint.cpp)), with `OMNISIM_NEWTON_TARGET_KE` / `OMNISIM_NEWTON_TARGET_KD` as global overrides. There is no integral term at all — the MuJoCo actuator is PD.
+
+  **To tune position tracking on this engine, change `maxTorque` / `maxForce` (or those two environment variables). Changing `controlPID` produces a bitwise-identical run** — measured 2026-09-10 on a one-hinge servo over 250 ticks with `controlPID` at `10 0 0` vs `0.01 0 0`: the joint-angle traces are byte-identical, for a `RotationalMotor` with limits, for a limit-less motor promoted to a servo, for a `LinearMotor` on a `SliderJoint`, and for a runtime `wb_motor_set_control_pid` call. The same rig diverges at tick 1 when `maxTorque` changes.
+
+  The paragraphs below describe the ODE-era behaviour and are kept because the field is still parsed, still validated and still round-trips through a world save.
+
 - The first coordinate of `controlPID` field specifies the initial value of the *P* parameter, which is the *proportional gain* of the motor PID-controller.
 A high *P* results in a large response to a small error, and therefore a more sensitive system.
 Note that by setting *P* too high, the system can become unstable.
@@ -139,6 +145,8 @@ In OmniSim, position control is carried out in three stages, as depicted in [thi
 The first stage is performed by the user-specified controller (1) that decides which position, velocity, acceleration and motor force must be used.
 The second stage is performed by the motor P-controller (2) that computes the current velocity of the motor *V<sub>c</sub>*.
 Finally, the third stage (3) is carried out by the physics simulator — Newton/MuJoCo joint actuation.
+
+> ⚠️ **Stage 2's output no longer reaches stage 3.** The figure and the algorithm below describe the ODE-era chain. Since the ODE deletion (2026-08-08, commit `5b3801758c`) the engine sends the **target position** straight to a Newton/MuJoCo PD position actuator whose gains come from the motor's torque ceiling (`ke = maxTorque × 10`, `kd = maxTorque × 0.5`), so *V<sub>c</sub>* is computed each tick and then discarded — it survives only to drive motor sound, muscle visuals and the kinematics-mode differential-wheels model. Consequently **`controlPID` (P, I and D) and `acceleration` do not affect a physics-enabled joint's motion**; `maxVelocity` and `maxForce`/`maxTorque` still do, because they are forwarded to the solver as the actuator's velocity and force limits. Both remain fully live in kinematics mode (a robot with no `Physics` node), which is what the algorithm block below still describes exactly.
 
 %figure "Motor control"
 %chart
@@ -481,6 +489,8 @@ The motor force/torque specified with this function cannot exceed the value spec
 The specified force (resp. torque) can be retrieved using the `wb_motor_get_available_force` (resp. `wb_motor_get_available_torque`) function.
 The `wb_motor_get_max_force` (reps. `wb_motor_get_max_torque`) function returns the limit specified in the `maxForce` (resp. `maxTorque`) field.
 Note that if the force/torque is not explicitly set using the `wb_motor_set_available_[force|torque]` function, then the `wb_motor_get_available_[force|torque]` and `wb_motor_get_max_[force|torque]` functions return the same value.
+
+⚠️ **`wb_motor_set_control_pid` has NO EFFECT on a physics-enabled joint.** The call succeeds, the values are stored and validated, and the P-controller keeps using them — but its output is discarded on the Newton path (see the `controlPID` banner in the field summary above). Setting `P = 5000` to stiffen a grasp, or a per-joint PID table to shape a gait, changes nothing: the run is bitwise identical. The equivalent lever is `wb_motor_set_available_force` / `wb_motor_set_available_torque` and the `maxForce` / `maxTorque` fields, from which the solver's actuator gains are derived, or the `OMNISIM_NEWTON_TARGET_KE` / `OMNISIM_NEWTON_TARGET_KD` environment overrides. The function is still honoured in kinematics mode.
 
 The `wb_motor_set_control_pid` function changes the values of the gains *P, I* and *D* in the PID-controller.
 These parameters are used to compute the current motor velocity *V<sub>c</sub>* from the current position *P<sub>c</sub>* and target position *P<sub>t</sub>*, such that *V<sub>c</sub>* where *error = P<sub>t</sub><sub>c</sub>*.

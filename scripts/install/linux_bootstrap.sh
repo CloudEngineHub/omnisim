@@ -113,6 +113,9 @@ fi
 phase_deps() {
   log "deps: apt prerequisites"
   export DEBIAN_FRONTEND=noninteractive
+  if [ -n "$SUDO" ]; then
+    printf 'OmniSim needs administrator access to install Ubuntu packages; sudo may now ask for your account password.\n'
+  fi
   $SUDO apt-get update
   # No qt6-*-dev here on purpose: the build vendors its own Qt 6.5.3 (see header).
   #

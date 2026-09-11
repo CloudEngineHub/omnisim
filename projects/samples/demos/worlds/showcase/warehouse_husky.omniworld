@@ -68,6 +68,19 @@ WorldInfo {
   # ~5.3 ms each, which holds the hop at ~6 mm (measured). MUST stay EVEN: the
   # GPU warp solver's CUDA-graph replay only engages on an even sub-step count
   # -- an odd value disables it and the step runs ~4x slower than CPU.
+  #
+  # WHAT THIS COMMENT USED TO LEAVE OUT: until 2026-09-11 (69b4b024b) the
+  # sub-step count ALSO set the wheel torque ceiling. A pure-velocity motor's
+  # gain was bounded at kv <= M_ii/sub_dt and a velocity servo's peak torque
+  # is kv*(cmd - w), so halving sub_dt doubled the torque a wheel could
+  # deliver (measured: wheel-rate ratio 0.0128/0.0172/0.0337/0.0678 at 1/2/4/8
+  # sub-steps). This value was silently doing two jobs and only the contact
+  # one was written down. That coupling is now gone -- torque comes from the
+  # declared effort regardless of sub_dt -- so lowering this number for
+  # performance is a DIFFERENT trade than the paragraph above predicts: you
+  # give up hop control only, not hop control plus the pivot itself. Re-measure
+  # before changing it; nothing here has been re-measured post-fix. See
+  # docs/developer/agents-hard-won-rules.md#wheel-stall-torque.
   newtonSubsteps 6
 }
 Viewpoint {

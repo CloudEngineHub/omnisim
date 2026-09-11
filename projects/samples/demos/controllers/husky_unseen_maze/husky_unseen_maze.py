@@ -378,7 +378,7 @@ class CameraDirector:
     long run readable without the disorienting high-speed chase-camera motion.
     """
 
-    MODES = {"track", "zone", "wide", "close_start", "story"}
+    MODES = {"track", "zone", "wide", "top", "close_start", "story"}
 
     def __init__(self, supervisor: Supervisor, enabled: bool, mode: str,
                  origin: float, cell_size: float, size: int,
@@ -429,6 +429,16 @@ class CameraDirector:
                 coverage_mode = "close_start"
             else:
                 coverage_mode = "zone"
+
+        if coverage_mode == "top":
+            # A locked, near-orthographic-feeling evidence view of the complete
+            # maze. The camera never follows, rotates, or translates during the
+            # run; all screen-space motion therefore belongs to the simulation.
+            self._apply(
+                [maze_center, maze_center, 76.0],
+                [maze_center, maze_center, 0.15],
+            )
+            return
 
         if coverage_mode == "wide":
             # A single locked establishing frame.  The whole authored maze is

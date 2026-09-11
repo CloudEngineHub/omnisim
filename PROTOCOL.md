@@ -494,7 +494,10 @@ Therefore, for any action that changes the robot's physical state:
    unmeasured is `null`, never `0.0`.)
 4. An action that returns before completing **MUST** say so in its
    `/capabilities` description, in words, and **SHOULD** return a monotonic
-   `seq` the caller can wait on. A wait primitive gated only on a mode string
+   `seq` the caller can wait on. Because a process restart resets a local
+   counter, a bridge that uses `seq` **SHOULD** also return an immutable
+   process-incarnation identifier; callers correlate the tuple
+   `(bridge_instance_id, seq)`, never `seq` alone. A wait primitive gated only on a mode string
    such as `idle` is non-conformant: it is a TOCTOU race that returns true for
    a robot which has not started moving.
 5. A mutating action arriving while another is in flight **SHOULD** be
@@ -506,12 +509,17 @@ Therefore, for any action that changes the robot's physical state:
 6. Where a primitive is known to be inaccurate, the magnitude **MUST** appear
    in its description until it is fixed. Shipping a −43% actuator behind a
    description implying exactness is a protocol defect, not a robot defect.
+   (That −43% is a historical worked example: it was measured on the Husky's
+   open-loop `turn` before `69b4b024b` (2026-09-11) lifted the wheel
+   stall-torque cap, and has not been re-measured through the bridge since.
+   The rule is about the *description*, and is unaffected by which number is
+   current.)
 
 **Conformance status, stated honestly:**
 
 | bridge | 5.4.1 conformance |
 |---|---|
-| `omnilink_mobile_bridge` | ✅ **Full.** `wait: true` on `drive_forward` / `turn` returns `{commanded, achieved, error, unit, settled, timed_out}`; `get_robot_state.last_command` carries the same record; `drive_to(x,y)` is always-blocking and returns `achieved_xy` / `error_m` / `arrived` — and now `settled` only when no leg timed out, having stopped the robot before reading the final pose. `drive_forward.achieved` is the displacement **projected onto the start heading**, so a robot pushed backwards reports a negative number (it used to `copysign` a magnitude onto the commanded value, which asserted the direction rather than measuring it). The `409 busy` check lives in `_begin_motion`, so it covers **every** entry point — `POST /tool`, the offline intent router and the idle loop included, not just the three path routes — and a waiter now matches its own `seq` **exactly**, returning `achieved: null, superseded: true` instead of the clobbering motion's measurement. `capabilities` publishes `actions`, `blocking_actions`, `waitable_actions`, `busy_rejecting_actions`, `busy_overriding_actions` and `site_bounds_m`. ⚠️ Two published verbs deliberately do **not** reject when busy: `stop_robot` and `set_velocity` are the escape hatches, so they *cancel* the running motion — whose `achieved` then reports `null` — and both say so in their descriptions (rule 6). |
+| `omnilink_mobile_bridge` | ✅ **Full.** `wait: true` on `drive_forward` / `turn` returns `{commanded, achieved, error, unit, settled, timed_out}`; `get_robot_state.last_command` carries the same record; dispatch, completion, timeout, supersession and state all carry the same restart-safe `(bridge_instance_id, seq)` identity, with the UUID regenerated once per bridge process. `drive_to(x,y)` is always-blocking and returns `achieved_xy` / `error_m` / `arrived` — and now `settled` only when no leg timed out, having stopped the robot before reading the final pose. `drive_forward.achieved` is the displacement **projected onto the start heading**, so a robot pushed backwards reports a negative number (it used to `copysign` a magnitude onto the commanded value, which asserted the direction rather than measuring it). The `409 busy` check lives in `_begin_motion`, so it covers **every** entry point — `POST /tool`, the offline intent router and the idle loop included, not just the three path routes — and a waiter now matches its own `seq` **exactly**, returning `achieved: null, superseded: true` instead of the clobbering motion's measurement. `capabilities` publishes `actions`, `blocking_actions`, `waitable_actions`, `busy_rejecting_actions`, `busy_overriding_actions` and `site_bounds_m`. ⚠️ Two published verbs deliberately do **not** reject when busy: `stop_robot` and `set_velocity` are the escape hatches, so they *cancel* the running motion — whose `achieved` then reports `null` — and both say so in their descriptions (rule 6). |
 | `husky_omnilink_bridge` | ◐ Partial — satisfies (1)–(3) on `drive_forward` / `turn`: both honour `wait` and return `{commanded, achieved, error, unit, settled}` measured against supervisor pose, `achieved` is `null` when not waited on, and `drive_to_waypoint?wait=true` returns `final_pose` + `distance_remaining_m` (commit `f57d910e`). **`turn` is fixed** for \|angle\| ≥ π: it tracks a signed **accumulated** residual instead of an absolute `wrap_pi` target, and reports `achieved` / `error` **unwrapped**. Previously the target wrapped onto the current yaw, so `turn(6.283185)` never moved the robot and answered `achieved: -0.000000, error: 0.000000, settled: true`, while `turn(3.5)` rotated **−2.783 rad — the short way, the opposite sign** — and reported a near-zero error, because a wrapped error cannot express an under-rotation past half a turn. A reply that cannot attribute a measurement to its own command `seq` now returns `achieved: null` with `measured_from: "unattributed"`. **Still missing:** (4) in part — the "NOT complete" warning is in the response body, but `/capabilities` publishes no `actions` list and therefore no per-action description; (5) busy-rejection entirely — a second motion command silently replaces the first; and (6) — the `drive_forward` accuracy figure below appears nowhere the model can read it. ⚠️ (1) is **violated by `drive_to_waypoint` without `wait`**, which answers `{"x": <target>, "y": <target>, "speed_m_s": …}` — the caller's own target under measurement-shaped keys, with no `commanded` key and no note that it returns before completing. ⚠️ `drive_forward` delivering **~65% of the commanded distance** (same early-stop-on-a-leading-pose class as `52f3f6ca`) is a **carried-over claim, not re-measured here** — it needs a live re-measurement before it is repeated or written into a description. |
 | `mavic_omnilink_bridge` | ❌ **Non-conformant on its default path.** The row here used to claim `goto_waypoint` returns `final_pose`; it does not — the string `final_pose` does not occur anywhere in `mavic_omnilink_bridge.py`. `wait` defaults **false**, and the default reply is `{"x": tx, "y": ty, "altitude": target_alt}`: the caller's own target echoed under measurement-shaped keys, with no `commanded` key and nothing saying the flight has not happened yet — violating (1) and (4), the exact failure 5.4.1 exists to forbid. With `wait: true` it *is* mostly honest — `_wait_until_arrived` supplies measured `x` / `y` / `z` / `yaw` plus `distance_remaining_m`, and because `**res` is spread last those measured values shadow the echoed target — but `altitude` still holds the **commanded** value beside the measured `z`, so one payload mixes commanded and measured under similar keys. Registers **no LLM tools at all** (`Tool(` occurs 0 times), so today nothing reads any of it; that is what keeps the defect latent, not fixed. |
 | `omnilink_arm_bridge` | ❌ Not yet. |
@@ -607,10 +615,89 @@ Reference implementation: [`omnilink_arm_bridge`](projects/samples/demos/control
 
 ### 6.2 Mobile (wheeled / tracked)
 
-- `POST /set_velocity { "linear": v_m_s, "angular": w_rad_s }`
+- `POST /set_velocity { "linear": v_m_s, "angular": w_rad_s, "wait": bool? }`
 - `POST /drive_forward { "distance": d_m, "speed": v_m_s? }`
 - `POST /turn { "angle": rad }`
 - `POST /drive_to_waypoint { "x": ..., "y": ... }` (optional; declare in capabilities)
+
+#### The yaw envelope is MEASURED, not derived
+
+A mobile bridge MUST publish `capabilities.max_angular_rad_s` as a yaw rate
+the base can actually hold, and MUST clamp `set_velocity` against that
+number rather than against `wheel_speed x radius / half_track`. The two are
+not close on a skid-steer base, and the gap is not a constant you can copy
+from this page.
+
+⚠️ **The three numbers this section used to quote are withdrawn.** Measured
+2026-09-10 under Newton/MuJoCo, a Clearpath Husky whose geometry implies
+3.47 rad/s held **0.119**, a Husarion ROSbot XL implying 4.65 held **0.032**,
+and a TurtleBot3 Burger implying 2.475 held **0.328**. Those are
+**pre-`69b4b024b` (2026-09-11)** and will not reproduce: the solver was
+bounding a pure-velocity motor's gain at `kv <= M_ii/dt`, so a wheel's stall
+torque tracked its own rotational inertia instead of the effort the URDF
+declares. It was never the differential the solver refused -- it was the
+servo gain the solver starved, and a pivot is simply the first real LOAD a
+wheeled base meets. Straight-line speed was unaffected throughout (96-100%
+of command on all three, tracking 0.9991 before and after), which is exactly
+why the defect hid for so long. Open-loop chassis yaw ratio before -> after:
+**Husky 0.0069 -> 0.532, TB3 Burger 0.2383 -> 0.958, ROSbot XL
+0.0069 -> 0.525**. The post-fix figures land where physics puts them rather
+than at 1.0: the Burger is a true two-wheel differential drive and scrubs
+nothing, while the two skid-steers must scrub all four tyres (a Coulomb
+moment balance for the Husky's geometry predicts a 0.55 ceiling). No bridge
+has re-published its `max_angular_rad_s` against the post-fix engine yet.
+
+The rule is unchanged and is the whole point: publishing the geometric
+figure means every angular command is accepted and none is delivered, and
+publishing a *stale measured* figure is the same defect one release later.
+Measure the base you ship, on the engine you ship. Where the two differ,
+publish both, plus the ratio:
+`max_angular_rad_s`, `max_angular_rad_s_kinematic`, `yaw_rate_gain`,
+`can_rotate_in_place`, `can_strafe`.
+
+#### set_velocity reports what the base DID (rule 1 applies to it too)
+
+`set_velocity` has no completion to wait for, which is exactly why it used
+to answer with the arguments it had been handed
+(`{accepted, linear, angular}`). That is the bare echo rule 1 forbids: on
+the Husky it said "angular 2.0 rad/s" while the base turned at 0.0115.
+(That 0.0115 is a pre-`69b4b024b` measurement and will not reproduce; the
+echo defect it illustrates is independent of how much yaw the base can
+deliver.)
+
+A conforming bridge MUST answer with
+`{commanded: {linear, angular}, applied: {linear, angular}, achieved:
+{linear, angular} | null, error: {linear, angular} | null, settled: bool}`.
+`applied` is the request after clamping; `achieved` is measured over a short
+hold (the reference bridge discards 1.2 sim-s of ramp and differences the
+next 0.8 s of settled pose) and is `null` -- **never** the commanded value --
+when the caller passed `wait: false` or no samples arrived. When the request
+was clamped, the reply MUST also carry `clamped_from`, a machine-readable
+`limited` reason and a `limit_note` naming the measured ceiling.
+
+#### A rotation the base cannot finish is REFUSED, not timed out
+
+Where a closed-loop `turn` would need more spinning time than the bridge is
+willing to spend, it MUST refuse up front with
+`{accepted: false, refused: "cannot_rotate_in_place", max_angular_rad_s,
+max_angular_rad_s_kinematic, yaw_rate_gain, estimated_spin_s, message,
+alternatives[]}`. A ROSbot XL asked for 90 degrees previously answered
+`{settled: false, timed_out: true}` with 0.0875 rad achieved -- a timeout is
+what a loop reports when something went wrong, and nothing had: the base
+held 0.032 rad/s, so the rotation needed 49 s. An agent can act on the
+refusal; it cannot act on the timeout.
+
+⚠️ **That 0.032 rad/s and the 49 s it implies are pre-`69b4b024b`
+(2026-09-11) and are withdrawn** -- the XL's open-loop yaw ratio went
+0.0069 -> 0.525 when the wheel stall-torque cap was lifted. The requirement
+above stands unchanged; the *constant* behind it does not. As shipped today
+the XL's `cannot_rotate_in_place` refusal is a **false negative on a public
+API**: it refuses a rotation the base can now perform. That is the second
+failure mode of this rule and it is worth stating plainly -- a refusal
+threshold **MUST** be derived from a ceiling measured on the engine in
+front of you, never from a constant baked into a bridge or copied out of a
+document. A bridge that hard-codes either number is wrong the moment the
+solver changes.
 
 ### 6.3 Flying
 
