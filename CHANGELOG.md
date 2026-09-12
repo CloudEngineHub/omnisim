@@ -27,6 +27,22 @@ top of that foundation.
 
 ## [Unreleased]
 
+## [v8.5.1] — 2026-09-12
+
+### Fixed
+
+- **The public licence gate was red from 2026-09-11 through the v8.5.0 cut**, on
+  six files. Four were OmniLink-authored and had simply never been given the
+  standard Apache header (the DDBot square replay, the two evaluation
+  controllers, the pilot-ledger generator). The other two were the vendored OIDN
+  headers, and that half was a defect in the check: the pin was the sha256 of the
+  author's working-tree bytes, which were CRLF, while the directory's
+  `.gitattributes` (`*.h text eol=lf`) normalises the blob without rewriting a
+  file already on disk -- so the pin matched on exactly one machine and failed on
+  the committed blob, every fresh clone and every CI runner. The digest is now
+  taken over LF-normalised bytes and pinned to what git stores, so the verdict is
+  the same on either line ending.
+
 ## [v8.5.0] — 2026-09-12
 
 ### Rendering
