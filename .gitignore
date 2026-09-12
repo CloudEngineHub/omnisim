@@ -421,10 +421,75 @@ packages/*/dist/
 /social/launch/pilots/ppo_robot_controller/results/training/**/logs/
 
 # Reply-wave workspaces (social/launch/pilots/replies_*): each recipient's
-# own repo is cloned as a sibling of evaluations/. Our evaluation worlds,
-# controllers, and results are tracked; the third-party clones are not.
-/social/launch/pilots/replies_*/*/
-!/social/launch/pilots/replies_*/evaluations/
+# own repo is cloned as a sibling of our evaluation. Our evaluation worlds,
+# controllers, and reports are tracked; the third-party clones are not.
+#
+# 2026-09-12: this used to read `/social/launch/pilots/replies_*/*/` with a
+# single exception for `evaluations/`. Early waves nested our work under
+# `replies_<date>/evaluations/<name>/`, so the exception covered it. The two
+# newest waves put our work directly at `replies_<date>/<name>/` instead, and
+# the rule silently stopped protecting it: 70 evaluations and 5,478 files --
+# the whole 2026-09-12 wave, including a full CPG gait-transition report --
+# were untracked and one `git clean` from gone.
+#
+# The fix ignores wave contents by DEFAULT and re-includes the artifacts we
+# author, rather than depending on where a wave happens to put them. Bulk run
+# output stays out: 450 MB of logs/stdio/screenshots and 267 MB of raw trace
+# CSV/JSON per wave, against 3.8 MB of worlds, controllers and reports.
+/social/launch/pilots/replies_*/*/**
+# Descend into directories, otherwise the re-includes below can never match.
+!/social/launch/pilots/replies_*/*/**/
+# What we author, and want back after any checkout.
+!/social/launch/pilots/replies_*/*/**/*.md
+!/social/launch/pilots/replies_*/*/**/*.py
+!/social/launch/pilots/replies_*/*/**/*.omniworld
+!/social/launch/pilots/replies_*/*/**/*.wbt
+!/social/launch/pilots/replies_*/*/**/*.urdf
+!/social/launch/pilots/replies_*/*/**/*.wrl
+!/social/launch/pilots/replies_*/*/**/*.proto
+# Third-party material re-excluded: a correspondent's own repo, and the robot
+# description packages we clone to import from. Not ours to vendor.
+/social/launch/pilots/replies_*/*/repo/
+/social/launch/pilots/replies_*/*/fork/
+/social/launch/pilots/replies_*/*/external_now/
+/social/launch/pilots/replies_*/*/merged_copy/
+/social/launch/pilots/replies_*/**/external/
+/social/launch/pilots/replies_*/**/*_description/
+/social/launch/pilots/replies_*/**/meshes/
+# Interpreter and dependency trees. The `!.../**/` line above re-includes every
+# directory, which overrides earlier rules, so these must be restated here --
+# one .venv/Lib alone carries 4,767 .py files.
+/social/launch/pilots/replies_*/**/.venv/
+/social/launch/pilots/replies_*/**/.deps/
+/social/launch/pilots/replies_*/**/deps_*/
+/social/launch/pilots/replies_*/**/site-packages/
+/social/launch/pilots/replies_*/**/node_modules/
+/social/launch/pilots/replies_*/**/__pycache__/
+# Engine run residue: regenerable, and the reports quote what matters.
+/social/launch/pilots/replies_*/**/logs/
+#
+# Waves that used the `evaluations/` layout: everything BESIDE `evaluations/`
+# at that level is the correspondent's own cloned repo, which is what the
+# original rule was protecting against. Listed per wave rather than as a
+# pattern because the layout is a property of each wave, not of the tree, and
+# the two newest waves (2026-09-03, 2026-09-12) deliberately do not use it --
+# there, the direct children ARE our evaluations and stay tracked.
+/social/launch/pilots/replies_2026_08_31/*/
+!/social/launch/pilots/replies_2026_08_31/evaluations/
+/social/launch/pilots/replies_2026_09_01/*/
+!/social/launch/pilots/replies_2026_09_01/evaluations/
+/social/launch/pilots/replies_2026_09_02/*/
+!/social/launch/pilots/replies_2026_09_02/evaluations/
+/social/launch/pilots/replies_2026_09_07/*/
+!/social/launch/pilots/replies_2026_09_07/evaluations/
+/social/launch/pilots/replies_2026_09_08/*/
+!/social/launch/pilots/replies_2026_09_08/evaluations/
+/social/launch/pilots/replies_2026_09_09/*/
+!/social/launch/pilots/replies_2026_09_09/evaluations/
+/social/launch/pilots/replies_2026_09_10/*/
+!/social/launch/pilots/replies_2026_09_10/evaluations/
+/social/launch/pilots/replies_2026_09_11/*/
+!/social/launch/pilots/replies_2026_09_11/evaluations/
 
 # Warp JIT kernel caches left next to pilot evaluation runs.
 /social/launch/pilots/**/warp_cache_*/
@@ -467,3 +532,28 @@ packages/*/dist/
 # world it varies (a copy must be a sibling for its relative URLs to resolve).
 # tests/physics/worlds/.h2diag.omniworld predates this rule and stays tracked.
 .*.omniworld
+
+# ...but a reply-wave evaluation's own worlds are EVIDENCE, not scratch. The
+# rule above is a blanket and git is last-match-wins, so it silently re-ignored
+# 102 worlds inside replies_2026_09_12/ that the re-includes in the reply-wave
+# block had just recovered -- the scenes each reported figure was actually
+# measured in. That is the same failure the 2026-09-12 rewrite fixed, one layer
+# down. A wave's dot-prefixed sibling worlds stay tracked.
+!/social/launch/pilots/replies_*/**/.*.omniworld
+
+# Third-party CAD submitted for an evaluation (2026-09-12): fusion_bot.urdf and
+# 4.3 MB of STL wheels, dropped beside the chat worlds while evaluating a
+# correspondent's robot. Not ours to vendor -- it needs a PROVENANCE.md and a
+# licence answer first, and projects/ ships in the public snapshot.
+/projects/samples/demos/worlds/chat/.eval912_rachit/
+
+# Outreach send machinery working state: harvested contact pools, composed
+# message bodies and per-round send batches. 16 MB and ~1,470 addresses, never
+# tracked (0 commits), and not something to write into permanent history. The
+# written records are tracked instead -- the ledger CSV, its reconstruction
+# note, the operations handover and each wave's reports -- and they are what
+# anyone actually needs.
+# WARNING: ignored, not tracked, means `git clean -fdx` deletes all of it. Back
+# it up outside the repo, where the suppression master already lives.
+/social/launch/pipeline/
+/social/launch/_send*.json

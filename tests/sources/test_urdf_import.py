@@ -534,6 +534,102 @@ class TestUrdfImport(unittest.TestCase):
         # No affix -> no mirror name; the caller falls back to identity matching.
         self.assertIsNone(self.urdf_import.mirror_name("index_mcp_roll"))
 
+    # ------------------------------------------------------------------
+    # Mesh DECODABILITY. The checker used to ask only "does a file exist at
+    # this path?", and on the 718-model urdfeus gallery (all 4,024 .glb are
+    # KHR_draco_mesh_compression, which OmniSim's assimp build refuses) it
+    # therefore reported ZERO problems while the engine gave 116 links a
+    # placeholder sphere in place of their declared <collision><mesh>.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _glb(json_doc: bytes, *, magic: bytes = b"glTF", version: int = 2,
+             declared_total: int | None = None) -> bytes:
+        import struct as _struct
+        pad = (4 - len(json_doc) % 4) % 4
+        chunk = json_doc + b" " * pad
+        total = 12 + 8 + len(chunk) if declared_total is None else declared_total
+        return (magic + _struct.pack("<II", version, total)
+                + _struct.pack("<II", len(chunk), 0x4E4F534A) + chunk)
+
+    def write_mesh(self, name: str, data: bytes) -> Path:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / name
+        path.write_bytes(data)
+        return path
+
+    def test_draco_glb_is_undecodable_not_ok(self):
+        """The real gallery case: the file is right there and cannot be read."""
+        path = self.write_mesh("m.glb", self._glb(
+            b'{"asset":{"version":"2.0"},"extensionsRequired":["KHR_draco_mesh_compression"]}'))
+        status, reason = self.urdf_import.classify_mesh_file(str(path))
+        self.assertEqual(status, "undecodable")
+        self.assertIn("KHR_draco_mesh_compression", reason)
+
+    def test_plain_glb_is_ok(self):
+        """Control: a GLB with no required extension must NOT raise an alarm --
+        a false positive here is worse than the silence it replaces."""
+        path = self.write_mesh("m.glb", self._glb(b'{"asset":{"version":"2.0"}}'))
+        self.assertEqual(self.urdf_import.classify_mesh_file(str(path))[0], "ok")
+
+    def test_truncated_glb_is_undecodable(self):
+        good = self._glb(b'{"asset":{"version":"2.0"}}')
+        path = self.write_mesh("m.glb", good[: len(good) - 4])
+        status, reason = self.urdf_import.classify_mesh_file(str(path))
+        self.assertEqual(status, "undecodable")
+        self.assertIn("truncated", reason)
+
+    def test_empty_mesh_file_is_undecodable(self):
+        path = self.write_mesh("m.stl", b"")
+        status, reason = self.urdf_import.classify_mesh_file(str(path))
+        self.assertEqual(status, "undecodable")
+        self.assertIn("empty", reason)
+
+    def test_missing_mesh_stays_missing_not_undecodable(self):
+        """The three states must not collapse into each other: 'no file' and
+        'unreadable file' need different fixes."""
+        self.assertEqual(self.urdf_import.classify_mesh_file("")[0], "missing")
+
+    def test_unknown_required_extension_is_unverified_not_undecodable(self):
+        """Only a PROVEN failure may be called undecodable."""
+        path = self.write_mesh("m.glb", self._glb(
+            b'{"asset":{"version":"2.0"},"extensionsRequired":["VENDOR_something_new"]}'))
+        status, reason = self.urdf_import.classify_mesh_file(str(path))
+        self.assertEqual(status, "unverified")
+        self.assertIn("VENDOR_something_new", reason)
+
+    def test_report_names_an_undecodable_collision_mesh(self):
+        """End to end: the report must name it, and --strict must see it."""
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        (root / "meshes").mkdir()
+        (root / "meshes" / "part.glb").write_bytes(self._glb(
+            b'{"asset":{"version":"2.0"},"extensionsRequired":["KHR_draco_mesh_compression"]}'))
+        urdf = root / "robot.urdf"
+        urdf.write_text(textwrap.dedent(
+            """\
+            <?xml version="1.0"?>
+            <robot name="draco">
+              <link name="base">
+                <inertial><mass value="1"/></inertial>
+                <collision><geometry><mesh filename="meshes/part.glb"/></geometry></collision>
+              </link>
+            </robot>
+            """), encoding="utf-8")
+        report = self.urdf_import.build_report(self.urdf_import.parse_urdf(urdf))
+        link = report["links"][0]
+        # The old existence-only check must still say the file is THERE ...
+        self.assertEqual(link["unresolved_meshes_collision"], [])
+        # ... and the new one must say it cannot be read.
+        self.assertEqual(len(link["undecodable_meshes_collision"]), 1)
+        self.assertIn("part.glb", link["undecodable_meshes_collision"][0])
+        self.assertEqual(report["mesh_status_counts"]["undecodable"], 1)
+        self.assertEqual(report["mesh_status_counts"]["ok"], 0)
+        # --strict is driven off report["warnings"], so the finding has to land there.
+        self.assertTrue(any("cannot decode" in w for w in report["warnings"]))
+
 
 if __name__ == "__main__":
     unittest.main()

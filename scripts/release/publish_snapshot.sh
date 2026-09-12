@@ -68,7 +68,20 @@
 #                    "Watch → Releases only" subscription fire and what
 #                    populates the repo's Releases sidebar. Without a token,
 #                    only the tag is pushed (no Release page) and the script
-#                    prints a one-line note.
+#                    prints a one-line note. Contents write is ALL this
+#                    script needs; it is not enough to comment on issues or
+#                    pull requests afterwards (that is `addComment`, which
+#                    needs Issues + Pull requests: Read and write) -- reply
+#                    on the tracker with a token that carries those.
+#   OMNISIM_PUBLISH_WORKTREE_DIR
+#                    Where the throwaway snapshot worktree is materialised.
+#                    Defaults to .build_tmp/release-publish under the repo.
+#                    Keep the prefix SHORT on Windows: the tree holds paths
+#                    over 200 characters, and a long prefix used to fail the
+#                    checkout with "Filename too long" AFTER the version-bump
+#                    commit had landed. The preflight now measures prefix +
+#                    longest tracked path before the first commit and runs
+#                    the checkout with core.longpaths when it must.
 #
 # Behavior:
 #   * Verifies <version> matches v<MAJOR>.<MINOR>.<PATCH>[-prerelease].
@@ -159,6 +172,36 @@ PUBLISH_NAME="${PUBLISH_NAME:-OmniLink}"
 # and the second of those runs BEFORE the block this used to be computed in.
 PUBLIC_OWNER_REPO="$(printf '%s' "$PUBLIC_REMOTE" \
     | sed -E 's#^git@[^:]+:##; s#^https?://[^/]+/##; s#\.git$##')"
+
+# ---- worktree preflight (BEFORE anything touches private HEAD) --------------
+# The worktree is materialised only after the changelog and version-bump
+# commits have landed, so a checkout that cannot succeed used to fail AFTER
+# the bump was committed (v8.4.0, 2026-09-11: 42 files under social/ died
+# with "Filename too long" because OMNISIM_PUBLISH_WORKTREE_DIR pointed at a
+# 100-character scratch path, and the bump commit was already on main). Two
+# things are settled here, before the first commit:
+#   1. the parent of the worktree directory is creatable at all;
+#   2. on Windows, whether <worktree prefix> + <longest tracked path> clears
+#      MAX_PATH (260). When it does not, the checkout below runs with
+#      `-c core.longpaths=true`, which git honours for the worktree's own
+#      checkout; the number is printed so a stale prefix is visible.
+# Neither step writes anything.
+cd "$REPO_ROOT"
+mkdir -p "$(dirname "$WORKTREE_DIR")" \
+    || err "cannot create the parent of the snapshot worktree: $(dirname "$WORKTREE_DIR")
+       (OMNISIM_PUBLISH_WORKTREE_DIR overrides the location)"
+LONGEST_TRACKED="$(git ls-files | awk 'length > m { m = length } END { print m + 0 }')"
+WORKTREE_PATH_MAX=$(( ${#WORKTREE_DIR} + 1 + LONGEST_TRACKED ))
+GIT_WORKTREE=(git)
+case "${OSTYPE:-}" in
+    msys*|cygwin*|win32*)
+        if (( WORKTREE_PATH_MAX >= 260 )); then
+            GIT_WORKTREE=(git -c core.longpaths=true)
+            log "worktree paths: prefix ${#WORKTREE_DIR} + longest tracked $LONGEST_TRACKED = $WORKTREE_PATH_MAX >= 260;"
+            log "                the checkout will run with core.longpaths=true"
+        fi
+        ;;
+esac
 
 # ---- auto-generate CHANGELOG.md section if missing -------------------------
 # Fully-automatic release notes: if CHANGELOG.md has no `## [$VERSION]`
@@ -325,7 +368,9 @@ if [[ -d "$WORKTREE_DIR" ]]; then
 fi
 
 # Use a detached HEAD so we never accidentally affect a real branch.
-git worktree add --detach "$WORKTREE_DIR" "$SOURCE_SHA" >/dev/null
+# GIT_WORKTREE carries `-c core.longpaths=true` when the preflight above
+# measured that this prefix cannot hold the longest tracked path on Windows.
+"${GIT_WORKTREE[@]}" worktree add --detach "$WORKTREE_DIR" "$SOURCE_SHA" >/dev/null
 trap 'git worktree remove --force "$WORKTREE_DIR" 2>/dev/null || true' EXIT
 
 cd "$WORKTREE_DIR"

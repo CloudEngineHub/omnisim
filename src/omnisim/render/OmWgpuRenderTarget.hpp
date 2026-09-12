@@ -58,6 +58,7 @@
 #include <cstdint>
 #include <map>
 #include <vector>
+#include "OmLocalShadow.hpp"
 
 class OmVulkanBackend;
 class QImage;
@@ -87,6 +88,10 @@ struct OmWgpuSolidDraw {
   void *vertexBuffer = nullptr;
   void *indexBuffer = nullptr;
   uint32_t indexCount = 0;
+  uint64_t geometryRevision = 0;  // 0: unknown content, never reuse its local shadows
+  uint64_t motionId = 0;  // node-lifetime serial, never a recycled address or draw-list index
+  uint32_t motionPart = 0;  // CadShape submesh within that node
+  bool deforming = false;  // stable vertex correspondence; snapshot positions each rendered frame
   // Shape/CadShape castShadows field. FALSE draws are skipped by the light-depth pass (pass 1) but
   // still render in pass 2 — matching WREN. The spot.omniworld "concentric rings" bug was the floating
   // SUN_MARKER sphere (castShadows FALSE) writing a giant occluder disc into the shadow map.
@@ -108,6 +113,14 @@ struct OmWgpuSolidDraw {
   // cache) + the albedo texture's LINEAR mean colour (bounce albedo; detail is irrelevant to
   // diffuse GI). Null/identity when unavailable -> the bake skips / uses baseColor alone.
   const std::vector<float> *cpuPositions = nullptr;
+  const std::vector<float> *cpuAttributes = nullptr;
+  // Borrowed only until the immediate photo snapshot, after a fresh collection.
+  const QImage *photoMaps[4] = {};
+  float photoMetalness = 0.0f, photoNormalStrength = 1.0f;
+  bool photoRefraction = false;
+  bool emissiveTwoSided = true;
+  float photoIor = 1.5f, photoAttenuationDistance = 1;
+  float photoAttenuationColor[3] = {1,1,1};
   const std::vector<uint32_t> *cpuIndices = nullptr;
   float texMeanLin[3] = {1.0f, 1.0f, 1.0f};
   // R4 material fidelity: optional albedo texture (WGPUTextureView from
@@ -237,6 +250,13 @@ void wbWgpuAppendInstanceReport(void *instance, const char *path, long frame);
 
 class OmWgpuRenderTarget {
 public:
+  struct LocalShadowStats {
+    uint64_t candidates=0, draws=0;
+    uint32_t faces=0;
+    bool reused=false;
+    double cpuUs=0;  // cache validation + shadow command encoding, not GPU time
+  };
+  const LocalShadowStats &localShadowStats() const { return mLocalShadowStats; }
   // `width` and `height` are in pixels and must be > 0. Format is
   // fixed at RGBA8Unorm so the readback path can memcpy 4 bytes per
   // pixel into the caller's buffer without conversion.
@@ -566,7 +586,8 @@ public:
                                          float bloomHdrThreshold = 0.0f,
                                          const float *skyScatter24 = nullptr,
                                          const float *iblSky8 = nullptr,
-                                         int outputTransfer = OM_WGPU_XFER_VIEW);
+                                         int outputTransfer = OM_WGPU_XFER_VIEW,
+                                         const float *extraLightOptions = nullptr);
 
   // R4 lighting convergence: the MULTI-CASCADE generalisation of clearAndDrawSceneTexturedShadowed —
   // the full material path (albedo/roughness/metalness/normal + GGX + hemisphere ambient) with N-cascade
@@ -610,7 +631,7 @@ public:
   void setOmniLightBlend(float b) { mOmniMisc4[0] = b; }
   // Upload the traced specular cubemap (RGBA16F, 3 mips: size, size/4, size/16).
   bool setOmniLightCube(const uint16_t *texels, int size, const float *center3,
-                        const float *aabbMin3, const float *aabbMax3);
+                        const float *aabbMin3, const float *aabbMax3, int count = 1);
   // Draw the OmniLight loading overlay (sun dot + progress bar) over the tonemapped frame in
   // mView. Present-path only; screenshots/dumps stay clean (their readback happens earlier).
   bool drawOmniProgress(float progress01, float pulseT);
@@ -888,6 +909,7 @@ private:
   void *mOmniCubeTex = nullptr;
   void *mOmniCubeView = nullptr;
   float mOmniCubeCenter4[4] = {0, 0, 0, 0};
+  float mReflectionCenters[16] = {}, mReflectionMin[16] = {}, mReflectionMax[16] = {};
   float mOmniAabbMin4[4] = {0, 0, 0, 0};
   float mOmniAabbMax4[4] = {0, 0, 0, 0};
   void *mOmniBarPipeline = nullptr;
@@ -906,7 +928,11 @@ private:
   bool mAdaptFlip = false;
   uint64_t mFrameCounter = 0;
   // TAA: ping-pong resolved-output textures (this frame's output = next frame's history),
-  // the previous frame's UNJITTERED view-proj, and the active output view (null = mView).
+  // the previous frame's jittered view-proj, and the active output view (null = mView).
+  void *mGpuTimer = nullptr;  // private native timestamp ring
+  void *mMotionVectors = nullptr;  // native-only, per-view history and motion attachments
+  void *mTaaDepthTex[2] = {nullptr, nullptr};
+  void *mTaaDepthView[2] = {nullptr, nullptr};
   void *mTaaMvTex[2] = {nullptr, nullptr};
   void *mTaaMvView[2] = {nullptr, nullptr};
   uint32_t mTaaMvW = 0, mTaaMvH = 0;
@@ -1119,6 +1145,8 @@ private:
   void *mCsmShadowDepthTexture = nullptr;    // WGPUTexture (Depth24Plus, shared light-pass occlusion)
   void *mCsmShadowDepthView = nullptr;       // WGPUTextureView
   uint32_t mCsmShadowRes = 0;                // current array layer resolution
+  OmLocalShadowCache mLocalShadowCache;
+  LocalShadowStats mLocalShadowStats;
   uint32_t mCsmCascadeCount = 0;             // current array layer count
   void *mCsmDepthUniformBuffer = nullptr;    // WGPUBuffer (light clip-depth pass, N*draws slots)
   size_t mCsmDepthUniformBufferSize = 0;

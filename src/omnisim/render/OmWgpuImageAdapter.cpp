@@ -15,10 +15,22 @@
 #include "OmWgpuImageAdapter.hpp"
 
 #include "OmWgpuTextureCache.hpp"
+#include "OmPhoto.hpp"
 
 #include <QtGui/QImage>
 
 namespace OmWgpuImageAdapter {
+  uint64_t photoTextureKey(const QImage *image) { return image ? image->cacheKey() : 0; }
+  bool copyPhotoTexture(const QImage *image, OmPhotoTexture &texture) {
+    if (!image || image->isNull()) return false;
+    const QImage rgba = image->convertToFormat(QImage::Format_RGBA8888);
+    texture.width = rgba.width(); texture.height = rgba.height();
+    texture.rgba.resize(static_cast<size_t>(rgba.width()) * rgba.height() * 4);
+    for (int y = 0; y < rgba.height(); ++y)
+      memcpy(texture.rgba.data() + static_cast<size_t>(y) * rgba.width() * 4,
+             rgba.constScanLine(y), static_cast<size_t>(rgba.width()) * 4);
+    return true;
+  }
 
   OmWgpuTextureHandle acquireFromQImage(OmWgpuTextureCache &cache, uint64_t textureId,
                                         const QImage &image) {

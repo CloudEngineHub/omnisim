@@ -39,17 +39,27 @@
 #include "OmSysInfo.hpp"
 #include "OmVideoRecorder.hpp"
 #include "OmView3D.hpp"
+#include "OmPhoto.hpp"
 #include "OmViewpoint.hpp"
 #include "OmWgpuView.hpp"
 #include "OmWorld.hpp"
 #include "OmWorldInfo.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <QtCore/QFileInfo>
 #include <QtCore/QTimer>
 #include <QtGui/QAction>
 #include <QtGui/QImage>
 #include <QtGui/QResizeEvent>
 #include <QtWidgets/QFileDialog>
+#include <QtWidgets/QDialog>
+#include <QtWidgets/QDialogButtonBox>
+#include <QtWidgets/QFormLayout>
+#include <QtWidgets/QComboBox>
+#include <QtWidgets/QSpinBox>
+#include <QtWidgets/QLabel>
+#include <QtWidgets/QCheckBox>
 #include <QtWidgets/QMenu>
 #include <QtWidgets/QSlider>
 #include <QtWidgets/QSplitter>
@@ -1171,4 +1181,53 @@ void OmSimulationView::showEvent(QShowEvent *event) {
 void OmSimulationView::showMenu(const QPoint &position, QWidget *parentWidget) {
   const OmBaseNode *selectedNode = OmSelection::instance() ? OmSelection::instance()->selectedNode() : NULL;
   OmContextMenuGenerator::generateContextMenu(position, selectedNode, parentWidget);
+}
+
+
+void OmSimulationView::renderPhoto() {
+  if (!OmWorld::instance()) return;
+  OmSimulationState::instance()->pauseSimulation();
+  QDialog dialog(this);
+  dialog.setWindowTitle(tr("Render Photo"));
+  QFormLayout layout(&dialog);
+  QLabel description(tr("Create a still image with traced lighting and reflections.\nThe simulation pauses while the image renders."));
+  layout.addRow(&description);
+  QComboBox size;
+  size.addItem(tr("Small — 960 pixels wide"), 960);
+  size.addItem(tr("Large — 1920 pixels wide"), 1920);
+  layout.addRow(tr("Image size"), &size);
+  QComboBox detail;
+  detail.addItem(tr("Quick"), 16);
+  detail.addItem(tr("Balanced"), 64);
+  detail.addItem(tr("Fine"), 256);
+  detail.setCurrentIndex(1);
+  layout.addRow(tr("Detail"), &detail);
+  QSpinBox duration;
+  duration.setRange(5, 300); duration.setValue(60); duration.setSuffix(tr(" seconds"));
+  layout.addRow(tr("Maximum render time"), &duration);
+  QCheckBox denoise(tr("Reduce grain"));
+  denoise.setChecked(true);
+  layout.addRow(&denoise);
+  QLabel note(tr("Solid glass can bend and absorb light when enabled in its material.\nThis still-image mode does not change robot camera output."));
+  note.setWordWrap(true);
+  layout.addRow(&note);
+  QDialogButtonBox buttons(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+  layout.addRow(&buttons);
+  connect(&buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+  connect(&buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+  if (dialog.exec() != QDialog::Accepted) { OmSimulationState::instance()->resumeSimulation(); return; }
+  const QString filename = QFileDialog::getSaveFileName(this, tr("Save Photo"),
+    OmPreferences::instance()->value("Directories/screenshots").toString() + "photo.png", tr("PNG image (*.png)"));
+  if (filename.isEmpty()) { OmSimulationState::instance()->resumeSimulation(); return; }
+  OmPhotoSettings settings;
+  settings.width = size.currentData().toInt();
+  settings.height = std::max(1, static_cast<int>(std::lround(settings.width *
+    static_cast<double>(mView3D->height()) / std::max(1, mView3D->width()))));
+  settings.samples = detail.currentData().toInt();
+  settings.timeLimitSeconds = duration.value();
+  settings.denoise = denoise.isChecked();
+  QString message;
+  const bool ok = mView3D->renderPhotoToFile(filename, settings, message);
+  OmSimulationState::instance()->resumeSimulation();
+  if (ok) OmLog::info(message); else OmMessageBox::warning(message, this);
 }

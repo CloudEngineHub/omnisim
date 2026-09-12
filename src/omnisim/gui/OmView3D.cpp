@@ -62,6 +62,13 @@
 #include "OmSimulationWorld.hpp"
 #include "OmSolid.hpp"
 #include "../render/OmniLight.hpp"
+#include "../render/OmPhotoSnapshot.hpp"
+#include "../render/OmPhotoDenoise.hpp"
+#include <QtCore/QSaveFile>
+#include <QtCore/QCoreApplication>
+#include <QtCore/QEventLoop>
+#include <QtWidgets/QProgressDialog>
+#include <chrono>
 #include "OmSphere.hpp"
 #include "OmStandardPaths.hpp"
 #include "OmSupervisorUtilities.hpp"
@@ -315,6 +322,7 @@ void OmView3D::onSelectionChanged(OmAbstractPose *selectedPose) {
 
 OmView3D::~OmView3D() {
   // OmniLight: the bake worker owns only snapshots, but it must not outlive the widget.
+  mOmniBakeCancel.store(true, std::memory_order_relaxed);
   if (mOmniBakeThread.joinable())
     mOmniBakeThread.join();
   cleanupFullScreenOverlay();
@@ -863,9 +871,11 @@ void OmView3D::prepareWorldLoading() {
 // Drop the cached main-view draw list (and its destroyed() hooks) and mark it for rebuild. Called
 // when a referenced node is destroyed, on world (re)load, and periodically for appearance staleness.
 void OmView3D::invalidateWgpuDrawList() {
-  for (const QMetaObject::Connection &c : mWgpuDrawListConns)
-    QObject::disconnect(c);
-  mWgpuDrawListConns.clear();
+  if (mWgpuDrawInputsDisconnect) {
+    auto disconnectInputs = std::move(mWgpuDrawInputsDisconnect);
+    mWgpuDrawInputsDisconnect = {};
+    disconnectInputs();
+  }
   mWgpuDrawList.clear();
   mWgpuModelList.clear();
   mWgpuRefreshList.clear();
@@ -1406,7 +1416,8 @@ namespace {
   }
 }  // namespace
 
-static void collectExtraLightsV3D(OmBaseNode *root, const OmDirectionalLight *sun, std::vector<float> &out) {
+static void collectExtraLightsV3D(OmBaseNode *root, const OmDirectionalLight *sun, std::vector<float> &out,
+                                 std::vector<float> &options) {
   if (!root || out.size() >= 8u * 16u)
     return;
   if (OmLight *l = dynamic_cast<OmLight *>(root)) {
@@ -1459,12 +1470,14 @@ static void collectExtraLightsV3D(OmBaseNode *root, const OmDirectionalLight *su
     } else
       return;  // some other OmLight subclass — not supported as an extra
     out.insert(out.end(), rec, rec + 16);
+    options.push_back(l->castShadows()?1.0f:0.0f);
+    options.push_back(l->rayTracing()?1.0f:0.0f);
     return;  // lights carry no child scene nodes of interest
   }
   if (OmGroup *g = dynamic_cast<OmGroup *>(root)) {
     const int n = g->childCount();
     for (int i = 0; i < n && out.size() < 8u * 16u; ++i)
-      collectExtraLightsV3D(g->child(i), sun, out);
+      collectExtraLightsV3D(g->child(i), sun, out, options);
   }
 }
 
@@ -1581,7 +1594,7 @@ bool OmView3D::renderMainFrameViaWgpu(bool culling, bool offScreen) {
   // (mWgpuMainViewUnavailable) leaves the view permanently blank, and the transient guards (mid-reload,
   // suspended, offscreen/sensor/screenshot) just skip this paint.
   (void)culling;
-  if (offScreen || mWgpuMainViewUnavailable || mWgpuMainViewSuspended)
+  if (offScreen || mPhotoRendering || mWgpuMainViewUnavailable || mWgpuMainViewSuspended)
     return false;  // offscreen/sensor/screenshot or mid-(re)load → stay on WREN; a prior failure → WREN
   // --no-rendering means exactly that. Until 2026-09-02 a `--batch --no-rendering --minimize` load
   // check still drew a full main-view frame on its first paint: it lazily initialised wgpu-native
@@ -1762,13 +1775,8 @@ bool OmView3D::renderMainFrameViaWgpu(bool culling, bool offScreen) {
                                            mWgpuTextureCache, &mWgpuRefreshList, &wgpuCollectSkipped);
     // A destroyed scene node would dangle the cached geom/WrTransform pointers — hook every
     // referenced node's destroyed() to invalidate the cache BEFORE the next frame can touch them.
-    QSet<QObject *> hooked;
-    for (const OmWgpuSceneRenderer::OmWgpuDrawRefresh &r : mWgpuRefreshList)
-      if (r.node && !hooked.contains(r.node)) {
-        hooked.insert(r.node);
-        mWgpuDrawListConns.push_back(
-          connect(r.node, &QObject::destroyed, this, [this]() { invalidateWgpuDrawList(); }));
-      }
+    mWgpuDrawInputsDisconnect = OmWgpuSceneRenderer::watchDrawInputs(mWgpuRefreshList,this,
+      [this]() { invalidateWgpuDrawList(); });
     // Structural-change hooks (replace the old 30-frame timer): top-level node additions (the
     // world root's children) and robot add/remove rebuild the list the moment they happen.
     // Qt::UniqueConnection dedupes across rebuilds.
@@ -1822,6 +1830,7 @@ bool OmView3D::renderMainFrameViaWgpu(bool culling, bool offScreen) {
   mWgpuTrackDraws = dynCounts.track;
   mWgpuMuscleDraws = dynCounts.muscle;
   tCollect = phaseTimer.elapsed();
+  const qint64 collectNs = phaseTimer.nsecsElapsed();
   if (tCollect > sMaxCollectMs)
     sMaxCollectMs = tCollect;  // worst collect in the window — the 30-frame rebuild hitch shows here
 
@@ -1841,7 +1850,7 @@ bool OmView3D::renderMainFrameViaWgpu(bool culling, bool offScreen) {
   static const bool sOverlaysOn = !qEnvironmentVariableIsSet("OMNISIM_WGPU_OVERLAYS") ||
                                   qEnvironmentVariableIntValue("OMNISIM_WGPU_OVERLAYS") != 0;
   OmSolid *selTop = nullptr;
-  if (sOverlaysOn && OmSelection::instance()) {
+  if (sOverlaysOn && !mPhotoSnapshotRequested && OmSelection::instance()) {
     selTop = OmSelection::instance()->selectedSolid();
     // collectWorldDraws tags every draw with its TOP solid, so highlight by top solid — that
     // is also what a bare click resolves to (see the pick handler's topMatter branch).
@@ -2102,8 +2111,9 @@ bool OmView3D::renderMainFrameViaWgpu(bool culling, bool offScreen) {
   // fills for the shader's ExtraLight array. Empty (the single-sun common case) leaves the shader
   // loop dead and the output unchanged.
   std::vector<float> extraLights;
+  std::vector<float> extraLightOptions;
   if (mWorld && mWorld->root())
-    collectExtraLightsV3D(mWorld->root(), sunNode, extraLights);
+    collectExtraLightsV3D(mWorld->root(), sunNode, extraLights, extraLightOptions);
   // HDR + AgX filmic tonemapping: ON BY DEFAULT (exposure from the Viewpoint's exposure field,
   // default 1.0). The historical "AgX reads milky/blown" verdict was diagnosed 2026-08-19: the
   // shading underneath was DISPLAY-referred (raw albedo, unit-energy sun, pow(1/2.2) inside the
@@ -2387,9 +2397,67 @@ bool OmView3D::renderMainFrameViaWgpu(bool culling, bool offScreen) {
       const float rtScale = (mOmniEverApplied && mOmniLocalsBaked) ? (1.0f - mOmniBlend) : 1.0f;
       if (rtScale < 1.0f)
         for (size_t li = 0; li + 15 < omniExtras.size(); li += 16)
-          if (omniExtras[li + 3] > 0.5f)  // point/spot only
+          if (omniExtras[li + 3] > 0.5f && extraLightOptions[li/8]<0.5f && extraLightOptions[li/8+1]>0.5f)
             for (int k = 4; k < 7; ++k)
               omniExtras[li + k] *= rtScale;
+    }
+    if (mPhotoSnapshotRequested) {
+      mPhotoScene = std::make_unique<OmPhotoScene>(omPhotoSnapshot(draws));
+      OmPhotoScene &photo = *mPhotoScene;
+      for (int k = 0; k < 3; ++k) {
+        photo.eye[k] = eye[k]; photo.forward[k] = fwd[k];
+        photo.right[k] = rgt[k]; photo.up[k] = up[k];
+        photo.sunTo[k] = towardSun[k]; photo.sunEnergy[k] = sunEnergy3[k] * dayF;
+      }
+      photo.horizontalFov = static_cast<float>(hf);
+      photo.exposure = agxExposure > 0 ? agxExposure : 1.0f;
+      photo.skyWidth = 256; photo.skyHeight = 128;
+      photo.sky.resize(256 * 128 * 3);
+      SkyMarchP mp;
+      mp.rayR = scat24[0]; mp.rayG = scat24[1]; mp.rayB = scat24[2]; mp.rayExp = scat24[3];
+      mp.mieS = scat24[4]; mp.mieExp = scat24[7]; mp.mieA = scat24[8]; mp.phaseG = scat24[11];
+      mp.ozR = scat24[12]; mp.ozG = scat24[13]; mp.ozB = scat24[14]; mp.camHkm = scat24[15];
+      mp.botKm = scat24[16]; mp.topKm = scat24[17]; mp.sinSunElev = scat24[18]; mp.albedo = scat24[19];
+      mp.illR = scat24[20]; mp.illG = scat24[21]; mp.illB = scat24[22];
+      const float sunAz = std::atan2(towardSun.y(), towardSun.x());
+      for (int y = 0; y < photo.skyHeight; ++y)
+        for (int x = 0; x < photo.skyWidth; ++x) {
+          const float el = M_PI * (0.5f - (y + 0.5f) / photo.skyHeight);
+          const float az = 2 * M_PI * ((x + 0.5f) / photo.skyWidth - 0.5f);
+          float *rgb = photo.sky.data() + (y * photo.skyWidth + x) * 3;
+          if (skyScatter)
+            sciSampleSky(mp, el, az - sunAz, rgb);
+          else if (skyCube) {
+            const float d[3] = {std::cos(el)*std::cos(az), std::cos(el)*std::sin(az), std::sin(el)};
+            const float ax = std::abs(d[0]), ay = std::abs(d[1]), azm = std::abs(d[2]);
+            float u, v, major; int face;
+            if (ax >= ay && ax >= azm) { face = d[0] >= 0 ? 0 : 1; major = ax; u = d[0] >= 0 ? -d[2] : d[2]; v = -d[1]; }
+            else if (ay >= azm) { face = d[1] >= 0 ? 2 : 3; major = ay; u = d[0]; v = d[1] >= 0 ? d[2] : -d[2]; }
+            else { face = d[2] >= 0 ? 4 : 5; major = azm; u = d[2] >= 0 ? d[0] : -d[0]; v = -d[1]; }
+            const QImage *image = bgNode->cubemapTexture(face);
+            const int ix = std::clamp(static_cast<int>((u/major*0.5f+0.5f)*image->width()), 0, image->width()-1);
+            const int iy = std::clamp(static_cast<int>((v/major*0.5f+0.5f)*image->height()), 0, image->height()-1);
+            const QColor c = image->pixelColor(ix, iy);
+            rgb[0] = std::pow(c.redF(), 2.2); rgb[1] = std::pow(c.greenF(), 2.2); rgb[2] = std::pow(c.blueF(), 2.2);
+          } else {
+            // A black authored environment must emit no light. The live view's
+            // legacy grey fallback is a display convenience, not scene radiance.
+            const OmRgb authored=bgNode?bgNode->skyColor():OmRgb(sky.r,sky.g,sky.b);
+            rgb[0] = std::pow(std::max(0.0, authored.red()), 2.2);
+            rgb[1] = std::pow(std::max(0.0, authored.green()), 2.2);
+            rgb[2] = std::pow(std::max(0.0, authored.blue()), 2.2);
+          }
+          for (int k = 0; k < 3; ++k) rgb[k] *= bgNode ? bgNode->luminosity() : 1.0;
+        }
+      for (size_t i = 0; i + 15 < extraLights.size(); i += 16) {
+        if (extraLightOptions[i/8+1]<0.5f) continue; // raster proxy for an emissive area light
+        const float *e = extraLights.data() + i;
+        OmniLightLocal light;
+        for (int k = 0; k < 3; ++k) { light.pos[k] = e[k]; light.colorLin[k] = e[4+k]; light.atten[k] = e[8+k]; light.spotDir[k] = e[12+k]; }
+        light.type = static_cast<int>(e[3]); light.radius = e[7]; light.cosCut = e[11]; light.cosBeam = e[15];
+        photo.lights.push_back(light);
+      }
+      return true;  // snapshot only: do not start a probe bake or another raster frame
     }
     // ===== OMNILIGHT: baked global illumination (the sky-LUT philosophy at full scale) =====
     // Trace the light COMPLETELY (CPU path tracer over the real scene triangles, real sky
@@ -2413,8 +2481,8 @@ bool OmView3D::renderMainFrameViaWgpu(bool culling, bool offScreen) {
         mWgpuRenderTarget->setOmniLightVolume(v.texels.data(), v.dims[0], v.dims[1], v.dims[2],
                                               org, invExt);
         if (!v.cubeTexels.empty())
-          mWgpuRenderTarget->setOmniLightCube(v.cubeTexels.data(), v.cubeSize, v.cubeCenter,
-                                              v.aabbMin, v.aabbMax);
+          mWgpuRenderTarget->setOmniLightCube(v.cubeTexels.data(), v.cubeSize, v.cubeCenters.data(),
+                                              v.cubeBoundsMin.data(), v.cubeBoundsMax.data(), v.cubeCount);
         // First landing fades in over ~0.6 s (no pop); later rebakes swap directly (both sides
         // are lit states, the delta is small).
         if (!mOmniEverApplied) {
@@ -2433,9 +2501,15 @@ bool OmView3D::renderMainFrameViaWgpu(bool culling, bool offScreen) {
     }
     // trigger: light-rig + scene-fingerprint key (quantized sun so day-night cycling rebakes
     // in steps, not every frame; moving robots do NOT retrigger — static-scene GI by design)
-    if (sOmniOn && skyScatter && !mOmniBakeRunning && !draws.empty()) {
+    if (sOmniOn && skyScatter && !mOmniBakeRunning && !draws.empty() &&
+        qEnvironmentVariable("OMNISIM_PHOTO_OUTPUT").isEmpty()) {
       uint64_t key = 1469598103934665603ULL;
       auto mix = [&key](int64_t v) { key = (key ^ static_cast<uint64_t>(v)) * 1099511628211ULL; };
+      for (float option:extraLightOptions) mix(static_cast<int64_t>(option));
+      if (bgNode) for (int i=0;i<std::min(3,bgNode->reflectionProbeCount());++i) {
+        const OmVector3 p=bgNode->reflectionProbePosition(i);
+        for (int k=0;k<3;++k) mix(static_cast<int64_t>(p[k]*1000));
+      }
       for (int k = 0; k < 3; ++k)
         mix(static_cast<int64_t>(std::lround(towardSun[k] * 40.0)));
       for (int k = 0; k < 3; ++k)
@@ -2476,11 +2550,12 @@ bool OmView3D::renderMainFrameViaWgpu(bool culling, bool offScreen) {
               !d.castShadows)
             continue;
           OmniLightMaterial m;
+          m.emissiveTwoSided=d.emissiveTwoSided;
           for (int k = 0; k < 3; ++k) {
             const float bc = k == 0 ? d.baseColorR : (k == 1 ? d.baseColorG : d.baseColorB);
             const float em = k == 0 ? d.emissiveR : (k == 1 ? d.emissiveG : d.emissiveB);
             m.albedoLin[k] = std::min(0.95f, bc * d.texMeanLin[k]);
-            m.emissiveLin[k] = std::pow(std::max(0.0f, em), 2.2f);
+            m.emissiveLin[k] = d.emissiveTwoSided ? std::pow(std::max(0.0f, em), 2.2f) : std::max(0.0f,em);
           }
           const uint32_t mi = static_cast<uint32_t>(mats->size());
           mats->push_back(m);
@@ -2562,6 +2637,8 @@ bool OmView3D::renderMainFrameViaWgpu(bool culling, bool offScreen) {
             return ok && v > 0.0f ? v : 0.22f;   // OMNILIGHT_SPACING=0.45 = exact revert
           }();
           bp.minSpacing = sOmniSpacing;
+          // OMNILIGHT_THREADS: worker budget, 0 keeps automatic CPU sizing.
+          bp.threads=std::max(0,qEnvironmentVariableIntValue("OMNILIGHT_THREADS"));
           static const float sOmniScale = []() {
             bool ok = false;
             const float v = qEnvironmentVariable("OMNILIGHT_SCALE").toFloat(&ok);
@@ -2570,15 +2647,23 @@ bool OmView3D::renderMainFrameViaWgpu(bool culling, bool offScreen) {
           bp.outputScale = sOmniScale;
           bp.progressDone = &mOmniProgressDone;
           bp.progressTotal = &mOmniProgressTotal;
+          mOmniBakeCancel.store(false, std::memory_order_relaxed);
+          bp.cancel = &mOmniBakeCancel;
+          if (bgNode) for (int i=0;i<std::min(3,bgNode->reflectionProbeCount());++i) {
+            const OmVector3 p=bgNode->reflectionProbePosition(i);
+            bp.reflectionPositions.push_back({static_cast<float>(p.x()),static_cast<float>(p.y()),static_cast<float>(p.z())});
+          }
           // Static local lights (point/spot) bake INTO the field with occlusion; their
           // unshadowed real-time versions crossfade out as the volume fades in.
           {
             const size_t nEx = extraLights.size() / 16;
             for (size_t li = 0; li < nEx; ++li) {
+              if (extraLightOptions[li*2+1]<0.5f) continue;
               const float *e = extraLights.data() + li * 16;
               if (e[3] < 0.5f)
                 continue;  // keep extra directionals real-time
               OmniLightLocal gl;
+              gl.physical = extraLightOptions[li*2]>0.5f;
               gl.pos[0] = e[0]; gl.pos[1] = e[1]; gl.pos[2] = e[2];
               gl.type = e[3] > 1.5f ? 2 : 1;
               gl.colorLin[0] = e[4]; gl.colorLin[1] = e[5]; gl.colorLin[2] = e[6];
@@ -2648,10 +2733,15 @@ bool OmView3D::renderMainFrameViaWgpu(bool culling, bool offScreen) {
                              vp->bloomThresholdField()->value() > 0.0)
         ? static_cast<float>(vp->bloomThresholdField()->value())
         : 0.0f,
-      skyScatter ? scat24 : nullptr, skyDerived ? iblSky8 : nullptr);
+      skyScatter ? scat24 : nullptr, skyDerived ? iblSky8 : nullptr, OM_WGPU_XFER_VIEW,
+      extraLightOptions.empty()?nullptr:extraLightOptions.data());
   }
   tRender = phaseTimer.elapsed();
-  if (qEnvironmentVariableIsSet("OMNISIM_WGPU_REPORT") && (f % 100 == 0 || (!cdOk && f < 5))) {
+  const qint64 renderNs = phaseTimer.nsecsElapsed() - collectNs;
+  // OMNISIM_WGPU_REPORT_EVERY: frame interval for profiling; default 100, 1 records every frame.
+  static const int reportEvery = qEnvironmentVariableIsSet("OMNISIM_WGPU_REPORT_EVERY") ?
+    std::max(1,qEnvironmentVariableIntValue("OMNISIM_WGPU_REPORT_EVERY")) : 100;
+  if (qEnvironmentVariableIsSet("OMNISIM_WGPU_REPORT") && (f % reportEvery == 0 || (!cdOk && f < 5))) {
     const QString rpath = qEnvironmentVariable("OMNISIM_WGPU_REPORT");
     QFile tf(rpath);
     // W1c: glArms is the CUMULATIVE number of times the draw collect has had to make WREN's
@@ -2732,6 +2822,11 @@ bool OmView3D::renderMainFrameViaWgpu(bool culling, bool offScreen) {
         uvOff = m;
     }
     if (tf.open(QIODevice::Append | QIODevice::Text)) {
+      const auto &shadows=mWgpuRenderTarget->localShadowStats();
+      tf.write(QString("frame=%1 profile collectUs=%2 renderUs=%3 localShadowUs=%4 localCandidates=%5 localDraws=%6 localFaces=%7 localReused=%8\n")
+               .arg(f).arg(collectNs/1000.0,0,'f',3).arg(renderNs/1000.0,0,'f',3)
+               .arg(shadows.cpuUs,0,'f',3).arg(static_cast<qulonglong>(shadows.candidates))
+               .arg(static_cast<qulonglong>(shadows.draws)).arg(shadows.faces).arg(shadows.reused?1:0).toUtf8());
       tf.write(QString("frame=%1 calls draws=%2 W=%3 H=%4 cdOk=%5 collectMs=%6 renderMs=%7 prevBlitMs=%8 maxGapMs=%9 "
                        "maxCollectMs=%10 glArms=%11 glArmsWindow=%12 ovCalled=%13 ovBatches=%14 ovVerts=%15 ovOk=%16 deform=%17 deformZ=%18/%19 hudCalled=%20 hudQuads=%21 hudOk=%22 granular=%23 track=%24 trackT=%25/%26/%27 muscle=%28 muscleR=%29 trackP=%30/%31/%32 uvOff=%33\n")
                  .arg(f).arg(static_cast<qulonglong>(draws.size())).arg(W).arg(H).arg(cdOk ? 1 : 0)
@@ -2758,6 +2853,32 @@ bool OmView3D::renderMainFrameViaWgpu(bool culling, bool offScreen) {
   if (!cdOk) {
     mWgpuMainViewUnavailable = true;
     return false;
+  }
+
+  // OMNISIM_PHOTO_OUTPUT: opt-in automated still capture. The process exits after
+  // writing the PNG/report, so a capture never leaves an engine running.
+  if (!mPhotoAutoAttempted && f >= 3 && OmSimulationState::instance()->hasStarted() &&
+      !qEnvironmentVariable("OMNISIM_PHOTO_OUTPUT").isEmpty()) {
+    mPhotoAutoAttempted = true;
+    QTimer::singleShot(0, this, [this]() {
+      OmPhotoSettings settings;
+      // OMNISIM_PHOTO_WIDTH / HEIGHT: output dimensions, default 960 x 540.
+      if (qEnvironmentVariableIsSet("OMNISIM_PHOTO_WIDTH")) settings.width = qEnvironmentVariableIntValue("OMNISIM_PHOTO_WIDTH");
+      if (qEnvironmentVariableIsSet("OMNISIM_PHOTO_HEIGHT")) settings.height = qEnvironmentVariableIntValue("OMNISIM_PHOTO_HEIGHT");
+      // OMNISIM_PHOTO_SAMPLES: maximum whole-image samples, default 64.
+      if (qEnvironmentVariableIsSet("OMNISIM_PHOTO_SAMPLES")) settings.samples = qEnvironmentVariableIntValue("OMNISIM_PHOTO_SAMPLES");
+      // OMNISIM_PHOTO_SECONDS: bounded render duration, default 60 seconds.
+      if (qEnvironmentVariableIsSet("OMNISIM_PHOTO_SECONDS")) settings.timeLimitSeconds = qEnvironmentVariableIntValue("OMNISIM_PHOTO_SECONDS");
+      // OMNISIM_PHOTO_DENOISE: edge-aware grain reduction, default on; 0 disables.
+      if (qEnvironmentVariableIsSet("OMNISIM_PHOTO_DENOISE")) settings.denoise = qEnvironmentVariableIntValue("OMNISIM_PHOTO_DENOISE") != 0;
+      // OMNISIM_PHOTO_LIGHT_SAMPLING / ADAPTIVE: value-parsed comparison controls, both default on.
+      if (qEnvironmentVariableIsSet("OMNISIM_PHOTO_LIGHT_SAMPLING")) settings.lightSampling=qEnvironmentVariableIntValue("OMNISIM_PHOTO_LIGHT_SAMPLING")!=0;
+      if (qEnvironmentVariableIsSet("OMNISIM_PHOTO_ADAPTIVE")) settings.adaptiveSampling=qEnvironmentVariableIntValue("OMNISIM_PHOTO_ADAPTIVE")!=0;
+      QString message;
+      const bool ok = renderPhotoToFile(qEnvironmentVariable("OMNISIM_PHOTO_OUTPUT"), settings, message, false);
+      if (ok) OmLog::info(message); else OmLog::error(message);
+      QCoreApplication::exit(ok ? 0 : 1);
+    });
   }
 
   // R4 3c-B: one-shot screenshot of the rendered wgpu main-view frame (after the scene settles at
@@ -4695,4 +4816,127 @@ void OmView3D::handleWorldModificationFromSupervisor() {
   // refresh only if simulation is paused or stepped
   if (sim->isPaused())
     refresh();
+}
+
+
+bool OmView3D::renderPhotoToFile(const QString &path, const OmPhotoSettings &settings, QString &message,
+                                bool interactive) {
+  if (mPhotoRendering || !mWorld) { message = tr("A world must be loaded and no other photo render may be active."); return false; }
+  OmSimulationState *state = OmSimulationState::instance();
+  OmLog::info(tr("[Photo] Capturing current scene."));
+  state->pauseSimulation();
+  mOmniBakeCancel.store(true, std::memory_order_relaxed);
+  if (mOmniBakeThread.joinable()) mOmniBakeThread.join();
+  if (mOmniBakeRunning) mOmniKey = 0;  // retry an interrupted bake when normal rendering resumes
+  mOmniBakeRunning = false;
+  // Always re-collect: cached appearance pointers may predate a live material edit.
+  mWgpuDrawListDirty = true;
+  mPhotoSnapshotRequested = true;
+  mPhotoScene.reset();
+  const bool captured = renderMainFrameViaWgpu(false, false);
+  mPhotoSnapshotRequested = false;
+  if (!captured || !mPhotoScene || mPhotoScene->triangles.empty()) {
+    state->resumeSimulation();
+    message = tr("Unable to capture scene geometry for the photo renderer.");
+    return false;
+  }
+  // Preserve the viewpoint's horizontal field of view for the requested aspect.
+  if (mWorld->viewpoint() && mWorld->viewpoint()->fieldOfView()) {
+    const float fov = mWorld->viewpoint()->fieldOfView()->value();
+    const float aspect = static_cast<float>(settings.width) / std::max(1, settings.height);
+    mPhotoScene->horizontalFov = aspect < 1 ? 2 * std::atan(std::tan(fov * 0.5f) * aspect) : fov;
+  }
+  mPhotoRendering = true;
+  OmLog::info(tr("[Photo] Tracing %1 triangles, %2 textures, %3 x %4 pixels (up to %5 samples).")
+                .arg(mPhotoScene->triangles.size()).arg(mPhotoScene->textures.size())
+                .arg(settings.width).arg(settings.height).arg(settings.samples));
+  std::atomic<bool> cancel{false}, finished{false};
+  std::atomic<int> progress{0};
+  OmPhotoResult result;
+  QProgressDialog dialog(tr("Rendering photo…"), tr("Cancel"), 0, settings.samples, mParentWidget);
+  dialog.setWindowTitle(tr("Render Photo"));
+  dialog.setWindowModality(Qt::ApplicationModal);
+  dialog.setMinimumDuration(0);
+  dialog.setAutoClose(false);
+  if (interactive) dialog.show();
+  std::thread worker([&]() {
+    try {
+      const auto start=std::chrono::steady_clock::now();
+      OmPhotoSettings tracing=settings;
+      if (settings.denoise) tracing.timeLimitSeconds*=0.85;
+      result = omRenderPhoto(*mPhotoScene, tracing, cancel, &progress);
+      if (settings.denoise && !result.cancelled && result.completedSamples>1) {
+        const double remaining=settings.timeLimitSeconds-std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
+#ifdef _WIN32
+        const QString library=QCoreApplication::applicationDirPath()+"/photo-denoise/OpenImageDenoise.dll";
+#elif defined(__APPLE__)
+        const QString library=QCoreApplication::applicationDirPath()+"/photo-denoise/libOpenImageDenoise.2.dylib";
+#else
+        const QString library=QCoreApplication::applicationDirPath()+"/photo-denoise/libOpenImageDenoise.so.2";
+#endif
+        std::string detail;
+        if (!omPhotoDenoise(result,settings.width,settings.height,library.toUtf8().constData(),cancel,remaining,detail))
+          result.denoiser="Edge-aware fallback: "+detail;
+        if (cancel.load()) result.cancelled=true;
+      }
+      result.seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
+    }
+    catch (const std::exception &e) { result.error = e.what(); }
+    finished.store(true, std::memory_order_release);
+  });
+  while (!finished.load(std::memory_order_acquire)) {
+    if (interactive) {
+      dialog.setValue(progress.load(std::memory_order_relaxed));
+      dialog.setLabelText(tr("Rendering photo… %1 of %2 samples").arg(progress.load()).arg(settings.samples));
+      if (dialog.wasCanceled()) cancel.store(true, std::memory_order_relaxed);
+    }
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  }
+  worker.join();
+  dialog.close();
+  bool ok = result.error.empty() && !result.cancelled && result.completedSamples > 0;
+  if (ok) {
+    const std::vector<uint8_t> rgb = omPhotoDisplay(result, mPhotoScene->exposure, settings.width, settings.height);
+    QImage image(rgb.data(), settings.width, settings.height, settings.width * 3, QImage::Format_RGB888);
+    QSaveFile file(path);
+    ok = file.open(QIODevice::WriteOnly) && image.save(&file, "PNG") && file.commit();
+    if (!ok) message = tr("Unable to save the photo to %1.").arg(path);
+    else {
+      message = tr("Photo saved to %1 (%2 samples%3).")
+                  .arg(path).arg(result.completedSamples).arg(result.timeLimited ? tr(", time limit reached") : QString());
+      QJsonObject report;
+      report["renderer"] = "OmniSim Photo";
+      report["width"] = settings.width; report["height"] = settings.height;
+      report["requested_samples"] = settings.samples; report["completed_samples"] = result.completedSamples;
+      report["seconds"] = result.seconds; report["time_limited"] = result.timeLimited;
+      report["average_samples"] = result.averageSamples;
+      report["adaptive_sampling"] = settings.adaptiveSampling;
+      report["light_sampling"] = settings.lightSampling;
+      report["triangles"] = static_cast<qint64>(mPhotoScene->triangles.size());
+      report["textures"] = static_cast<int>(mPhotoScene->textures.size());
+      report["solid_dielectrics"] = true;
+      int solidGlass=0,emitters=0;
+      for (const auto &m:mPhotoScene->materials) if (m.refraction) ++solidGlass;
+      for (const auto &t:mPhotoScene->triangles) {
+        const auto &m=mPhotoScene->materials[t.material];
+        if (m.emission[0]>0 || m.emission[1]>0 || m.emission[2]>0) ++emitters;
+      }
+      report["solid_glass_materials"]=solidGlass;
+      report["emissive_triangles"]=emitters;
+      report["explicit_lights"]=static_cast<int>(mPhotoScene->lights.size());
+      report["denoised"] = settings.denoise && result.completedSamples > 1;
+      report["denoiser"] = QString::fromStdString(result.denoiser);
+      QSaveFile meta(path + ".json");
+      const QByteArray data = QJsonDocument(report).toJson();
+      if (!meta.open(QIODevice::WriteOnly) || meta.write(data) != data.size() || !meta.commit())
+        message += tr(" The image was saved, but its capture report could not be written.");
+    }
+  } else if (result.cancelled) message = tr("Photo render cancelled; no file was saved.");
+  else if (!result.error.empty()) message = QString::fromStdString(result.error);
+  else message = tr("The time limit elapsed before one full sample completed; no file was saved.");
+  mPhotoScene.reset();
+  mPhotoRendering = false;
+  state->resumeSimulation();
+  return ok;
 }

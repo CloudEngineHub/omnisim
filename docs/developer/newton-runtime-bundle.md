@@ -107,7 +107,7 @@ python3XX._pth                    # isolated path config -> the bundle below
 newton-runtime/
   python.exe  Lib/  DLLs/         # self-contained CPython
   site-packages/                  # vendor mode: warp, newton, mujoco_warp, pxr (usd),
-                                  #   newton_usd_schemas
+                                  #   newton_usd_schemas, onnxruntime
   FIRST_RUN_INSTALL.txt           # bootstrap mode instead of site-packages
 ```
 
@@ -118,6 +118,136 @@ pinch grasp uses), plus the CPython runtime → **~600 MB measured at warp 1.14*
 Also vendored (added 2026-08-19): `newton-usd-schemas` 0.5.0 (~115 KB, Apache-2.0,
 zero deps) — newton's codeless USD schema plugin, without which `add_usd`
 hard-fails (`require_newton_usd_schemas` raises), so USD import needs it bundled.
+
+## The bundle is also the CONTROLLER interpreter
+
+⚠ This is not only the physics runtime. The engine embeds CPython for Newton
+(it loads `python3XX.dll` from its own directory), but it **spawns a separate
+`python` per Python controller**, resolved from `PATH`
+(`OmLanguageTools::pythonCommand`). Two of the launch paths put this bundle
+first on that `PATH` — `scripts/dev/headless_runner.py` (so every
+`python -m omnisim run-headless`) and `scripts/dev/omnisim_run_agent.py` (so
+every `run-agent`), both of which also point `PYTHONPATH` at
+`newton-runtime/site-packages`. `launch.bat` and the installer's shortcut do
+not (`launcher.c` adds only the engine dir, `cpp/` and msys `usr/bin`), so
+those give the controller the user's system `python`.
+
+That split is why a gap here hides: a developer's own `python` can have a
+package the shipped bundle lacks, and nothing in `python -m omnisim` ever
+touches the bundle's copy. Measured 2026-09-11 on a probe controller launched
+by the engine — `sys.executable =
+msys64\mingw64\bin\newton-runtime\python.exe`, `numpy` 2.5.3, `onnxruntime`
+**ModuleNotFoundError** — while the same clone's `python` had onnxruntime
+1.26.0. 26 shipped controllers `import onnxruntime` (every `*_deploy` /
+`*_mimic` under `projects/policies/research/controllers`, plus the
+`anypick_cam` and `omniarm6_bin_picking` demos), so on a clean clone every one
+of them refused to run its policy.
+
+Fixed by vendoring `onnxruntime` 1.26.0 (42 MB installed against a 694 MB
+bundle, +6%; MIT; a platform wheel like warp/mujoco/numpy already are). It is
+in `DEPLOY_STACK` in `newton_runtime_pins.py` and in the bundler's
+`VERIFY_IMPORTS`, and `python -m omnisim doctor` reports it on the `policies`
+row.
+
+### `omnisim_bridges` is source-shipped, NOT vendored (resolved 2026-09-11)
+
+`omnisim_bridges` (`packages/omnisim-bridges/`) had the same failure signature
+and the **opposite** remedy. Probe controller, launched by the engine under
+`run-headless`, before the fix:
+
+```
+executable                  O:\omnisim\msys64\mingw64\bin\newton-runtime\python.exe
+PYTHONPATH                  ...\lib\controller\python;...\newton-runtime\site-packages
+import omnisim_bridges      ModuleNotFoundError
+after the _omnilink_relay bootstrap
+import omnisim_bridges      OK -> O:\omnisim\packages\omnisim-bridges\src\...
+```
+
+That second line is the whole story: the package was **already reachable** from
+the bundled interpreter. `_omnilink_relay/__init__.py` puts
+`packages/omnisim-bridges/src` on `sys.path` — but the two bridges imported
+`omnisim_bridges` *above* that import, so the bare `except Exception` swallowed
+a `ModuleNotFoundError` and installed stubs. `omnilink_arm_bridge` showed the
+mechanism cleanly by failing **only half-way**: `intent_router` (imported before
+the relay) degraded while `intents` (imported after it) worked.
+
+So it is **not vendored**, deliberately:
+
+- it is an *editable* install precisely so edits to the package take effect
+  immediately — a wheel in the bundle would shadow the tree with a stale copy,
+  which is worse than the bug it fixes;
+- it is pure Python with no platform wheel, unlike warp/mujoco/numpy/onnxruntime;
+- its source already ships **in the installer**
+  (`scripts/packaging/files_core.txt`: `packages/omnisim-bridges [recurse]`),
+  so a tree-relative path resolves on an installed box too.
+
+Both halves of the fix are therefore path-based:
+
+1. `headless_runner.py` and `omnisim_run_agent.py` add
+   `packages/omnisim-bridges/src` to the controller `PYTHONPATH` beside the
+   bundle's `site-packages`. (`omnisim_run_agent.py` prepended the bundled
+   python while setting **no** `PYTHONPATH` at all — so `run-agent` handed
+   controllers an interpreter that could not import numpy either. Fixed in the
+   same change.)
+2. Every bridge controller bootstraps the same path itself, above its first
+   `omnisim_bridges` import, so launch paths we do not control (`launch.bat`,
+   the installer shortcut) work on a clean clone with no editable install.
+
+And the silence is closed at both ends: the `except Exception` is narrowed to
+`ImportError` (a genuine error *inside* the package is no longer mistaken for
+the package being absent), a stub prints an unmissable banner naming
+`sys.executable`, the path tried and the fix, and `doctor` grew a `bridges`
+row. The banner is for the GUI console: controller stdout **and** stderr reach
+neither `omnisim_log.txt` nor the `run-headless` capture (measured), which is
+why `doctor` is the headless channel.
+
+Anything added to this bundle should be checked against what a *controller*
+needs, not only what physics needs — and checked against whether it should be
+in the bundle at all, or source-shipped like this one.
+
+### Which interpreter does a controller get? (open, deliberately unchanged)
+
+A controller gets a **different interpreter depending on how you launched**:
+
+| Launch path | Controller interpreter | Ordering |
+|---|---|---|
+| `run-headless` | bundled newton-runtime | PREPEND (`549734211`, 2026-08-26) |
+| `run-agent` | bundled newton-runtime | PREPEND |
+| `omnisim/dev/runner.py` (`run-world`, `test-world`) | system python | TAIL (deliberate, 2026-07-28) |
+| `launch.bat` / installer shortcut | system python | never added (`launcher.c`) |
+
+The 2026-07 TAIL decision was made **for this exact defect** — the comment in
+`runner.py` says prepending "silently degraded every OmniLink demo" because the
+bundle has no `omnisim_bridges`. That rationale is now **obsolete on its own
+terms**, and was always weaker than it read:
+
+- it only ever worked because the *developer's* system python carried an
+  editable install. On a clean clone the system python has no
+  `omnisim_bridges` either, so the tail order fixed nothing there;
+- the bridges now resolve the package from the tree regardless of interpreter,
+  which is what actually makes a clean clone work.
+
+What each ordering still costs, measured or read from the code:
+
+- **PREPEND** gives a guaranteed-complete interpreter (numpy, warp, newton,
+  onnxruntime) and is what makes the RL-deploy demos run. It costs the system
+  python's site-packages: a controller importing anything the bundle lacks and
+  the developer installed (`scipy`, `torch`, `opencv`) fails.
+- **TAIL** gives whatever the user installed, and its one real service is that
+  a box with **no** system Python still resolves an interpreter instead of
+  every controller dying `"python.exe" was not found`. It costs the bundle's
+  packages: under `run-world`, a controller needing `onnxruntime` gets it only
+  if the user installed it themselves.
+
+**Recommendation, not applied:** converge on PREPEND everywhere, because the
+bundle is the only interpreter whose contents the project controls and can
+verify (`VERIFY_IMPORTS`, `doctor`). That would make `run-world` and
+`test-world` behave like `run-headless`, which is also what the demo catalogue
+assumes. It is **not** done here because the blast radius is every
+`run-world` / `test-world` controller on every developer machine that relies on
+a system package the bundle lacks, and that set is unknown — it needs an audit
+of controller imports against the bundle's contents, plus a decision about
+whether the bundle should grow to cover them. Flagged for the owner.
 
 wgpu is already handled: the Makefile copies `wgpu_native.dll` next to the binary
 when built with `WGPU_NATIVE_HOME`, and it ships in the same recursive `msys64/`
@@ -132,12 +262,52 @@ bundler **autodetects** the version from the binary's PE import table (pure
 Python, no objdump dependency) rather than hardcoding it. `--inspect` prints what
 the binary needs vs what is staged.
 
+## ⛔ Re-vendoring while an engine is running CORRUPTS the bundle
+
+`pip install --upgrade --target` **rmtrees each existing package directory**
+before reinstalling it. A running `omnisim-bin.exe` holds the bundle's compiled
+extensions open, so on Windows that delete fails *part way through* and leaves a
+package that imports but does not compute. Measured 2026-09-11: **341 files
+removed from the bundle's numpy** before pip hit
+`_umath_linalg.cp312-win_amd64.pyd` and died; the bundle had to be hand-repaired
+from the wheel. The corruption then surfaces later as a confusing `ImportError`
+somewhere unrelated.
+
+This matters because AGENTS.md §0 and §2 tell agents to run
+`make -C src/omnisim bundle-newton-runtime` as a bootstrap step. So the bundler
+now **refuses by default**:
+
+```
+$ python scripts/packaging/bundle_newton_runtime.py
+REFUSING to re-vendor the bundle: omnisim-bin is running.
+    omnisim-bin.exe pid 8260
+    omnisim-bin.exe pid 15328
+...
+Override only if you are certain: --allow-running-engines
+```
+
+The check runs before anything writes to the bundle. If processes cannot be
+enumerated at all it warns loudly rather than silently proceeding. Stop the
+engines and re-run — do **not** kill an `omnisim-bin` you did not spawn.
+
+`pip_install(..., upgrade=False)` is the surgical path (`--no-deps`, no rmtree)
+for adding one package to an otherwise-good bundle.
+
 ## Verification
 
 - `--verify` (also run by `make bundle-newton-runtime`) launches the **staged**
   interpreter under a scrubbed environment (no `PYTHONPATH`/`PYTHONHOME`, reduced
-  `PATH`, `PYTHONNOUSERSITE=1`) and asserts `import warp, newton` succeed — i.e.
+  `PATH`, `PYTHONNOUSERSITE=1`) and asserts `VERIFY_IMPORTS` succeed — i.e.
   it proves the clean-box story on the build box.
+- It then runs `INTEGRITY_PROBES`, which **exercise the compiled extensions**
+  rather than only importing names: `numpy.linalg.det` and `.inv` (both route
+  through `_umath_linalg`, the exact `.pyd` that was locked in the incident
+  above) and `numpy.fft` (`_pocketfft_umath`). A half-deleted package imports
+  fine and computes nothing, so name-only verification cannot see it — and
+  `numpy` was not even in `VERIFY_IMPORTS` until 2026-09-11. On failure the
+  bundler says the bundle is **DAMAGED** and how to repair it, instead of
+  emitting a generic import error that sends the next person hunting their own
+  environment.
 - `--verify-binary` additionally runs `omnisim-bin.exe` on the Newton smoke world
   and checks for the `[OmNewtonBackend]` runtime-up line (the same signal the
   pre-push gate's `--require-newton` uses).

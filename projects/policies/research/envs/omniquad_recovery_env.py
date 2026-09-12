@@ -42,7 +42,9 @@ from gymnasium import spaces
 
 
 REPO_ROOT = next(_p for _p in Path(__file__).resolve().parents if (_p / "projects" / "policies").is_dir() or (_p / "AGENTS.md").exists() or (_p / ".git").exists())
-WORLD_PATH = REPO_ROOT / "projects" / "rl" / "worlds" / "omniquad_recovery_train.omniworld"
+# PATH: `projects/rl` was renamed to `projects/policies/research` by 1b668a910;
+# the old path failed SILENTLY here (2026-09-11).
+WORLD_PATH = REPO_ROOT / "projects" / "policies" / "research" / "worlds" / "omniquad_recovery_train.omniworld"
 OMNISIM_BIN = REPO_ROOT / "msys64" / "mingw64" / "bin" / "omnisim-bin.exe"
 TMP_DIR = Path(r"C:\tmp\omnisim_rl_rec")
 

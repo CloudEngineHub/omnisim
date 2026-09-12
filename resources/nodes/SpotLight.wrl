@@ -2,6 +2,7 @@
 # The light emitted by a SpotLight (or other light sources) can be detected by a LightSensor node.
 
 SpotLight {
+  field SFBool rayTracing TRUE
   w3dField SFFloat ambientIntensity 0         # [0,1]
   w3dField SFVec3f attenuation      1 0 0     # [0,)
   w3dField SFFloat beamWidth        1.570796  # [0,)

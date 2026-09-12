@@ -12,6 +12,7 @@
     - [Starting OmniSim](starting-omnisim.md)
     - [The User Interface](the-user-interface.md)
     - [The 3D Window](the-3d-window.md)
+    - [Render a Photo](photo-rendering.md)
     - [The Scene Tree](the-scene-tree.md)
     - [The Console](the-console.md)
     - [Preferences](preferences.md)

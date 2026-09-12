@@ -157,10 +157,46 @@ def omnisim_env() -> dict[str, str]:
         # application directory is searched before PATH) and the
         # python312._pth beside that DLL puts sys.path on
         # newton-runtime/{Lib,DLLs,site-packages}. Verified: 22 launches via
-        # scripts/dev/headless_runner.py -- which never puts newton-runtime
-        # on PATH -- all wrote {"backend":"newton","degraded":false,
-        # "finalised":true,"solver":"MuJoCo (cpu/mj_step, ...)"} to
-        # <log>.newton.json.
+        # scripts/dev/headless_runner.py all wrote
+        # {"backend":"newton","degraded":false,"finalised":true,
+        # "solver":"MuJoCo (cpu/mj_step, ...)"} to <log>.newton.json.
+        #
+        # ⚠ THIS TAIL ORDER IS OVERRIDDEN DOWNSTREAM, and the sentence above
+        # used to claim otherwise ("headless_runner.py -- which never puts
+        # newton-runtime on PATH"). That stopped being true on 2026-08-26
+        # (549734211): scripts/dev/headless_runner.py now PREPENDS
+        # newton-runtime and sets PYTHONPATH to its site-packages, and so does
+        # scripts/dev/omnisim_run_agent.py:omnisim_env(). So a controller
+        # started by `run-headless` / `run-agent` runs on the BUNDLED
+        # interpreter regardless of what this function does -- measured
+        # 2026-09-11 with a probe controller: sys.executable =
+        # msys64\mingw64\bin\newton-runtime\python.exe. Consequences live:
+        # onnxruntime was absent from that bundle (fixed the same day by
+        # pinning it in scripts/packaging/newton_runtime_pins.py), and
+        # `omnisim_bridges` -- the very package this tail order was chosen to
+        # protect -- was absent from it too.
+        #
+        # THE omnisim_bridges HALF IS NOW CLOSED, and NOT by vendoring it:
+        # the package is an editable install precisely so edits to it take
+        # effect immediately, and a wheel in the bundle would shadow the tree
+        # with a stale copy. Its canonical source ships in the checkout AND in
+        # the installer (files_core.txt: `packages/omnisim-bridges [recurse]`),
+        # so headless_runner.py and omnisim_run_agent.py now add that src dir
+        # to the controller PYTHONPATH beside the bundle's site-packages, and
+        # every bridge controller ALSO bootstraps the same path for itself
+        # before its first `omnisim_bridges` import -- which covers launch
+        # paths nobody here controls (launch.bat, the installer shortcut).
+        # `python -m omnisim doctor` reports it as the `bridges` row.
+        #
+        # SO THE TAIL/PREPEND SPLIT NO LONGER DECIDES WHETHER A BRIDGE WORKS.
+        # It still decides WHICH interpreter a controller gets, and therefore
+        # what else is importable (the bundle has numpy/warp/newton/onnxruntime
+        # and no system site-packages; the system python is whatever the
+        # developer installed). Anything reasoning about which interpreter a
+        # controller gets must read headless_runner.py too, not this comment
+        # alone. The ordering itself is deliberately UNCHANGED -- see
+        # docs/developer/newton-runtime-bundle.md, "Which interpreter does a
+        # controller get?", for the evidence and the open recommendation.
         #
         # Kept on the TAIL for its one real service: a box with no system
         # Python still resolves an interpreter, so controllers start

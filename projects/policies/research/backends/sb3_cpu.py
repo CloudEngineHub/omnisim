@@ -51,7 +51,9 @@ class Sb3CpuBackend:
 
         # The OmniQuadEnv lives in projects/policies/research/envs/omniquad_env.py. For
         # non-OmniQuad robots, a similar gym env should be plugged in.
-        sys.path.insert(0, str(REPO_ROOT / "projects" / "rl" / "envs"))
+        # PATH: `projects/rl` was renamed to `projects/policies/research` by 1b668a910;
+        # the old path failed SILENTLY here (2026-09-11).
+        sys.path.insert(0, str(REPO_ROOT / "projects" / "policies" / "research" / "envs"))
         from omniquad_env import OmniQuadEnv
 
         # OmniQuad is the only robot the sb3 backend supports today (the gym
@@ -145,7 +147,9 @@ class Sb3CpuBackend:
 
     def export_onnx(self, ckpt, out, robot):
         # Reuse the existing onnx exporter logic.
-        sys.path.insert(0, str(REPO_ROOT / "projects" / "rl" / "inference"))
+        # PATH: `projects/rl` was renamed to `projects/policies/research` by 1b668a910;
+        # the old path failed SILENTLY here (2026-09-11).
+        sys.path.insert(0, str(REPO_ROOT / "projects" / "policies" / "research" / "inference"))
         from export_onnx import OnnxablePolicy  # type: ignore
         import torch
         import numpy as np

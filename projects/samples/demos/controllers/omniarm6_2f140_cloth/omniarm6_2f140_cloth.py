@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""OMNIARM6 + Robotiq 2F-140 pick & place -- held by CONTACT FRICTION, nothing else.
+"""OMNIARM6 + 140 mm two-finger gripper pick & place -- held by CONTACT FRICTION,
+nothing else.
 
 Sibling of omniarm6_real_pick_place (the 2F-85 version). Same honesty rules, same
 contact census, different gripper -- and the differences are not cosmetic, so
@@ -24,12 +25,27 @@ would work with the fingers wide open, for ever. This controller never calls
 act_grasp, never writes the block's pose, and never creates a weld. If the
 contact physics stops holding, the block falls.
 
-THE GRIPPER. omniarm6_2f140_grip.urdf: every <visual> is the customer's CAD
-(3d_models/2F-140_Assy_Open_20191022.STEP via scripts/dev/step_to_urdf.py) and
-the collision is TEN axis-aligned boxes -- a gripper-body box, and per jaw two
-pad halves, a fingertip bracket and the four-bar arm. The pad's inner face is at
-exactly |q| by construction, so every number below is a real distance on the
-grasp axis and not a joint reading that needs decoding.
+THE GRIPPER. omniarm6_2f140_grip.urdf is OmniSim's OWN model of a 140 mm
+two-finger parallel gripper, not a manufacturer's product model. Every <visual>
+is primitive geometry authored in this repository (boxes and cylinders, no mesh
+or CAD file of any kind) and the collision is TEN hand-authored axis-aligned
+boxes -- a gripper-body box, and per jaw two pad halves, a fingertip bracket and
+the four-bar arm. The pad's inner face is at exactly |q| by construction, so
+every number below is a real distance on the grasp axis and not a joint reading
+that needs decoding.
+
+⚠ CORRECTED 2026-09-11. This paragraph used to say every <visual> was "the
+customer's CAD (3d_models/2F-140_Assy_Open_20191022.STEP via
+scripts/dev/step_to_urdf.py)". That stopped being true on 2026-08-22 and it was
+wrong in the risky direction -- it claimed third-party CAD lineage for geometry
+that is entirely ours. See projects/robots/robotiq/PROVENANCE.md.
+
+⚠ NAMING. `2f140` throughout this file (filenames, link names, device names,
+gripper-config ids) is a SIZE/CLASS identifier -- a 140 mm stroke, two-finger
+parallel gripper -- kept stable for the worlds and bridges that reference it.
+It is not a product name. Where a manufacturer's name or datasheet figure
+appears below it is used nominatively, to state which class of real hardware
+this model stands in for.
 
 THE CONTROL LAW. Size the jaws to the part before the arm moves, reach, drop,
 close once to 10 mm of interference, verify by contact, lift, carry, place --

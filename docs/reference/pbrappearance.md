@@ -5,6 +5,10 @@ PBRAppearance {
   SFColor  baseColor            1 1 1             # any color
   SFNode   baseColorMap         NULL              # {ImageTexture, PROTO}
   SFFloat  transparency         0                 # [0, 1]
+  SFBool   refraction           FALSE             # solid glass in Photo mode
+  SFFloat  indexOfRefraction    1.5               # [1, 4]
+  SFColor  attenuationColor     1 1 1             # transmitted fraction
+  SFFloat  attenuationDistance  1                 # metres, positive
   SFFloat  roughness            0                 # [0, 1]
   SFNode   roughnessMap         NULL              # {ImageTexture, PROTO}
   SFFloat  metalness            1                 # [0, 1]
@@ -17,6 +21,7 @@ PBRAppearance {
   SFColor  emissiveColor        0 0 0             # any color
   SFNode   emissiveColorMap     NULL              # {ImageTexture, PROTO}
   SFFloat  emissiveIntensity    1                 # [0, inf)
+  SFBool   emissiveTwoSided     TRUE              # Photo / OmniLight emission
   SFNode   textureTransform     NULL              # {TextureTransform, PROTO}
   SFString name                 "PBRAppearance"   # any string
 }
@@ -62,6 +67,14 @@ Note: it is encouraged to use either 1 or 0 for this value as no real-world mate
 - The `emissiveColor` field specifies the emissive color of the material's surface  (as if the surface emits light), analogous to the `emissiveColor` field of the [Material](material.md) node.
 - The `emissiveColorMap` field specifies an [ImageTexture](imagetexture.md) for the material's emissive color which overrides `emissiveColor`.
 - The `emissiveIntensity` field is used as an intensity multiplier on the emissive color, to express different emissive brightness levels.
+
+- `refraction TRUE` enables smooth solid dielectric transport in the optional
+  [Photo renderer](../guide/photo-rendering.md). Use closed, outward-facing
+  geometry. `indexOfRefraction` controls bending and Fresnel reflection;
+  `attenuationColor` gives transmission through `attenuationDistance` metres of
+  the material. Thickness is measured from geometry. The live view still uses
+  alpha blending. `emissiveTwoSided FALSE` emits only from the front face in
+  Photo and OmniLight, for example on an `OmniSimAreaLight` panel.
 - The `textureTransform` field contains a [TextureTransform](texturetransform.md) node.
 If `textureTransform` is NULL, the `textureTransform` field has no effect.
 Otherwise, the [TextureTransform](texturetransform.md) is applied to all textures in the [PBRAppearance](#pbrappearance) node when shading the object.

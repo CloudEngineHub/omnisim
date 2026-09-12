@@ -24,7 +24,9 @@ How it finds its policy + spec:
   1. Env var `OMNISIM_POLICY_ONNX` -> path to policy.onnx
   2. Fallback: world's controllerArgs `--policy <path>`
   3. Fallback: `projects/policies/research/inference/policies/omniquad_ppo_main/policy.onnx`
-     (the canonical shipped OmniQuad policy)
+     (the canonical export slot -- gitignored; eval_policy.py copies here)
+  4. Fallback: `projects/policies/research/policies/omniquad_ppo_main/policy.onnx`
+     (the TRACKED copy of the same policy -- the only one a clean clone has)
 
 The matching `robot_spec.json` is assumed to live in the same
 directory as the policy. Backends write it during ONNX export.
@@ -210,15 +212,27 @@ def _parse_args():
     return args
 
 
-def find_policy(cli_args) -> Path:
+def find_policy(cli_args, tried=None) -> Path:
     candidates = []
     if cli_args.policy:
         candidates.append(Path(cli_args.policy))
     env = os.environ.get("OMNISIM_POLICY_ONNX") or os.environ.get("OMNIQUAD_POLICY_ONNX")
     if env:
         candidates.append(Path(env))
-    candidates.append(REPO_ROOT / "projects" / "rl" / "inference" / "policies"
+    # PATH: `projects/rl` was renamed to `projects/policies/research` by
+    # 1b668a910. Every candidate ahead of this one is opt-in (--policy, an env
+    # var), so the dead entry was the EFFECTIVE default: the normal way to run
+    # this controller returned a path that could not exist (2026-09-11).
+    # Two live entries now: the gitignored export slot eval_policy.py copies
+    # into, then the TRACKED copy of the same policy (the legacy omniquad
+    # policies were archived to research/policies/ on 2026-06-26, see
+    # .gitignore) -- the only one a clean clone actually has.
+    candidates.append(REPO_ROOT / "projects" / "policies" / "research" / "inference"
+                      / "policies" / "omniquad_ppo_main" / "policy.onnx")
+    candidates.append(REPO_ROOT / "projects" / "policies" / "research" / "policies"
                       / "omniquad_ppo_main" / "policy.onnx")
+    if tried is not None:
+        tried.extend(candidates)
     for c in candidates:
         if c.exists():
             return c
@@ -233,7 +247,10 @@ def find_spec(cli_args, policy_path: Path) -> Path:
     if env:
         candidates.append(Path(env))
     candidates.append(policy_path.parent / "robot_spec.json")
-    candidates.append(REPO_ROOT / "projects" / "rl" / "inference" / "policies"
+    # PATH: see find_policy() above -- same rename, same two live locations.
+    candidates.append(REPO_ROOT / "projects" / "policies" / "research" / "inference"
+                      / "policies" / "omniquad_ppo_main" / "robot_spec.json")
+    candidates.append(REPO_ROOT / "projects" / "policies" / "research" / "policies"
                       / "omniquad_ppo_main" / "robot_spec.json")
     for c in candidates:
         if c.exists():
@@ -246,7 +263,9 @@ def _read_velocity_command():
     vy = float(os.environ.get("OMNISIM_VY") or os.environ.get("OMNIQUAD_VY", 0.0))
     wz = float(os.environ.get("OMNISIM_WZ") or os.environ.get("OMNIQUAD_WZ", 0.0))
     try:
-        cmd_file = REPO_ROOT / "projects" / "rl" / "inference" / "current_command.txt"
+        # PATH: `projects/rl` -> `projects/policies/research` (1b668a910); the
+        # dead path meant this sentinel was never found (2026-09-11).
+        cmd_file = REPO_ROOT / "projects" / "policies" / "research" / "inference" / "current_command.txt"
         if cmd_file.exists():
             lines = cmd_file.read_text().strip().splitlines()
             if len(lines) >= 3:
@@ -260,9 +279,19 @@ def main() -> int:
     _boot("main starting")
     _boot(f"argv={sys.argv} cwd={os.getcwd()}")
     cli = _parse_args()
-    policy_path = find_policy(cli)
+    _tried: list = []
+    policy_path = find_policy(cli, tried=_tried)
     if not policy_path.exists():
-        msg = f"[rl_deploy] ERROR: policy not found at {policy_path}\n"
+        # Name EVERY path tried and the interpreter that tried them: the engine
+        # spawns a different python per controller (resolved from PATH), so an
+        # error naming neither sends the operator to the wrong interpreter and
+        # the wrong directory (2026-09-11).
+        msg = ("[rl_deploy] ERROR: no policy found. Tried:\n"
+               + "".join(f"    {c}\n" for c in _tried)
+               + f"  controller interpreter: {sys.executable}\n"
+               + "  (the ENGINE spawns that python from PATH -- it is NOT the one\n"
+                 "   `python -m omnisim` runs)\n"
+               + "  Pass --policy, or set OMNISIM_POLICY_ONNX / OMNIQUAD_POLICY_ONNX.\n")
         sys.stderr.write(msg)
         _boot(msg.rstrip("\n"))
         return 1

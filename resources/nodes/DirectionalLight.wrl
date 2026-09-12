@@ -3,6 +3,7 @@
 # If you want to model a light bulb you should rather use a PointLight or a SpotLight node.
 
 DirectionalLight {
+  field SFBool rayTracing TRUE
   w3dField SFFloat ambientIntensity 0
   w3dField SFColor color            1 1 1
   w3dField SFVec3f direction        0 0 -1

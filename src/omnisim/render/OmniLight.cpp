@@ -15,6 +15,7 @@
 // the design contract. Pure std; no Qt, no GPU — runs entirely on a worker thread.
 
 #include "OmniLight.hpp"
+#include "OmTrace.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -25,200 +26,7 @@
 
 namespace {
 
-struct V3 {
-  float x = 0, y = 0, z = 0;
-};
-static inline V3 v3(const float *p) { return {p[0], p[1], p[2]}; }
-static inline V3 sub(V3 a, V3 b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
-static inline V3 add(V3 a, V3 b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
-static inline V3 mul(V3 a, float s) { return {a.x * s, a.y * s, a.z * s}; }
-static inline float dot(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
-static inline V3 cross(V3 a, V3 b) {
-  return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
-}
-static inline V3 norm(V3 a) {
-  const float l = std::sqrt(dot(a, a));
-  return l > 1e-12f ? mul(a, 1.0f / l) : V3{0, 0, 1};
-}
-
-// ---- BVH (median split on the longest axis, leaf <= 4 tris, iterative stack traversal) ----
-
-struct BvhNode {
-  float bmin[3], bmax[3];
-  int32_t left = -1;    // internal: left child (right = left + 1 is NOT used; explicit right)
-  int32_t right = -1;
-  int32_t first = 0;    // leaf: first tri index (into order)
-  int32_t count = 0;    // leaf: tri count (0 = internal)
-};
-
-struct Bvh {
-  std::vector<BvhNode> nodes;
-  std::vector<uint32_t> order;  // triangle indices, leaf-contiguous
-  const std::vector<OmniLightTriangle> *tris = nullptr;
-};
-
-static void triBounds(const OmniLightTriangle &t, float mn[3], float mx[3]) {
-  for (int k = 0; k < 3; ++k) {
-    mn[k] = std::min({t.v0[k], t.v1[k], t.v2[k]});
-    mx[k] = std::max({t.v0[k], t.v1[k], t.v2[k]});
-  }
-}
-
-static int buildNode(Bvh &b, std::vector<float> &cent, int first, int count) {
-  BvhNode node;
-  node.bmin[0] = node.bmin[1] = node.bmin[2] = 3.4e38f;
-  node.bmax[0] = node.bmax[1] = node.bmax[2] = -3.4e38f;
-  for (int i = first; i < first + count; ++i) {
-    float mn[3], mx[3];
-    triBounds((*b.tris)[b.order[i]], mn, mx);
-    for (int k = 0; k < 3; ++k) {
-      node.bmin[k] = std::min(node.bmin[k], mn[k]);
-      node.bmax[k] = std::max(node.bmax[k], mx[k]);
-    }
-  }
-  const int idx = static_cast<int>(b.nodes.size());
-  b.nodes.push_back(node);
-  if (count <= 4) {
-    b.nodes[idx].first = first;
-    b.nodes[idx].count = count;
-    return idx;
-  }
-  int axis = 0;
-  float ext[3] = {node.bmax[0] - node.bmin[0], node.bmax[1] - node.bmin[1],
-                  node.bmax[2] - node.bmin[2]};
-  if (ext[1] > ext[axis])
-    axis = 1;
-  if (ext[2] > ext[axis])
-    axis = 2;
-  const int mid = first + count / 2;
-  std::nth_element(b.order.begin() + first, b.order.begin() + mid, b.order.begin() + first + count,
-                   [&](uint32_t a, uint32_t c) { return cent[a * 3 + axis] < cent[c * 3 + axis]; });
-  const int l = buildNode(b, cent, first, mid - first);
-  const int r = buildNode(b, cent, mid, first + count - mid);
-  b.nodes[idx].left = l;
-  b.nodes[idx].right = r;
-  b.nodes[idx].count = 0;
-  return idx;
-}
-
-static void buildBvh(Bvh &b, const std::vector<OmniLightTriangle> &tris) {
-  b.tris = &tris;
-  const size_t n = tris.size();
-  b.order.resize(n);
-  std::vector<float> cent(n * 3);
-  for (size_t i = 0; i < n; ++i) {
-    b.order[i] = static_cast<uint32_t>(i);
-    for (int k = 0; k < 3; ++k)
-      cent[i * 3 + k] = (tris[i].v0[k] + tris[i].v1[k] + tris[i].v2[k]) / 3.0f;
-  }
-  b.nodes.reserve(n / 2 + 8);
-  if (n)
-    buildNode(b, cent, 0, static_cast<int>(n));
-}
-
-struct Hit {
-  float t = 3.4e38f;
-  uint32_t tri = 0;
-  bool backface = false;
-  bool ok = false;
-};
-
-static inline bool aabbHit(const BvhNode &nd, V3 o, V3 invD, float tMax) {
-  float t0 = 0.0f, t1 = tMax;
-  const float *ov = &o.x;
-  const float *iv = &invD.x;
-  for (int k = 0; k < 3; ++k) {
-    const float ta = (nd.bmin[k] - ov[k]) * iv[k];
-    const float tb = (nd.bmax[k] - ov[k]) * iv[k];
-    t0 = std::max(t0, std::min(ta, tb));
-    t1 = std::min(t1, std::max(ta, tb));
-  }
-  return t0 <= t1;
-}
-
-static Hit trace(const Bvh &b, V3 o, V3 d, float tMax, bool anyHit) {
-  Hit h;
-  if (b.nodes.empty())
-    return h;
-  const V3 invD = {1.0f / (std::abs(d.x) > 1e-12f ? d.x : copysignf(1e-12f, d.x)),
-                   1.0f / (std::abs(d.y) > 1e-12f ? d.y : copysignf(1e-12f, d.y)),
-                   1.0f / (std::abs(d.z) > 1e-12f ? d.z : copysignf(1e-12f, d.z))};
-  int stack[64];
-  int sp = 0;
-  stack[sp++] = 0;
-  while (sp) {
-    const BvhNode &nd = b.nodes[stack[--sp]];
-    if (!aabbHit(nd, o, invD, std::min(tMax, h.t)))
-      continue;
-    if (nd.count) {
-      for (int i = nd.first; i < nd.first + nd.count; ++i) {
-        const OmniLightTriangle &tr = (*b.tris)[b.order[i]];
-        // Moller-Trumbore
-        const V3 e1 = sub(v3(tr.v1), v3(tr.v0));
-        const V3 e2 = sub(v3(tr.v2), v3(tr.v0));
-        const V3 pv = cross(d, e2);
-        const float det = dot(e1, pv);
-        if (std::abs(det) < 1e-9f)
-          continue;
-        const float inv = 1.0f / det;
-        const V3 tv = sub(o, v3(tr.v0));
-        const float u = dot(tv, pv) * inv;
-        if (u < 0.0f || u > 1.0f)
-          continue;
-        const V3 qv = cross(tv, e1);
-        const float vv = dot(d, qv) * inv;
-        if (vv < 0.0f || u + vv > 1.0f)
-          continue;
-        const float t = dot(e2, qv) * inv;
-        if (t > 1e-4f && t < std::min(tMax, h.t)) {
-          h.t = t;
-          h.tri = b.order[i];
-          h.backface = det < 0.0f;
-          h.ok = true;
-          if (anyHit)
-            return h;
-        }
-      }
-    } else if (sp < 62) {
-      stack[sp++] = nd.left;
-      stack[sp++] = nd.right;
-    }
-  }
-  return h;
-}
-
-// ---- deterministic per-probe RNG (PCG32-flavoured) ----
-struct Rng {
-  uint64_t state;
-  explicit Rng(uint64_t seed) : state(seed * 6364136223846793005ULL + 1442695040888963407ULL) {}
-  float next() {  // [0,1)
-    state = state * 6364136223846793005ULL + 1442695040888963407ULL;
-    const uint32_t xorshifted = static_cast<uint32_t>(((state >> 18u) ^ state) >> 27u);
-    const uint32_t rot = static_cast<uint32_t>(state >> 59u);
-    const uint32_t r = (xorshifted >> rot) | (xorshifted << ((0u - rot) & 31u));
-    return (r >> 8) * (1.0f / 16777216.0f);
-  }
-};
-
-static V3 sphereDir(int i, int n, float j1, float j2) {
-  // Fibonacci sphere with per-probe jitter — stratified, deterministic.
-  const float golden = 2.39996323f;
-  const float z = 1.0f - 2.0f * ((i + j1) / n);
-  const float r = std::sqrt(std::max(0.0f, 1.0f - z * z));
-  const float phi = i * golden + j2 * 6.2831853f;
-  return {r * std::cos(phi), r * std::sin(phi), z};
-}
-
-static V3 cosineDir(V3 n, float u1, float u2) {
-  const float r = std::sqrt(u1);
-  const float phi = 6.2831853f * u2;
-  V3 t = std::abs(n.z) < 0.9f ? V3{0, 0, 1} : V3{1, 0, 0};
-  const V3 b1 = norm(cross(t, n));
-  const V3 b2 = cross(n, b1);
-  const V3 d = add(add(mul(b1, r * std::cos(phi)), mul(b2, r * std::sin(phi))),
-                   mul(n, std::sqrt(std::max(0.0f, 1.0f - u1))));
-  return norm(d);
-}
+using namespace OmTrace;
 
 static uint16_t toHalf(float f) {
   // round-to-nearest float -> half, clamped to half range (no NaN/inf inputs expected)
@@ -270,7 +78,7 @@ static V3 localLightsAt(const TraceCtx &c, V3 hp, V3 n, const OmniLightMaterial 
     const Hit sh = trace(*c.bvh, hp, dir, dist - 1e-3f, true);
     if (sh.ok)
       continue;  // occluded — the whole point
-    const float f = ndl * att * c.p->localScale;
+    const float f = ndl * att * (gl.physical?1.0f/3.14159265f:c.p->localScale);
     L = add(L, {m.albedoLin[0] * gl.colorLin[0] * f, m.albedoLin[1] * gl.colorLin[1] * f,
                 m.albedoLin[2] * gl.colorLin[2] * f});
   }
@@ -293,11 +101,13 @@ static V3 radiance(const TraceCtx &c, V3 o, V3 d, int bounces, Rng &rng) {
   const OmniLightTriangle &tr = (*c.tris)[h.tri];
   const OmniLightMaterial &m = (*c.mats)[tr.material];
   V3 n = norm(cross(sub(v3(tr.v1), v3(tr.v0)), sub(v3(tr.v2), v3(tr.v0))));
+  const bool emissionVisible=m.emissiveTwoSided || dot(n,d)<0;
   if (dot(n, d) > 0.0f)
     n = mul(n, -1.0f);  // face the ray
   const V3 hp = add(o, mul(d, h.t));
   const V3 hpo = add(hp, mul(n, 1e-3f));
   V3 L = {m.emissiveLin[0], m.emissiveLin[1], m.emissiveLin[2]};
+  if (!emissionVisible) L={0,0,0};
   // direct sun at the hit (one shadow ray)
   const float ndl = dot(n, c.sunTo);
   if (ndl > 0.0f) {
@@ -384,6 +194,7 @@ bool omniLightBake(const std::vector<OmniLightTriangle> &tris,
   auto worker = [&]() {
     const int rays = std::max(16, p.raysPerProbe);
     for (;;) {
+      if (p.cancel && p.cancel->load(std::memory_order_relaxed)) return;
       const int pi = nextProbe.fetch_add(1);
       if (pi >= probeCount)
         return;
@@ -458,10 +269,11 @@ bool omniLightBake(const std::vector<OmniLightTriangle> &tris,
     pool.emplace_back(worker);
   for (auto &th : pool)
     th.join();
+  if (p.cancel && p.cancel->load(std::memory_order_relaxed)) return false;
   out.bakeSeconds = std::chrono::duration<double>(clock::now() - t1).count();
   out.validProbes = validCount.load();
 
-  // ---- specular probe: one path-traced cubemap at the scene's airy centre ----
+  // ---- specular captures: one broad probe plus up to three local probes ----
   {
     // AABB (unpadded scene bounds recovered from the padded grid extents)
     for (int k = 0; k < 3; ++k) {
@@ -472,12 +284,42 @@ bool omniLightBake(const std::vector<OmniLightTriangle> &tris,
     out.cubeCenter[2] = out.aabbMin[2] + 0.35f * (out.aabbMax[2] - out.aabbMin[2]);
     const int S = 64;
     out.cubeSize = S;
+    std::vector<V3> centers{v3(out.cubeCenter)};
+    for (const auto &position:p.reflectionPositions) {
+      if (centers.size()==4) break;
+      const V3 point=v3(position.data());
+      bool duplicate=false;
+      for (V3 other:centers) if (dot(sub(point,other),sub(point,other))<0.25f) duplicate=true;
+      if (!duplicate) centers.push_back(point);
+    }
+    out.cubeCount=static_cast<int>(centers.size());
+    auto cubeDirection=[](int face,float u,float v) {
+      switch(face) {
+        case 0:return norm(V3{1,-v,-u}); case 1:return norm(V3{-1,-v,u});
+        case 2:return norm(V3{u,1,v}); case 3:return norm(V3{u,-1,-v});
+        case 4:return norm(V3{u,-v,1}); default:return norm(V3{-u,-v,-1});
+      }
+    };
+    for (size_t probe=0;probe<centers.size();++probe) {
+    const V3 cc=centers[probe];
+    for (int k=0;k<3;++k) {
+      out.cubeCenters.push_back((&cc.x)[k]);
+      float lo=std::min(out.aabbMin[k],(&cc.x)[k]-0.1f), hi=std::max(out.aabbMax[k],(&cc.x)[k]+0.1f);
+      if (probe>0) {
+        V3 direction{}; (&direction.x)[k]=1;
+        const Hit positive=trace(bvh,cc,direction,hi-(&cc.x)[k],false);
+        const Hit negative=trace(bvh,cc,mul(direction,-1),(&cc.x)[k]-lo,false);
+        if (positive.ok && positive.t>0.1f) hi=(&cc.x)[k]+positive.t;
+        if (negative.ok && negative.t>0.1f) lo=(&cc.x)[k]-negative.t;
+      }
+      out.cubeBoundsMin.push_back(lo); out.cubeBoundsMax.push_back(hi);
+    }
     std::vector<float> face0(static_cast<size_t>(S) * S * 6 * 3);
-    const V3 cc = v3(out.cubeCenter);
     std::atomic<int> nextT2(0);
     TraceCtx cctx = ctx;
     auto cubeTrace = [&]() {
       for (;;) {
+        if (p.cancel && p.cancel->load(std::memory_order_relaxed)) return;
         const int ti = nextT2.fetch_add(1);
         if (ti >= S * S * 6)
           return;
@@ -507,32 +349,17 @@ bool omniLightBake(const std::vector<OmniLightTriangle> &tris,
       cpool.emplace_back(cubeTrace);
     for (auto &th : cpool)
       th.join();
-    // 3 mips (S, S/4, S/16), box-filtered — the roughness ladder for the runtime lookup.
-    const int S1 = S / 4, S2 = S / 16;
-    auto boxDown = [](const std::vector<float> &src, int ss, std::vector<float> &dst, int ds) {
-      dst.assign(static_cast<size_t>(ds) * ds * 6 * 3, 0.0f);
-      const int f = ss / ds;
-      for (int face = 0; face < 6; ++face)
-        for (int y = 0; y < ds; ++y)
-          for (int x = 0; x < ds; ++x) {
-            double acc[3] = {0, 0, 0};
-            for (int sy = 0; sy < f; ++sy)
-              for (int sx = 0; sx < f; ++sx) {
-                const size_t si =
-                  ((static_cast<size_t>(face) * ss + (y * f + sy)) * ss + (x * f + sx)) * 3;
-                acc[0] += src[si];
-                acc[1] += src[si + 1];
-                acc[2] += src[si + 2];
-              }
-            const size_t di = ((static_cast<size_t>(face) * ds + y) * ds + x) * 3;
-            dst[di] = static_cast<float>(acc[0] / (f * f));
-            dst[di + 1] = static_cast<float>(acc[1] / (f * f));
-            dst[di + 2] = static_cast<float>(acc[2] / (f * f));
-          }
+    if (p.cancel && p.cancel->load(std::memory_order_relaxed)) return false;
+    auto sampleCube=[&](V3 d) {
+      const float ax=std::abs(d.x),ay=std::abs(d.y),az=std::abs(d.z);
+      float u,v,major; int face;
+      if (ax>=ay && ax>=az) { face=d.x>=0?0:1; major=ax; u=d.x>=0?-d.z:d.z; v=-d.y; }
+      else if (ay>=az) { face=d.y>=0?2:3; major=ay; u=d.x; v=d.y>=0?d.z:-d.z; }
+      else { face=d.z>=0?4:5; major=az; u=d.z>=0?d.x:-d.x; v=-d.y; }
+      const int x=std::clamp(static_cast<int>((u/major*0.5f+0.5f)*S),0,S-1);
+      const int y=std::clamp(static_cast<int>((v/major*0.5f+0.5f)*S),0,S-1);
+      return v3(&face0[((face*S+y)*S+x)*3]);
     };
-    std::vector<float> face1, face2;
-    boxDown(face0, S, face1, S1);
-    boxDown(face1, S1, face2, S2);
     auto packHalf = [&](const std::vector<float> &src, int ss) {
       for (size_t i = 0; i < static_cast<size_t>(ss) * ss * 6; ++i) {
         out.cubeTexels.push_back(toHalf(src[i * 3]));
@@ -541,10 +368,32 @@ bool omniLightBake(const std::vector<OmniLightTriangle> &tris,
         out.cubeTexels.push_back(toHalf(1.0f));
       }
     };
-    out.cubeTexels.reserve((static_cast<size_t>(S) * S + S1 * S1 + S2 * S2) * 6 * 4);
     packHalf(face0, S);
-    packHalf(face1, S1);
-    packHalf(face2, S2);
+    // GGX importance prefiltering, with roughness=mip/6. A full 64..1 chain
+    // represents the complete roughness range instead of box-blurred mirrors.
+    for (int mip=1,ms=S/2;ms>=1;++mip,ms/=2) {
+      std::vector<float> filtered(ms*ms*6*3);
+      const float roughness=mip/6.0f, alpha=roughness*roughness;
+      for (int face=0;face<6;++face) for (int y=0;y<ms;++y) for (int x=0;x<ms;++x) {
+        if (p.cancel && p.cancel->load()) return false;
+        const V3 n=cubeDirection(face,(x+0.5f)/ms*2-1,(y+0.5f)/ms*2-1);
+        const V3 tangent=norm(cross(std::abs(n.z)<0.9f?V3{0,0,1}:V3{1,0,0},n));
+        V3 sum; float weight=0;
+        Rng rng(0xB076159AULL ^ (face*ms*ms+y*ms+x));
+        for (int sample=0;sample<64;++sample) {
+          const float u=(sample+0.5f)/64, phi=6.2831853f*rng.next();
+          const float c=std::sqrt((1-u)/(1+(alpha*alpha-1)*u)), r=std::sqrt(std::max(0.0f,1-c*c));
+          const V3 h=norm(add(add(mul(tangent,r*std::cos(phi)),mul(cross(n,tangent),r*std::sin(phi))),mul(n,c)));
+          const V3 l=sub(mul(h,2*dot(n,h)),n); const float nl=std::max(0.0f,dot(n,l));
+          sum=add(sum,mul(sampleCube(l),nl)); weight+=nl;
+        }
+        const V3 value=mul(sum,1/std::max(weight,1e-8f));
+        const int i=((face*ms+y)*ms+x)*3;
+        filtered[i]=value.x; filtered[i+1]=value.y; filtered[i+2]=value.z;
+      }
+      packHalf(filtered,ms);
+    }
+    }
   }
 
   out.valid = out.validProbes > 0;

@@ -77,14 +77,20 @@ TRAPS this encodes (all measured, all cost real time before being understood)
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack, contextmanager
+import hashlib
 import json
 import os
+from pathlib import Path
+import re
 import subprocess
 import sys
+import tempfile
 import time
-from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
 BIN = REPO / "msys64" / "mingw64" / "bin" / "omnisim-bin.exe"
 if not BIN.exists():  # linux / macos layout
     for cand in (REPO / "bin" / "omnisim-bin", REPO / "Contents" / "MacOS" / "omnisim"):
@@ -101,6 +107,47 @@ def parse_env(pairs):
         k, v = p.split("=", 1)
         out[k] = v
     return out
+
+
+@contextmanager
+def comparison_worlds(world: Path, views_path: str | None):
+    """Temporary camera variants beside the source, preserving relative assets.
+
+    Authored worlds are never edited. The manifest pins the same camera poses
+    for both binaries; a screenshot difference therefore measures rendering.
+    """
+    if views_path is None:
+        yield [(world, world.stem, None)]
+        return
+    from scripts.dev.set_viewpoint import find_viewpoint_block, rewrite_block
+    views = json.loads(Path(views_path).read_text(encoding="utf-8"))["views"]
+    if not views:
+        raise ValueError("view manifest must contain at least one view")
+    source = world.read_text(encoding="utf-8")
+    bounds = find_viewpoint_block(source)
+    if bounds is None:
+        raise ValueError(f"no Viewpoint in {world}")
+    start, end = bounds
+    generated, names = [], set()
+    try:
+        for view in views:
+            name = view["name"]
+            if not re.fullmatch(r"[a-z0-9_-]+", name) or name in names:
+                raise ValueError(f"invalid or duplicate view name: {name!r}")
+            names.add(name)
+            block = rewrite_block(source[start:end], view["orientation"], view["position"],
+                                  view.get("field_of_view"))
+            fd, path = tempfile.mkstemp(prefix=".render_view_", suffix=".omniworld", dir=world.parent)
+            os.close(fd)
+            path = Path(path)
+            generated.append((path, f"{world.stem}__{name}", view))
+            path.write_text(source[:start] + block + source[end:], encoding="utf-8")
+        yield generated
+    finally:
+        for path, _, _ in generated:
+            path.unlink(missing_ok=True)
+            # Only the sidecar belonging to this exact temporary world.
+            path.with_name(f".{path.stem}.omniperspective").unlink(missing_ok=True)
 
 
 def wait_for_complete(path: Path, timeout_s: float) -> bool:
@@ -135,25 +182,43 @@ def render(world: Path, out_png: Path, frame: int, extra_env: dict, log: Path,
     env["OMNISIM_LOG_PATH"] = str(log)
     if report:
         env["OMNISIM_WGPU_REPORT"] = str(report)
+        env.setdefault("OMNISIM_WGPU_REPORT_EVERY", "1")
     env.update(extra_env)
-    for stale in (out_png, log):
-        stale.unlink(missing_ok=True)
+    timing_path = env.get('OMNISIM_WGPU_GPU_TIMING')
+    gpu_report = Path(timing_path) if timing_path and timing_path != '0' else None
+    for stale in (out_png, log, report, gpu_report):
+        if stale is not None:
+            stale.unlink(missing_ok=True)
 
     # Trap 1: windowed, realtime. Anything else never repaints.
-    proc = subprocess.Popen([str(BIN), str(world), "--mode=realtime"], cwd=str(REPO), env=env)
+    binary = Path(env.get("OMNISIM_BINARY", str(BIN)))
+    # A concrete inherited handle avoids Windows console attachment during
+    # embedded-Python startup when the caller itself has no console.
+    with log.with_suffix(log.suffix + ".stdout").open("wb") as output:
+        proc = subprocess.Popen([str(binary), str(world), "--mode=realtime"], cwd=str(REPO),
+                                env=env, stdout=output, stderr=subprocess.STDOUT)
     # Budget generously and RETURN EARLY: wait_for_complete exits the moment the PNG stops
     # growing, so a healthy run costs what it costs and only a broken one pays the ceiling.
     # Measured on machine 9722d23d12a3: world load + first OmniLight bake alone is ~12-16 s
     # before frame 0 of the counter, and --mode=realtime is vsync-paced well under 60 fps, so
     # a naive frame/60 estimate under-waits and reports a false "no frame".
     budget = frame / 25.0 + 20.0 + settle
-    done = wait_for_complete(out_png, budget)
-    time.sleep(1.0)  # let the last write flush before the kill
-    proc.terminate()
     try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
+        done = wait_for_complete(out_png, budget)
+        time.sleep(1.0)  # let the last write flush before the kill
+    finally:
+        if proc.poll() is None and os.name == "nt":
+            # Reap the controllers belonging to this engine too (e.g. the realism
+            # variant's sun marker), never another running OmniSim instance.
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        elif proc.poll() is None:
+            proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
 
     errors = warnings = 0
     if log.exists():
@@ -171,7 +236,88 @@ def render(world: Path, out_png: Path, frame: int, extra_env: dict, log: Path,
                     pass
         if len(vals) > 1:
             render_ms = sorted(vals[1:])[len(vals[1:]) // 2]  # median, skipping frame 0
-    return {"dumped": done, "errors": errors, "warnings": warnings, "render_ms": render_ms}
+    return {"dumped": done, "errors": errors, "warnings": warnings, "render_ms": render_ms,
+            "profile": summarize_profile(report.read_text(errors="replace")) if report and report.exists() else None,
+            "gpu_profile": summarize_gpu_profile(gpu_report.read_text(errors="replace"))
+                           if gpu_report and gpu_report.exists() else [],
+            "binary": str(binary), "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+            "world_sha256": hashlib.sha256(world.read_bytes()).hexdigest(), "environment": extra_env}
+
+
+def summarize_profile(text: str, warmup_frames: int = 60) -> dict | None:
+    """CPU call timings and submitted shadow work; never interpret as GPU time/FPS.
+
+    Skip warm-up frames, and discard repeated frame IDs from stale/appended reports.
+    Older binaries emit no profile rows: unavailable is distinct from zero work.
+    """
+    rows = {}
+    for line in text.splitlines():
+        if " profile " not in line:
+            continue
+        fields = dict(re.findall(r"(\w+)=([-+\d.]+)", line))
+        try:
+            row = {key: float(fields[key]) for key in (
+                "frame", "collectUs", "renderUs", "localShadowUs", "localCandidates",
+                "localDraws", "localFaces", "localReused")}
+        except (KeyError, ValueError):
+            continue
+        if row["frame"] >= warmup_frames:
+            rows[row["frame"]] = row
+    if not rows:
+        return None
+    import math
+    values = list(rows.values())
+    def percentile(key, quantile):
+        ordered = sorted(row[key] for row in values)
+        return ordered[max(0, math.ceil(len(ordered) * quantile) - 1)]
+    result = {"samples": len(values), "warmup_frames": warmup_frames,
+              "timing_scope": "CPU collect/render calls and local-shadow encoding; not GPU timestamps or FPS"}
+    for key in ("collectUs", "renderUs", "localShadowUs", "localCandidates", "localDraws", "localFaces"):
+        result[key] = {"p50": percentile(key, .5), "p95": percentile(key, .95)}
+    result["local_cache_hit_fraction"] = sum(row["localReused"] for row in values) / len(values)
+    return result
+
+
+def summarize_gpu_profile(text: str, warmup_frames: int = 60) -> list[dict]:
+    """GPU timestamp results, separated by render target (main view and sensors).
+
+    Missing/unsupported samples are unavailable, never zero. gpuSpanUs spans the
+    measured render passes; it excludes presentation, physics and CPU work.
+    Group timings sum the passes in that group, so do not add them into FPS.
+    """
+    import math
+    targets = {}
+    for line in text.splitlines():
+        fields = dict(re.findall(r"(\w+)=([^\s]+)", line))
+        try:
+            target = int(fields['target'])
+            if fields.get('status') == 'unavailable':
+                targets.setdefault(target, {})
+                continue
+            frame = int(fields['frame'])
+            row = {key: float(value) for key, value in fields.items() if key.endswith('Us')}
+            width, height = int(fields['width']), int(fields['height'])
+            if ('gpuSpanUs' not in row or not all(math.isfinite(v) and v >= 0 for v in row.values())
+                    or width <= 0 or height <= 0):
+                continue
+        except (KeyError, ValueError):
+            continue
+        if frame >= warmup_frames:
+            targets.setdefault(target, {})[frame] = (width, height, row)
+    result = []
+    for target, frames in sorted(targets.items()):
+        summary = {'target': target, 'samples': len(frames), 'warmup_frames': warmup_frames,
+                   'status': 'available' if frames else 'unavailable'}
+        if frames:
+            dimensions = {(w, h) for w, h, _ in frames.values()}
+            summary['dimensions'] = [list(size) for size in sorted(dimensions)]
+            keys = set().union(*(row.keys() for _, _, row in frames.values()))
+            for key in sorted(keys):
+                values = sorted(row[key] for _, _, row in frames.values() if key in row)
+                summary[key] = {'samples': len(values), 'p50': values[math.ceil(len(values)*.5)-1],
+                                'p95': values[math.ceil(len(values)*.95)-1]}
+        result.append(summary)
+    return result
 
 
 def diff(a_png: Path, b_png: Path, threshold: int) -> dict:
@@ -200,6 +346,7 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--world", action="append", required=True,
                     help="repo-relative or absolute world path (repeatable)")
+    ap.add_argument("--views", help="JSON manifest of named fixed camera positions and orientations")
     ap.add_argument("--arm-a", action="append", default=[], metavar="KEY=VALUE",
                     help="env for arm A (default: none = the shipped default)")
     ap.add_argument("--arm-b", action="append", default=[], metavar="KEY=VALUE",
@@ -218,56 +365,66 @@ def main() -> int:
     ap.add_argument("--json", default=None)
     args = ap.parse_args()
 
-    if not BIN.exists():
-        sys.exit(f"simulator binary not found at {BIN}")
+    env_a, env_b = parse_env(args.arm_a), parse_env(args.arm_b)
+    for arm in ([env_a] if args.no_diff or args.noise_floor else [env_a, env_b]):
+        binary = Path(arm.get("OMNISIM_BINARY", os.environ.get("OMNISIM_BINARY", str(BIN))))
+        if not binary.is_file():
+            sys.exit(f"simulator binary not found at {binary}")
     out_dir = Path(args.out_dir) if args.out_dir else Path(os.environ.get("TEMP", "/tmp")) / "render_ab"
+    # The engine changes cwd while loading a world. Dump/log paths must remain
+    # anchored to the caller's output directory throughout the run.
+    out_dir = out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    env_a, env_b = parse_env(args.arm_a), parse_env(args.arm_b)
     results = []
-    for w in args.world:
-        world = Path(w) if Path(w).is_absolute() else REPO / w
-        if not world.exists():
-            print(f"!! world not found: {world}")
-            results.append({"world": w, "error": "not found"})
-            continue
-        stem = world.stem
-        print(f"== {stem}")
-        row = {"world": w}
-        a_png = out_dir / f"{stem}__A.png"
-        row["arm_a"] = render(world, a_png, args.frame, env_a, out_dir / f"{stem}__A.log",
-                              out_dir / f"{stem}__A.report" if args.perf else None, args.settle)
-        print(f"   arm A: dumped={row['arm_a']['dumped']} errors={row['arm_a']['errors']}"
-              + (f" renderMs={row['arm_a']['render_ms']}" if args.perf else ""))
-        if not args.no_diff:
-            b_png = out_dir / f"{stem}__B.png"
-            # --noise-floor: arm B is arm A again, so the diff IS the run-to-run floor.
-            env_b_eff = dict(env_a) if args.noise_floor else env_b
-            row["arm_b"] = render(world, b_png, args.frame, env_b_eff, out_dir / f"{stem}__B.log",
-                                  out_dir / f"{stem}__B.report" if args.perf else None, args.settle)
-            print(f"   arm B: dumped={row['arm_b']['dumped']} errors={row['arm_b']['errors']}"
-                  + (f" renderMs={row['arm_b']['render_ms']}" if args.perf else ""))
-            if row["arm_a"]["dumped"] and row["arm_b"]["dumped"]:
-                row["diff"] = diff(a_png, b_png, args.threshold)
-                d = row["diff"]
-                if d.get("same_size"):
-                    verdict = "MATCH" if d["pixels_over_threshold"] == 0 else "DIFFERS"
-                    print(f"   diff: {verdict} mean={d['mean_abs']} max={d['max_abs']} "
-                          f"px>{d['threshold']}={d['pixels_over_threshold']}")
-                    row["verdict"] = verdict
+    with ExitStack() as variants:
+        inputs = []
+        for w in args.world:
+            original = Path(w) if Path(w).is_absolute() else REPO / w
+            if not original.exists():
+                print(f"!! world not found: {original}")
+                results.append({"world": w, "error": "not found"})
+                continue
+            for world, stem, view in variants.enter_context(comparison_worlds(original, args.views)):
+                inputs.append((w, world, stem, view))
+        for w, world, stem, view in inputs:
+            print(f"== {stem}")
+            row = {"world": w, "view": view}
+            a_png = out_dir / f"{stem}__A.png"
+            row["arm_a"] = render(world, a_png, args.frame, env_a, out_dir / f"{stem}__A.log",
+                                  out_dir / f"{stem}__A.report" if args.perf else None, args.settle)
+            print(f"   arm A: dumped={row['arm_a']['dumped']} errors={row['arm_a']['errors']}"
+                  + (f" renderMs={row['arm_a']['render_ms']}" if args.perf else ""))
+            if not args.no_diff:
+                b_png = out_dir / f"{stem}__B.png"
+                # --noise-floor: arm B is arm A again, so the diff IS the run-to-run floor.
+                env_b_eff = dict(env_a) if args.noise_floor else env_b
+                row["arm_b"] = render(world, b_png, args.frame, env_b_eff, out_dir / f"{stem}__B.log",
+                                      out_dir / f"{stem}__B.report" if args.perf else None, args.settle)
+                print(f"   arm B: dumped={row['arm_b']['dumped']} errors={row['arm_b']['errors']}"
+                      + (f" renderMs={row['arm_b']['render_ms']}" if args.perf else ""))
+                if row["arm_a"]["dumped"] and row["arm_b"]["dumped"]:
+                    row["diff"] = diff(a_png, b_png, args.threshold)
+                    d = row["diff"]
+                    if d.get("same_size"):
+                        verdict = "MATCH" if d["pixels_over_threshold"] == 0 else "DIFFERS"
+                        print(f"   diff: {verdict} mean={d['mean_abs']} max={d['max_abs']} "
+                              f"px>{d['threshold']}={d['pixels_over_threshold']}")
+                        row["verdict"] = verdict
+                    else:
+                        print(f"   diff: SIZE MISMATCH {d['a_size']} vs {d['b_size']}")
+                        row["verdict"] = "SIZE_MISMATCH"
                 else:
-                    print(f"   diff: SIZE MISMATCH {d['a_size']} vs {d['b_size']}")
-                    row["verdict"] = "SIZE_MISMATCH"
-            else:
-                row["verdict"] = "NO_FRAME"
-                print("   diff: skipped — an arm produced no frame")
-        results.append(row)
+                    row["verdict"] = "NO_FRAME"
+                    print("   diff: skipped — an arm produced no frame")
+            results.append(row)
 
     if args.json:
         Path(args.json).write_text(json.dumps(results, indent=1))
         print(f"\nwrote {args.json}")
     bad = [r for r in results if r.get("verdict") in ("DIFFERS", "NO_FRAME", "SIZE_MISMATCH")
-           or r.get("error")]
+           or r.get("error") or any(not r[arm]["dumped"] or r[arm]["errors"]
+                                    for arm in ("arm_a", "arm_b") if arm in r)]
     print(f"\n{len(results) - len(bad)}/{len(results)} worlds MATCH")
     return 1 if bad else 0
 

@@ -89,13 +89,51 @@ def _env_float(key: str, default: float) -> float:
         return default
 
 
+def missing_dep_advice(exc: BaseException) -> list[str]:
+    """Lines that tell the operator EXACTLY which interpreter is short a package.
+
+    A controller does not run under the interpreter the user typed `python` into:
+    the engine spawns one per controller, resolved from PATH, and under
+    `python -m omnisim run-headless` / `run-agent` that PATH puts the bundled
+    `msys64/mingw64/bin/newton-runtime/python.exe` first. So "pip install
+    onnxruntime" -- what this used to say -- installs it into the wrong
+    interpreter and the controller keeps failing identically. Name the
+    interpreter and hand over a command that targets IT.
+    """
+    lines = []
+    if not isinstance(exc, ImportError):
+        return lines
+    package = getattr(exc, "name", None) or "onnxruntime"
+    exe = Path(sys.executable)
+    lines.append(f"MISSING PACKAGE: {package!r} is not importable by the "
+                 f"interpreter the ENGINE launched this controller with:")
+    lines.append(f"  {exe}")
+    if exe.parent.name == "newton-runtime":
+        # The shipped bundle. It is staged by the packaging script, so pip-ing
+        # into it by hand drifts from the pinned set -- point at the bundler.
+        lines.append("That is OmniSim's BUNDLED controller interpreter. Re-stage it:")
+        lines.append("  make -C src/omnisim bundle-newton-runtime")
+        lines.append(f"or, to patch this clone only: pip install --target "
+                     f"\"{exe.parent / 'site-packages'}\" {package}")
+        lines.append("`python -m omnisim doctor` reports this on the `policies` row.")
+    else:
+        lines.append(f"  \"{exe}\" -m pip install {package}")
+        lines.append("(Installing into any OTHER python will not fix it -- the engine "
+                     "spawns this one, from PATH.)")
+    return lines
+
+
 def find_policy_path() -> Path:
     p = os.environ.get("GO2_POLICY_ONNX") or os.environ.get(
         "OMNISIM_POLICY_ONNX")
     if p:
         return Path(p)
-    return (_REPO / "projects" / "rl" / "inference" / "policies"
-            / "gpu_go2_walk_main" / "policy.onnx")
+    # `projects/rl` was renamed to `projects/policies` by 1b668a910 and this
+    # default was never re-pointed, so the shipped controller silently took the
+    # "policy not found -> BARE gait model" branch on every clean clone: it ran,
+    # it exited 0, and it never loaded the policy it exists to deploy.
+    return (_REPO / "projects" / "policies" / "research" / "inference"
+            / "policies" / "gpu_go2_walk_main" / "policy.onnx")
 
 
 def main() -> int:
@@ -144,14 +182,21 @@ def main() -> int:
             # a mode. Degrading to zero residual here would keep the robot
             # walking on the bare gait model and exit 0, so the run reports PASS
             # while the policy under test never ran. Judge nothing on that.
-            # To run without a policy on purpose, use --bare (the branch below).
+            #
+            # ⚠ There is NO deliberate bare-mode flag. This controller parses no
+            # arguments at all. The bare branch below is reachable only by the
+            # policy being ABSENT -- i.e. by pointing GO2_POLICY_ONNX at a path
+            # that does not exist. (Corrected 2026-09-11: these two messages
+            # used to say "pass --bare", an option that has never existed.)
             say(f"[go2_walk_deploy] FATAL: ONNX policy exists but failed to "
                 f"load ({e}).\n")
             say(f"[go2_walk_deploy] path: {policy_path}\n")
+            for line in missing_dep_advice(e):
+                say("[go2_walk_deploy] " + line + "\n")
             say("[go2_walk_deploy] refusing to run with ZERO residual and "
-                "report it as a policy result. Fix the controller "
-                "interpreter's deps (pip install onnxruntime), or pass --bare "
-                "to run the gait model deliberately.\n")
+                "report it as a policy result. To run the gait model without "
+                "a policy on purpose, point GO2_POLICY_ONNX at a path that "
+                "does not exist -- there is no --bare flag.\n")
             raise SystemExit(2)
     else:
         say(f"[go2_walk_deploy] policy not found at {policy_path}; "

@@ -37,6 +37,7 @@
 #include <array>
 #include <cstddef>
 #include <vector>
+#include <functional>
 
 class OmBaseNode;
 class OmRenderBackend;
@@ -92,6 +93,12 @@ namespace OmWgpuSceneRenderer {
     float localScale[3] = {1.0f, 1.0f, 1.0f};
     bool hasLocalScale = false;
   };
+
+  // Signal-driven invalidation for main-view and sensor draw caches. Geometry,
+  // opacity and castShadows edits must arrive before any cached shadow is reused.
+  // The returned callback disconnects the hooks; Qt connection types stay in the implementation.
+  std::function<void()> watchDrawInputs(const std::vector<OmWgpuDrawRefresh> &refresh, QObject *context,
+                                       const std::function<void()> &invalidate);
 
   // ---- Per-VIEWER node visibility (wb_supervisor_node_set_visibility) ----
   //

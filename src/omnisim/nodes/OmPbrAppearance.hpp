@@ -66,8 +66,15 @@ public:
   OmRgb baseColor() const;
   OmRgb emissiveColor() const;
   double emissiveIntensity() const;
+  bool emissiveTwoSided() const;
   double transparency() const;
   double roughness() const;
+  double metalness() const;
+  double normalMapFactor() const;
+  bool refraction() const;
+  double indexOfRefraction() const;
+  OmRgb attenuationColor() const;
+  double attenuationDistance() const;
   // PBRAppearance.IBLStrength: the renderer premultiplies it with Background.luminosity into
   // ONE scale factor applied to BOTH the diffuse and the specular image-based ambient.
   double iblStrength() const;
@@ -90,6 +97,11 @@ private:
   OmSFColor *mBaseColor;
   OmSFNode *mBaseColorMap;
   OmSFDouble *mTransparency;
+  OmSFBool *mRefraction;
+  OmSFBool *mEmissiveTwoSided;
+  OmSFDouble *mIndexOfRefraction;
+  OmSFColor *mAttenuationColor;
+  OmSFDouble *mAttenuationDistance;
   OmSFDouble *mRoughness;
   OmSFNode *mRoughnessMap;
   OmSFDouble *mMetalness;

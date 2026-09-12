@@ -38,6 +38,7 @@
 #include "OmLog.hpp"
 #include "OmMFColor.hpp"
 #include "OmMFNode.hpp"
+#include "OmMFString.hpp"
 #include "OmMFVector3.hpp"
 #include "OmMassChecker.hpp"
 #include "OmMathsUtilities.hpp"
@@ -3109,10 +3110,79 @@ static QString attachNewtonShapeFromBoundingObject(OmNewtonBackend *newton, int 
                       .arg(shapeOffset.x()).arg(shapeOffset.y()).arg(shapeOffset.z())
                       .arg(sqx).arg(sqy).arg(sqz).arg(sqw);
     } else {
+      // ⚠ THE UNDECODABLE-COLLIDER CLIFF. The world DECLARES a triangle mesh as
+      // this body's collider and the mesh carries no usable triangle data, so
+      // nothing mesh-shaped reaches the solver. The body then takes whatever the
+      // fallback ladder hands it -- the mesh's AABB when the geometry decoded to
+      // vertices but no triangles, or (when the decode failed outright, so there
+      // are no vertices to bound either) the r=0.12 placeholder sphere that
+      // flushPendingNewtonRegistrations adds for a body with no shape at all.
+      //
+      // Measured 2026-09-11 on the public urdfeus gallery (718 models,
+      // github.com/iory/urdfeus @ a5d094b): all 4,024 of its .glb meshes are
+      // KHR_draco_mesh_compression, our assimp build has no Draco decoder, and
+      // every <collision><mesh> in it therefore became a 12 cm sphere. The run
+      // still loaded, still stepped, still exited 0 -- and every contact,
+      // resting pose and grasp result from those bodies was meaningless.
+      //
+      // This is NOT the same class as the Group-of-N drop or the cylinder ->
+      // capsule substitution a few lines up. Those are visible in the world
+      // text: an author who reads their own file can see the Group, and the
+      // substituted shape still has the authored EXTENT. Here the file is
+      // correct, the mesh is on disk, and the only evidence is a reader-side
+      // decode failure logged somewhere else entirely. So it is an ERROR by
+      // default -- run-headless FAILs on it without --fail-on-warning, which is
+      // the whole point: a bare PASS must not be reachable with a placeholder
+      // collider standing in for a declared mesh. Value-parsed hatch
+      // (OMNISIM_STRICT_COLLISION_MESH=0) downgrades it to a warning for anyone
+      // who has to run such a world while the mesh is being converted.
+      //
+      // The substitution is NAMED rather than described generically, because the
+      // two arms are not equally bad and an author needs to know which one they
+      // got: the AABB box at least keeps the mesh's extent, while the r=0.12
+      // sphere keeps nothing at all. Both are errors -- the declared geometry
+      // reached the solver in neither -- but the consequence differs.
       double hx = 0.0, hy = 0.0, hz = 0.0, cx = 0.0, cy = 0.0, cz = 0.0;
-      if (computeBoundingObjectMeshAabb(boundingObjectValue, &hx, &hy, &hz, &cx, &cy, &cz)) {
+      const bool aabbUsable =
+        computeBoundingObjectMeshAabb(boundingObjectValue, &hx, &hy, &hz, &cx, &cy, &cz);
+      if (aabbUsable) {
         newton->addShapeBox(idx, hx, hy, hz, cx, cy, cz);
         shapeDesc = QString("box(mesh AABB fallback)");
+      }
+      const OmSolid *const owner = tmg->upperSolid();
+      const OmMFString *const urlField = tmg->findMFString("url");
+      const QString meshRef = (urlField != nullptr && urlField->size() > 0) ?
+                                QString("'%1'").arg(urlField->item(0)) :
+                                QString("a %1 node with no 'url' field").arg(tmg->nodeModelName());
+      const QString consequence =
+        aabbUsable ?
+          QObject::tr("It collides as the mesh's axis-aligned BOUNDING BOX instead: the extent is right, "
+                      "the shape is not, so anything that depends on the surface -- a grasp, a fit, a "
+                      "concave interior -- is wrong.") :
+          QObject::tr("It collides as a 12 cm placeholder SPHERE instead, which keeps nothing of the "
+                      "authored geometry: every contact, grasp and resting pose this body produces is "
+                      "meaningless.");
+      const QString msg =
+        QObject::tr("%1: the boundingObject declares a collision MESH (%2) but the mesh holds no usable "
+                    "triangle data, so it was NOT handed to the physics engine. %3 Nothing else in this run "
+                    "would have said so. The usual cause is a mesh the reader declined to decode: look for an "
+                    "'Invalid data, please verify mesh file' warning naming this file earlier in the log. "
+                    "Draco-compressed glTF (KHR_draco_mesh_compression) is the common one and is NOT supported "
+                    "-- re-export the mesh uncompressed (glTF/STL/OBJ/DAE), or author an explicit primitive "
+                    "boundingObject. Set OMNISIM_STRICT_COLLISION_MESH=0 to downgrade this to a warning.")
+          .arg(owner != nullptr ? owner->usefulName() : tmg->usefulName())
+          .arg(meshRef)
+          .arg(consequence);
+      static QSet<int> reportedMeshColliderIds;
+      const int mid = tmg->uniqueId();
+      if (!reportedMeshColliderIds.contains(mid)) {
+        reportedMeshColliderIds.insert(mid);
+        // Value-parsed (=0/false/off/no disarm), so it cannot become the
+        // OMNISIM_REQUIRE_NEWTON trap where `=0` ARMS the gate.
+        if (newtonEnvFlag("OMNISIM_STRICT_COLLISION_MESH", true))
+          OmLog::error(msg, false, OmLog::ODE);
+        else
+          OmLog::warning(msg, false, OmLog::ODE);
       }
     }
   }

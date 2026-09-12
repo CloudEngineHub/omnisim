@@ -200,6 +200,179 @@ def _pillow_status() -> dict:
     }
 
 
+def _bridges_dep(binary: str | None) -> dict:
+    """Can a spawned bridge controller import `omnisim_bridges`?
+
+    Sibling of _controller_deps, and the same class of fault -- but the answer
+    is the opposite, which is why it gets its own row. onnxruntime is VENDORED
+    into the bundle; omnisim_bridges deliberately is NOT. It is an editable
+    install so that edits to the package take effect immediately, and the
+    canonical source ships both in the checkout and in the installer
+    (scripts/packaging/files_core.txt: `packages/omnisim-bridges [recurse]`).
+    A vendored wheel in the bundle would shadow the tree with a stale copy.
+
+    So the thing to verify is that the SOURCE is reachable, not that a wheel is
+    installed. Until 2026-09-11 it was not: the bridges imported the package
+    before the sys.path bootstrap that makes it importable, and every failure
+    was swallowed by a bare `except Exception` -- silently, exit 0. Controller
+    stdout and stderr reach NEITHER omnisim_log.txt NOR the run-headless
+    capture (measured), so the controller's own banner cannot be the only
+    signal. This row is the one a headless operator can actually see.
+
+    ADVISORY, never a gate: only the OmniLink chat/bridge demos need it.
+    """
+    info: dict = {"status": "unknown", "detail": "", "fix": None}
+    src = REPO_ROOT / "packages" / "omnisim-bridges" / "src"
+    if not (src / "omnisim_bridges" / "__init__.py").is_file():
+        info["status"] = "missing"
+        info["detail"] = (
+            "packages/omnisim-bridges/src is absent, so every OmniLink bridge "
+            "controller runs its deferred-intent and status/resume features as "
+            "STUBS (the robot still drives; those features are simply gone)"
+        )
+        info["fix"] = ("restore packages/omnisim-bridges/ in the checkout "
+                       "(it is source-shipped, not vendored into the bundle)")
+        return info
+
+    # Prove it against the interpreter a spawned controller actually gets.
+    exe = None
+    if os.name == "nt" and binary:
+        cand = Path(binary).parent / "newton-runtime" / "python.exe"
+        if cand.is_file():
+            exe = str(cand)
+    if exe is None:
+        exe = shutil.which("python") or shutil.which("python3")
+    if exe is None:
+        info["detail"] = "no interpreter to check the bridge imports with"
+        return info
+    probe = (
+        "import sys; sys.path.insert(0, r'%s'); "
+        "import omnisim_bridges.intent_router, omnisim_bridges.intents; "
+        "print('ok')" % src
+    )
+    try:
+        out = subprocess.run([exe, "-c", probe], capture_output=True,
+                             text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        info["detail"] = "could not run the bridge import probe"
+        return info
+    if out.returncode != 0:
+        info["status"] = "missing"
+        info["detail"] = (
+            "packages/omnisim-bridges/src is present but does not import on the "
+            "controller interpreter: "
+            + (out.stderr or "").strip().splitlines()[-1:][0]
+            if (out.stderr or "").strip() else "unknown import error"
+        )
+        info["fix"] = "python -c \"import omnisim_bridges\" to see the full error"
+        return info
+    info["status"] = "ok"
+    info["detail"] = ("omnisim_bridges imports on the controller interpreter "
+                      "(OmniLink bridges keep their deferred-intent layer)")
+    return info
+
+
+def _controller_deps(binary: str | None) -> dict:
+    """Can the interpreter the engine spawns for CONTROLLERS run a shipped policy?
+
+    Physics and controllers do NOT share an interpreter, and until 2026-09-11
+    nothing checked the controller one. The engine embeds CPython for Newton
+    (`newton-runtime/python312.dll`, resolved from its own directory) but
+    SPAWNS a separate `python` per Python controller, resolved from PATH
+    (`OmLanguageTools::pythonCommand`). Which one that is depends on how the
+    engine was launched:
+
+      * `python -m omnisim run-headless` / `run-agent` PREPEND
+        `msys64/mingw64/bin/newton-runtime` to PATH -- so the controller runs
+        on the BUNDLED interpreter (headless_runner.py, omnisim_run_agent.py);
+      * `launch.bat` / the installer's shortcut do not (launcher.c adds only
+        the engine dir, `cpp/` and msys `usr/bin`) -- so the controller runs
+        on the user's system `python`.
+
+    The bundle shipped without `onnxruntime` while the developer's own python
+    had it, so 26 shipped controllers (every *_deploy / *_mimic under
+    projects/policies/research/controllers, plus the anypick_cam and
+    omniarm6_bin_picking demos) refused to run their ONNX policies on a clean
+    clone and nothing said why. That is what this row exists to say out loud.
+
+    ADVISORY, never a gate: a world with no policy controller runs perfectly
+    without onnxruntime, so this must not fail an install that is fine for
+    what it is being used for.
+    """
+    info: dict = {"status": "unknown", "detail": "", "fix": None,
+                  "bundle": None, "system": None}
+    probe = (
+        "import importlib.util as u;"
+        "print(','.join(m for m in ('onnxruntime',) if u.find_spec(m) is None))"
+    )
+
+    if os.name == "nt":
+        if binary:
+            sp = Path(binary).parent / "newton-runtime" / "site-packages"
+            if sp.is_dir():
+                info["bundle"] = (sp / "onnxruntime").exists()
+        # The system `python` is what launch.bat / the installer shortcut give
+        # a controller, so report it too -- one of the two being right is the
+        # reason this defect hid for as long as it did.
+        exe = shutil.which("python") or shutil.which("python3")
+        if exe:
+            try:
+                out = subprocess.run([exe, "-c", probe], capture_output=True,
+                                     text=True, timeout=20)
+                if out.returncode == 0:
+                    info["system"] = not out.stdout.strip()
+            except (OSError, subprocess.SubprocessError):
+                pass
+        if info["bundle"] is None:
+            info["detail"] = "no bundled controller interpreter to check"
+            return info
+        if info["bundle"]:
+            info["status"] = "ok"
+            info["detail"] = ("onnxruntime in the bundled controller interpreter "
+                              "(shipped RL-deploy controllers can load their policies)")
+            return info
+        info["status"] = "missing"
+        info["detail"] = (
+            "onnxruntime is NOT in the bundled controller interpreter -- every shipped "
+            "RL-deploy controller refuses to run its ONNX policy under "
+            "`python -m omnisim run-headless` / `run-agent`, which launch controllers "
+            "on that interpreter"
+        )
+        info["fix"] = (
+            "make -C src/omnisim bundle-newton-runtime   (re-stages the pinned set, "
+            "onnxruntime included)"
+        )
+        return info
+
+    # Linux / macOS: no bundle. The controller interpreter is the `python3` the
+    # engine finds on PATH, which is also where the physics wheels live.
+    exe = shutil.which("python3") or shutil.which("python")
+    if not exe:
+        info["detail"] = "no python3 on PATH to check"
+        return info
+    try:
+        out = subprocess.run([exe, "-c", probe], capture_output=True,
+                             text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        info["detail"] = f"could not run `{exe}` to check the controller interpreter"
+        return info
+    if out.returncode != 0:
+        info["detail"] = f"`{exe} -c` failed, so the controller deps are unverified"
+        return info
+    info["system"] = not out.stdout.strip()
+    if info["system"]:
+        info["status"] = "ok"
+        info["detail"] = f"onnxruntime importable from {exe} (the controller interpreter)"
+    else:
+        info["status"] = "missing"
+        info["detail"] = (
+            f"{exe} cannot import onnxruntime -- every shipped RL-deploy controller "
+            "refuses to run its ONNX policy"
+        )
+        info["fix"] = f"{exe} -m pip install onnxruntime"
+    return info
+
+
 def _wgpu_native_status(binary: str | None) -> dict:
     """wgpu is the ONLY renderer; on Windows it is a DLL beside the engine."""
     info: dict = {"status": "unknown", "path": None, "detail": "", "fix": None}
@@ -1013,6 +1186,8 @@ def run(argv: list[str]) -> int:
         RUNTIME_SOURCE,
         (Path(webots).parent / RUNTIME_BUNDLE_REL) if (webots and os.name == "nt") else None,
     )
+    controller_deps = _controller_deps(webots)
+    bridges_dep = _bridges_dep(webots)
     wgpu = _wgpu_native_status(webots)
     pillow = _pillow_status()
     hooks = _git_hooks_status()
@@ -1041,6 +1216,8 @@ def run(argv: list[str]) -> int:
                     "physics": physics,
                     "python": python,
                     "runtime_bundle": runtime_bundle,
+                    "controller_deps": controller_deps,
+                    "bridges": bridges_dep,
                     "wgpu_native": wgpu,
                     "pillow": pillow,
                     "git_hooks": hooks,
@@ -1108,6 +1285,30 @@ def run(argv: list[str]) -> int:
         print(f"            fix:  {runtime_bundle['fix']}")
     else:
         print(f"runtime     {runtime_bundle['detail']}")
+    # The CONTROLLER interpreter is a different interpreter from the physics one
+    # and can be wrong on its own. Advisory: a world with no policy controller
+    # does not care.
+    if controller_deps["status"] == "ok":
+        print(f"policies    {controller_deps['detail']}")
+    elif controller_deps["status"] == "missing":
+        print(f"policies    WARN: {controller_deps['detail']}")
+        print(f"            fix:  {controller_deps['fix']}")
+        if controller_deps.get("system") is True:
+            print("            note: your system python HAS it, so this fault is "
+                  "invisible from `python -m omnisim` -- only a spawned controller sees it")
+    elif controller_deps["detail"]:
+        print(f"policies    ?  {controller_deps['detail']}")
+    # Same class of fault, opposite remedy: omnisim_bridges is SOURCE-shipped,
+    # not vendored. Controller stdout/stderr reach neither the log nor the
+    # run-headless capture, so this row is the only place a headless operator
+    # can see that the bridges are running as stubs.
+    if bridges_dep["status"] == "ok":
+        print(f"bridges     {bridges_dep['detail']}")
+    elif bridges_dep["status"] == "missing":
+        print(f"bridges     WARN: {bridges_dep['detail']}")
+        print(f"            fix:  {bridges_dep['fix']}")
+    elif bridges_dep["detail"]:
+        print(f"bridges     ?  {bridges_dep['detail']}")
     if wgpu["status"] == "present":
         print(f"renderer    {wgpu['detail']}")
     elif wgpu["status"] == "absent":

@@ -190,6 +190,30 @@ def omnisim_env() -> dict:
         bundled_python = msys_bin / "newton-runtime" / "python.exe"
         if bundled_python.exists():
             env["PATH"] = f"{bundled_python.parent}{os.pathsep}{env['PATH']}"
+            # ── PREPENDING the bundle obliges us to set PYTHONPATH ────────
+            # The engine spawns each Python controller as the bare command
+            # "python.exe" (OmLanguageTools::pythonCommand -> QProcess),
+            # resolved from this PATH, so the line above hands every
+            # controller the bundled interpreter. That bundle's site-packages
+            # is a SIBLING of Lib, not inside it, and there is no python3XX._pth
+            # beside python.exe -- so without PYTHONPATH the controller gets an
+            # interpreter that cannot import numpy, let alone onnxruntime.
+            # headless_runner.py has set this since 549734211; this function
+            # prepended the same directory without it.
+            pythonpath = []
+            site_packages = bundled_python.parent / "site-packages"
+            if site_packages.is_dir():
+                pythonpath.append(str(site_packages))
+            # omnisim_bridges is SOURCE-shipped rather than vendored into the
+            # bundle (editable install; a vendored wheel would shadow the tree
+            # with a stale copy). See the matching note in headless_runner.py.
+            bridges_src = REPO_ROOT / "packages" / "omnisim-bridges" / "src"
+            if bridges_src.is_dir():
+                pythonpath.append(str(bridges_src))
+            if pythonpath:
+                env["PYTHONPATH"] = os.pathsep.join(
+                    [*pythonpath, env.get("PYTHONPATH", "")]
+                )
     return env
 
 

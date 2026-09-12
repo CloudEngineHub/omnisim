@@ -26,6 +26,25 @@ to keep the identifiers stable for worlds, bridges and gripper configs that
 already reference them. This package is not affiliated with, sponsored by, or
 endorsed by Robotiq, and it is not a Robotiq release.
 
+### User-facing prose — corrected 2026-09-11
+
+Nominative use covers identifiers. It does **not** cover a catalogue entry that
+hands our own work a manufacturer's product name as its title. `DEMOS.md`, the
+launcher catalogue and three world titles read "Robotiq 2F-140" as the name of
+the thing on screen; they now read **"140 mm two-finger gripper"**. The
+`2f140` in paths, DEF names, link names, device names and `--gripper` ids is
+unchanged — it is a size/class identifier, and renaming it is a separate
+decision that would touch worlds, configs and tests (see the rename note the
+2026-09-11 doc-accuracy pass left for the owner).
+
+Corrected in the same pass: two flagship worlds and their two controllers still
+claimed every `<visual>` was "the customer's own CAD
+(3d_models/2F-140_Assy_Open_20191022.STEP, tessellated by
+scripts/dev/step_to_urdf.py)". That contradicted this file outright and claimed
+third-party CAD lineage for geometry that is entirely ours. The arm-mounted
+URDF had already been corrected on 2026-08-24; the four copies downstream of it
+were missed.
+
 ## Dimensions
 
 Mounting interface, ~144 mm coupling-face-to-pivot height, and the fingers'

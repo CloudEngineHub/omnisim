@@ -15,6 +15,7 @@
 // Modifications copyright 2026 OmniLink, licensed under the Apache License, Version 2.0.
 
 #include "OmBackground.hpp"
+#include "OmMFVector3.hpp"
 
 #include "OmApplication.hpp"
 #include "OmApplicationInfo.hpp"
@@ -78,6 +79,7 @@ static int gCoordinateSystemRotate(int i) {
 }
 
 void OmBackground::init() {
+  mReflectionProbePositions=findMFVector3("reflectionProbePositions");
   mSkyColor = findMFColor("skyColor");
   mLuminosity = findSFDouble("luminosity");
   mAtmosphericSky = findSFString("atmosphericSky");
@@ -186,6 +188,7 @@ void OmBackground::activate() {
     createWrenObjects();
 
   connect(mLuminosity, &OmSFDouble::changed, this, &OmBackground::updateLuminosity);
+  connect(mReflectionProbePositions, &OmMFVector3::changed, this, &OmBackground::updateLuminosity);
   connect(mSkyColor, &OmMFColor::changed, this, &OmBackground::updateColor);
   connect(OmWorld::instance()->viewpoint(), &OmViewpoint::cameraModeChanged, this, &OmBackground::updateCubemap);
   for (int i = 0; i < 6; ++i) {
@@ -434,3 +437,6 @@ QStringList OmBackground::customExportedFields() const {
   }
   return fields;
 }
+
+int OmBackground::reflectionProbeCount() const { return mReflectionProbePositions->size(); }
+OmVector3 OmBackground::reflectionProbePosition(int index) const { return mReflectionProbePositions->item(index); }

@@ -62,6 +62,7 @@ struct OmAbstractCamera::WgpuDrawCache {
   std::vector<std::array<float, 16>> models;  // draws' modelMatrix16 alias into this, 1:1
   std::vector<OmWgpuSceneRenderer::OmWgpuDrawRefresh> refresh;
   std::vector<QMetaObject::Connection> conns;
+  std::function<void()> disconnectInputs;
   const OmWgpuMeshCache *meshCache = nullptr;
   const OmWgpuTextureCache *texCache = nullptr;
   bool dirty = true;
@@ -314,6 +315,11 @@ void OmAbstractCamera::invalidateWgpuDrawCache() {
   if (!mWgpuDrawCache)
     return;
   WgpuDrawCache &c = *mWgpuDrawCache;
+  if (c.disconnectInputs) {
+    auto disconnectInputs = std::move(c.disconnectInputs);
+    c.disconnectInputs = {};
+    disconnectInputs();
+  }
   for (const QMetaObject::Connection &conn : c.conns)
     QObject::disconnect(conn);
   c.conns.clear();
@@ -387,12 +393,8 @@ void OmAbstractCamera::collectWgpuDrawsCached(OmWgpuMeshCache &cache, OmWgpuText
     OmWgpuSceneRenderer::collectWorldDraws(cache, c.draws, c.models, /*outNodes=*/nullptr, texCache, &c.refresh,
                                            &skipped);
     // A destroyed scene node would dangle the cached records: hook every referenced node.
-    QSet<QObject *> hooked;
-    for (const OmWgpuSceneRenderer::OmWgpuDrawRefresh &r : c.refresh)
-      if (r.node && !hooked.contains(r.node)) {
-        hooked.insert(r.node);
-        c.conns.push_back(connect(r.node, &QObject::destroyed, this, [this]() { invalidateWgpuDrawCache(); }));
-      }
+    c.disconnectInputs = OmWgpuSceneRenderer::watchDrawInputs(c.refresh,this,
+      [this]() { invalidateWgpuDrawCache(); });
     if (OmWorld::instance()) {
       if (OmGroup *root = OmWorld::instance()->root())
         c.conns.push_back(connect(root, &OmGroup::childrenChanged, this, [this]() { invalidateWgpuDrawCache(); }));

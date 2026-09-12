@@ -40,6 +40,21 @@ Resolution order in the bridge:
 Sim configs: [`_gripper_configs.py`](../../projects/samples/demos/controllers/omnilink_arm_bridge/_gripper_configs.py).
 Sim effectors: [`gripper_effectors.py`](../../projects/samples/demos/controllers/omnilink_arm_bridge/gripper_effectors.py).
 
+⚠️ **The `id` and `model` columns name the REAL hardware each entry targets, not
+the origin of the simulated geometry.** Every gripper OmniSim ships is **its own
+model**, authored in this repository from URDF primitive solids — boxes and
+cylinders declared inline, with no mesh, texture or CAD file from any third
+party and nothing tessellated from or derived from a manufacturer's product
+model. The vendor and product names are trademarks of their owners and are used
+**nominatively**, to say which class of hardware an entry stands in for and to
+keep the `--gripper` ids stable across sim and real. OmniSim is not affiliated
+with, sponsored by or endorsed by any of them. Provenance:
+[`projects/robots/robotiq/PROVENANCE.md`](../../projects/robots/robotiq/PROVENANCE.md),
+[`projects/devices/PROVENANCE.md`](../../projects/devices/PROVENANCE.md),
+[`TRADEMARKS.md`](../../TRADEMARKS.md). The **real-hardware drivers** in
+[`agents/bridges/grippers/`](../../agents/bridges/grippers/) are a different
+thing: those do speak each vendor's actual register protocol.
+
 ## HTTP / tool surface
 
 Every arm bridge with a gripper exposes (POST unless noted):

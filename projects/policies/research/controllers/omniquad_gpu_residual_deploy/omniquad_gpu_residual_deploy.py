@@ -108,8 +108,18 @@ def find_policy_path() -> Path:
         "OMNISIM_POLICY_ONNX")
     if p:
         return Path(p)
-    return (_REPO / "projects" / "rl" / "inference" / "policies"
-            / "gpu_omniquad_residual_main" / "policy.onnx")
+    # PATH: `projects/rl` was renamed to `projects/policies/research` by
+    # 1b668a910 and this default was never re-pointed (2026-09-11).
+    #
+    # ⚠️ Re-pointing does NOT make this controller work: `gpu_omniquad_residual_main`
+    # does not exist ANYWHERE in the tree -- not under research/inference/policies/
+    # and not under research/policies/. It was deliberately NOT swapped for a
+    # policy that does exist (gpu_omniquad_residual_v8, omniquad_residual_main,
+    # ...): a quadruped walking on the wrong policy is a worse defect than one
+    # that refuses to start. The path below is the correct location for that
+    # NAME; until an export lands there, pass OMNIQUAD_POLICY_ONNX explicitly.
+    return (_REPO / "projects" / "policies" / "research" / "inference"
+            / "policies" / "gpu_omniquad_residual_main" / "policy.onnx")
 
 
 def main() -> int:
@@ -137,6 +147,8 @@ def main() -> int:
             say(f"[omniquad_gpu_residual_deploy] FATAL: ONNX policy exists but "
                 f"failed to load ({e}) -- refusing to run ZERO residual and "
                 "report it as a policy result\n")
+            say(f"[omniquad_gpu_residual_deploy] path: {policy_path}\n")
+            say(f"[omniquad_gpu_residual_deploy] controller interpreter: {sys.executable}\n")
             # FATAL, deliberately: the policy file EXISTS and would not load -- a broken
             # environment (classically: onnxruntime missing from the CONTROLLER interpreter,
             # a DIFFERENT python than the engine embeds), not a mode. Falling back here keeps
@@ -145,8 +157,21 @@ def main() -> int:
             # head-to-head (2026-07-12) -- and the broken run scored BETTER than the real one.
             raise SystemExit(2)
     else:
-        say(f"[omniquad_gpu_residual_deploy] policy not found at {policy_path}; "
-            "running model walker with zero residual\n")
+        # LOUD, deliberately, and louder than its siblings: this controller's
+        # default policy NAME (gpu_omniquad_residual_main) exists nowhere in the
+        # tree, so with no env var this branch is the ONLY outcome. It used to
+        # announce that in one line and exit 0 (2026-09-11).
+        _bar = "!" * 72
+        say(f"{_bar}\n")
+        say("[omniquad_gpu_residual_deploy] POLICY NOT FOUND -- running the model "
+            "walker with ZERO residual. This run is NOT a policy result.\n")
+        say(f"[omniquad_gpu_residual_deploy]   tried: {policy_path}\n")
+        say(f"[omniquad_gpu_residual_deploy]   controller interpreter: {sys.executable}\n")
+        say("[omniquad_gpu_residual_deploy]   NOTE: that policy is not shipped in this "
+            "tree under any path. No substitute was chosen for you.\n")
+        say("[omniquad_gpu_residual_deploy]   fix: train/export it, or point "
+            "OMNIQUAD_POLICY_ONNX / OMNISIM_POLICY_ONNX at the policy you mean.\n")
+        say(f"{_bar}\n")
 
     # Gait parameters -- MUST match the trainer's. ground_z=-0.57 keeps the
     # trot 100% IK-reachable across the cycle (the historic -0.62 exceeded

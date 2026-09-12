@@ -41,7 +41,9 @@ from pathlib import Path
 import numpy as np
 
 REPO_ROOT = next(_p for _p in Path(__file__).resolve().parents if (_p / "projects" / "policies").is_dir() or (_p / "AGENTS.md").exists() or (_p / ".git").exists())
-sys.path.insert(0, str(REPO_ROOT / "projects" / "rl" / "envs"))
+# PATH: `projects/rl` was renamed to `projects/policies/research` by 1b668a910;
+# the old path failed SILENTLY here (2026-09-11).
+sys.path.insert(0, str(REPO_ROOT / "projects" / "policies" / "research" / "envs"))
 
 from omniquad_env import OmniQuadEnv, OBS_DIM, ACT_DIM
 

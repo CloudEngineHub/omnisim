@@ -43,8 +43,11 @@
 class QImage;
 class OmWgpuTextureCache;
 struct OmWgpuTextureHandle;
+struct OmPhotoTexture;
 
 namespace OmWgpuImageAdapter {
+  uint64_t photoTextureKey(const QImage *image);
+  bool copyPhotoTexture(const QImage *image, OmPhotoTexture &texture);
 
   // Convert + upload the QImage's pixels into the cache.
   // - Returns {nullptr, nullptr, 0, 0} if the image is null, has

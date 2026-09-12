@@ -1027,15 +1027,13 @@ measurement rather than a rerunnable script.
   1. The script hard-codes its MJCF export path to `C:\tmp\quad_newton_export.xml`, so
      it is **Windows-only** and **`C:\tmp` must already exist** (`mkdir C:\tmp`). It
      does not create the directory.
-  2. It still prepends the pre-rename `projects/rl/tools` to `sys.path`. That directory
-     no longer exists (it is now `projects/policies/research/tools`); the stale entry is
-     harmless *only* because the script's own directory is already on `sys.path` and its
-     `newton_friction_probe` dependency is a sibling there — so **run it by path, from
-     the repo root, exactly as above**, and do not copy it elsewhere.
+  2. ~~It still prepends the pre-rename `projects/rl/tools` to `sys.path`.~~ **FIXED
+     2026-09-11**: the script now prepends `projects/policies/research/tools`, the
+     directory that exists. (It had been harmless only because the script's own
+     directory is already on `sys.path` and its `newton_friction_probe` dependency is a
+     sibling there.) Still **run it by path, from the repo root, exactly as above**.
 
-  (Both are defects in the script, not in the measurement. The script lives under
-  `projects/policies/` and is out of scope for this doc's edit; fixing them is tracked
-  separately.)
+  (Precondition 1 remains a defect in the script, not in the measurement.)
 - Both require the Warp/Newton/MuJoCo runtime; run from PowerShell so the embedded
   interpreter resolves the user-site `warp` package (see the project's Newton-verification
   notes). Numbers vary with GPU; ours are a laptop RTX 3060 (§1.2).

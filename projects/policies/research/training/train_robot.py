@@ -52,8 +52,10 @@ from projects.policies.research.backends.robot_registry import list_robots, get_
 from projects.policies.research.backends.base import TrainingConfig
 
 
-RUNS_DIR = REPO_ROOT / "projects" / "rl" / "training" / "runs"
-ONNX_DIR = REPO_ROOT / "projects" / "rl" / "inference" / "policies"
+# PATH: `projects/rl` was renamed to `projects/policies/research` by 1b668a910;
+# the old path failed SILENTLY here (2026-09-11).
+RUNS_DIR = REPO_ROOT / "projects" / "policies" / "research" / "training" / "runs"
+ONNX_DIR = REPO_ROOT / "projects" / "policies" / "research" / "inference" / "policies"
 
 
 def main() -> int:

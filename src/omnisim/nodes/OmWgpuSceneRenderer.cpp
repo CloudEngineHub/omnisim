@@ -57,6 +57,7 @@
 #include "OmWgpuRenderTarget.hpp"
 #include "OmWgpuTextureCache.hpp"
 #include "OmWorld.hpp"
+#include "OmNodeOperations.hpp"
 // W1c: the collect owns its own GL arming now (see OmWrenGlArm below) instead of
 // relying on a caller-side makeWrenCurrent()/doneWren() bracket.
 #include "OmDeformableFrameListener.hpp"  // the Cloth/SoftBody subscription registry
@@ -68,13 +69,30 @@
 
 #include <QtCore/QFileInfo>  // P2: the Muscle texture path -> one stable cache key
 #include <QtCore/QList>      // hiddenNodes->isEmpty()/contains(): the header only forward-declares QList
+#include <QtCore/QSet>
+#include <QtCore/QVariant>
 #include <QtGui/QImage>
 
 #include <algorithm>
+#include <utility>
 #include <cmath>
 #include <cstdint>
 
 namespace {
+
+  uint64_t motionId(QObject *node) {
+    // Node IDs may be reassigned by PROTO regeneration; addresses may be reused.
+    // This private property dies with the instance. Collection is on the scene
+    // thread; cached draws retain the serial without another property lookup.
+    static uint64_t next = 0;
+    const char *key = "_omnisimMotionId";
+    uint64_t id = node->property(key).toULongLong();
+    if (!id) {
+      id = ++next;
+      node->setProperty(key, QVariant::fromValue<qulonglong>(id));
+    }
+    return id;
+  }
 
   // Cumulative GL arms taken by the collect; published by glArmCount().
   unsigned long long gGlArms = 0;
@@ -409,6 +427,23 @@ void applyLegacyAppearanceTexture(OmAppearance *app, OmWgpuTextureCache *texCach
 }
 
 static void fillWrenAmbient(OmPbrAppearance *pbr, OmAppearance *app, OmWgpuSolidDraw &draw) {
+  if (pbr) {
+    draw.photoMetalness = static_cast<float>(pbr->metalness());
+    draw.photoNormalStrength = static_cast<float>(pbr->normalMapFactor());
+    draw.photoRefraction = pbr->refraction();
+    draw.emissiveTwoSided = pbr->emissiveTwoSided();
+    draw.photoIor = static_cast<float>(pbr->indexOfRefraction());
+    draw.photoAttenuationDistance = static_cast<float>(pbr->attenuationDistance());
+    const OmRgb absorption = pbr->attenuationColor();
+    draw.photoAttenuationColor[0] = absorption.red();
+    draw.photoAttenuationColor[1] = absorption.green();
+    draw.photoAttenuationColor[2] = absorption.blue();
+    OmImageTexture *maps[4] = {pbr->baseColorMap(), pbr->roughnessMap(), pbr->metalnessMap(), pbr->normalMap()};
+    for (int i = 0; i < 4; ++i)
+      draw.photoMaps[i] = maps[i] ? maps[i]->image() : nullptr;
+  } else
+    draw.photoMaps[0] = legacyAppearanceImage(app);
+
   if (!wgpuWrenAmbientEnabled())
     return;
   if (pbr) {
@@ -827,6 +862,8 @@ static void fillWrenAmbient(OmPbrAppearance *pbr, OmAppearance *app, OmWgpuSolid
         modelStorage.push_back(model);
         OmWgpuSolidDraw draw;
         draw.modelMatrix16 = modelStorage.back().data();
+        draw.motionId = motionId(cad);
+        draw.motionPart = static_cast<uint32_t>(i);
         OmPbrAppearance *cpbr = cad->wgpuAppearance(i);
         const OmRgb color = cpbr ? cpbr->baseColor() : OmRgb(0.7, 0.7, 0.7);
         draw.baseColorR = static_cast<float>(color.red());
@@ -845,11 +882,13 @@ static void fillWrenAmbient(OmPbrAppearance *pbr, OmAppearance *app, OmWgpuSolid
         draw.vertexBuffer = h.vertexBuffer;
         draw.indexBuffer = h.indexBuffer;
         draw.indexCount = h.indexCount;
+        draw.geometryRevision = h.geometryRevision;
         draw.localCenter[0] = h.localCenter[0];
         draw.localCenter[1] = h.localCenter[1];
         draw.localCenter[2] = h.localCenter[2];
         draw.localRadius = h.localRadius;
         draw.cpuPositions = h.cpuPositions;
+        draw.cpuAttributes = h.cpuAttributes;
         draw.cpuIndices = h.cpuIndices;
         draw.castShadows = cad->wgpuCastShadows();
         fillUvTransform(cpbr, draw);
@@ -934,6 +973,7 @@ static void fillWrenAmbient(OmPbrAppearance *pbr, OmAppearance *app, OmWgpuSolid
         bool hasLocalScale = false;
         if (acquireGeometryMesh(geom, cache, h, localScale, hasLocalScale, outSkipped)) {
           OmWgpuSolidDraw draw;
+          draw.motionId = motionId(shape);
           std::array<float, 16> model;
           OmMatrix4 modelMat = geom->matrix();
           if (hasLocalScale)
@@ -1002,11 +1042,13 @@ static void fillWrenAmbient(OmPbrAppearance *pbr, OmAppearance *app, OmWgpuSolid
           draw.vertexBuffer = h.vertexBuffer;
           draw.indexBuffer = h.indexBuffer;
           draw.indexCount = h.indexCount;
+          draw.geometryRevision = h.geometryRevision;
           draw.localCenter[0] = h.localCenter[0];
           draw.localCenter[1] = h.localCenter[1];
           draw.localCenter[2] = h.localCenter[2];
           draw.localRadius = h.localRadius;
           draw.cpuPositions = h.cpuPositions;
+          draw.cpuAttributes = h.cpuAttributes;
           draw.cpuIndices = h.cpuIndices;
           draw.castShadows = shape->isCastShadowsEnabled();
           fillUvTransform(pbr ? static_cast<OmAbstractAppearance *>(pbr)
@@ -1033,9 +1075,10 @@ static void fillWrenAmbient(OmPbrAppearance *pbr, OmAppearance *app, OmWgpuSolid
                 draw.texMeanLin[2] = th.meanLin[2];
               }
             }
-            // Per-pixel roughnessMap (modulates the specular highlight in the textured-lit
-            // path). Only meaningful alongside an albedo map (the flat path ignores it);
-            // null → the render target binds a default-white texture (no-op).
+            // PBRAppearance's roughnessMap OVERRIDES the scalar roughness. The shader
+            // multiplies its texture by (1 - specularStrength), so a loaded map needs
+            // a unit factor. Otherwise the default roughness=0 erases the entire map
+            // and even concrete becomes mirror-smooth. Failed uploads keep the scalar.
             if (OmImageTexture *rmap = pbr->roughnessMap()) {
               const QImage *img = rmap->image();
               if (img) {
@@ -1043,6 +1086,8 @@ static void fillWrenAmbient(OmPbrAppearance *pbr, OmAppearance *app, OmWgpuSolid
                 OmWgpuTextureHandle th =
                   OmWgpuImageAdapter::acquireFromQImage(*texCache, texId, *img);
                 draw.roughnessView = th.view;
+                if (th.view)
+                  draw.specularStrength = 0.0f;
               }
             }
             // metalnessMap (.r) — metals lose diffuse + tint specular by albedo. Null →
@@ -1397,6 +1442,10 @@ static void fillWrenAmbient(OmPbrAppearance *pbr, OmAppearance *app, OmWgpuSolid
       OmWgpuTextureHandle th =
         OmWgpuImageAdapter::acquireFromQImage(*texCache, stableTexId(sl.map), *img);
       *sl.view = th.view;
+      // Same map-overrides-scalar contract as the Shape collector, also for
+      // Cloth / SoftBody and Track appearances.
+      if (sl.view == &draw.roughnessView && th.view)
+        draw.specularStrength = 0.0f;
       if (sl.albedo) {
         draw.texMeanLin[0] = th.meanLin[0];
         draw.texMeanLin[1] = th.meanLin[1];
@@ -1440,6 +1489,8 @@ static void fillWrenAmbient(OmPbrAppearance *pbr, OmAppearance *app, OmWgpuSolid
 
     OmWgpuSolidDraw draw;
     draw.modelMatrix16 = modelStorage.back().data();  // re-pointed by the caller after the loop
+    draw.motionId = motionId(node);
+    draw.deforming = true;
     float fallback[3] = {0.8f, 0.8f, 0.8f};
     node->wgpuFallbackDiffuse(fallback);
     OmPbrAppearance *pbr = node->pbrAppearance();
@@ -1448,11 +1499,13 @@ static void fillWrenAmbient(OmPbrAppearance *pbr, OmAppearance *app, OmWgpuSolid
     draw.vertexBuffer = h.vertexBuffer;
     draw.indexBuffer = h.indexBuffer;
     draw.indexCount = h.indexCount;
+    draw.geometryRevision = h.geometryRevision;
     draw.localCenter[0] = h.localCenter[0];
     draw.localCenter[1] = h.localCenter[1];
     draw.localCenter[2] = h.localCenter[2];
     draw.localRadius = h.localRadius;
     draw.cpuPositions = h.cpuPositions;
+    draw.cpuAttributes = h.cpuAttributes;
     draw.cpuIndices = h.cpuIndices;
     draw.castShadows = node->wgpuCastShadows();
     out.push_back(draw);
@@ -1715,11 +1768,13 @@ namespace OmWgpuSceneRenderer {
         draw.vertexBuffer = sphere.vertexBuffer;
         draw.indexBuffer = sphere.indexBuffer;
         draw.indexCount = sphere.indexCount;
+        draw.geometryRevision = sphere.geometryRevision;
         draw.localCenter[0] = sphere.localCenter[0];
         draw.localCenter[1] = sphere.localCenter[1];
         draw.localCenter[2] = sphere.localCenter[2];
         draw.localRadius = sphere.localRadius;
         draw.cpuPositions = sphere.cpuPositions;
+        draw.cpuAttributes = sphere.cpuAttributes;
         draw.cpuIndices = sphere.cpuIndices;
         out.push_back(draw);
       }
@@ -1763,11 +1818,13 @@ namespace OmWgpuSceneRenderer {
       proto.vertexBuffer = sphere.vertexBuffer;
       proto.indexBuffer = sphere.indexBuffer;
       proto.indexCount = sphere.indexCount;
+      proto.geometryRevision = sphere.geometryRevision;
       proto.localCenter[0] = sphere.localCenter[0];
       proto.localCenter[1] = sphere.localCenter[1];
       proto.localCenter[2] = sphere.localCenter[2];
       proto.localRadius = sphere.localRadius;
       proto.cpuPositions = sphere.cpuPositions;
+      proto.cpuAttributes = sphere.cpuAttributes;
       proto.cpuIndices = sphere.cpuIndices;
       out.reserve(out.size() + static_cast<size_t>(n));
       modelStorage.reserve(modelStorage.size() + static_cast<size_t>(n));
@@ -1861,11 +1918,13 @@ namespace OmWgpuSceneRenderer {
         draw.vertexBuffer = h.vertexBuffer;
         draw.indexBuffer = h.indexBuffer;
         draw.indexCount = h.indexCount;
+        draw.geometryRevision = h.geometryRevision;
         draw.localCenter[0] = h.localCenter[0];
         draw.localCenter[1] = h.localCenter[1];
         draw.localCenter[2] = h.localCenter[2];
         draw.localRadius = h.localRadius;
         draw.cpuPositions = h.cpuPositions;
+        draw.cpuAttributes = h.cpuAttributes;
         draw.cpuIndices = h.cpuIndices;
         out.push_back(draw);
       }
@@ -1926,7 +1985,9 @@ namespace OmWgpuSceneRenderer {
       modelStorage.push_back(model);
       OmWgpuSolidDraw draw;
       draw.modelMatrix16 = modelStorage.back().data();  // re-pointed below
-      // ⚠ A Muscle IS NOT APPEARANCE-DRIVEN: it has no Appearance node at all. WREN builds a
+      draw.motionId = motionId(m);
+      draw.deforming = true;
+      // A Muscle IS NOT APPEARANCE-DRIVEN: it has no Appearance node at all. WREN builds a
       // hardcoded phong material -- diffuse from the `color` field blended by the contraction
       // status, the gl:textures/muscle.png main texture, and NO specular, because phong.frag
       // zeroes specularTotal on any textured material (phong.frag:187). Reproduce that
@@ -1958,11 +2019,13 @@ namespace OmWgpuSceneRenderer {
       draw.vertexBuffer = h.vertexBuffer;
       draw.indexBuffer = h.indexBuffer;
       draw.indexCount = h.indexCount;
+      draw.geometryRevision = h.geometryRevision;
       draw.localCenter[0] = h.localCenter[0];
       draw.localCenter[1] = h.localCenter[1];
       draw.localCenter[2] = h.localCenter[2];
       draw.localRadius = h.localRadius;
       draw.cpuPositions = h.cpuPositions;
+      draw.cpuAttributes = h.cpuAttributes;
       draw.cpuIndices = h.cpuIndices;
       out.push_back(draw);
     }
@@ -2009,6 +2072,54 @@ namespace OmWgpuSceneRenderer {
       return nullptr;
     const QList<const OmBaseNode *> &nodes = viewpoint->getInvisibleNodes();
     return nodes.isEmpty() ? nullptr : &nodes;
+  }
+
+  std::function<void()> watchDrawInputs(const std::vector<OmWgpuDrawRefresh> &refresh, QObject *context,
+                                       const std::function<void()> &invalidate) {
+    std::vector<QMetaObject::Connection> connections;
+    // childrenChanged can arrive before an imported subtree is finalized. A
+    // sensor can collect that intermediate tree and otherwise cache the omission.
+    connections.push_back(QObject::connect(OmNodeOperations::instance(),&OmNodeOperations::nodeAdded,context,invalidate));
+    QSet<QObject *> hooked;
+    for (const auto &r:refresh) {
+      if (r.geom && !hooked.contains(r.geom)) {
+        hooked.insert(r.geom);
+        connections.push_back(QObject::connect(r.geom,&QObject::destroyed,context,invalidate));
+        connections.push_back(QObject::connect(r.geom,&OmGeometry::changed,context,invalidate));
+      }
+      if (!r.node || hooked.contains(r.node)) continue;
+      hooked.insert(r.node);
+      connections.push_back(QObject::connect(r.node,&QObject::destroyed,context,invalidate));
+      if (auto *shape=dynamic_cast<OmShape *>(r.node)) {
+        connections.push_back(QObject::connect(shape,&OmShape::geometryInShapeInserted,context,invalidate));
+        connections.push_back(QObject::connect(shape,&OmShape::castShadowsChanged,context,invalidate));
+        auto opacity=[](OmShape *s) {
+          if (auto *p=s->pbrAppearance()) return p->transparency();
+          auto *a=s->appearance();
+          return a && a->material() ? static_cast<double>(a->material()->transparency()) : 0.0;
+        };
+        const double previousOpacity=opacity(shape);
+        auto *previousPbr=shape->pbrAppearance();
+        auto *previousAppearance=shape->appearance();
+        const auto materialChanged=[=]() {
+            // Texture scrolling emits this too. Do not turn a conveyor animation
+            // into a full scene walk every frame; only shadow-relevant edits rebuild.
+            if (shape->pbrAppearance()!=previousPbr || shape->appearance()!=previousAppearance ||
+                opacity(shape)!=previousOpacity) invalidate();
+          };
+        connections.push_back(QObject::connect(shape,&OmShape::wrenMaterialChanged,context,materialChanged));
+        // Native-only shapes may never establish the legacy material propagation
+        // chain. Observe the appearance directly as well.
+        if (previousPbr)
+          connections.push_back(QObject::connect(previousPbr,&OmPbrAppearance::changed,context,materialChanged));
+        if (previousAppearance)
+          connections.push_back(QObject::connect(previousAppearance,&OmAppearance::changed,context,materialChanged));
+      }
+    }
+    return [connections=std::move(connections)]() {
+      for (const auto &connection : connections)
+        QObject::disconnect(connection);
+    };
   }
 
   bool refreshWorldDraws(std::vector<std::array<float, 16>> &modelStorage,

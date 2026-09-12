@@ -1,7 +1,7 @@
 #OMNISIM R2025a utf8
 
 # Deploy world for the PPO standing policy from
-# projects/rl/training/train_g1_stand.py.
+# projects/policies/research/training/train_g1_stand.py.
 #
 # Uses the legs-only G1 URDF (g1_legs_omnisim.urdf) because the full
 # 23-DOF URDF currently hangs Newton's body registration at the arm chain.

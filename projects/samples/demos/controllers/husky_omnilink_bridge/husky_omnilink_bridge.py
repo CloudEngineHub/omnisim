@@ -214,33 +214,59 @@ GOTO_TIMEOUT_S = 120.0    # safety abort. 120 s sim is deliberately
                           # advances slowly relative to controller torque
                           # ramp-up. 120 s comfortably covers worst-case
                           # 90° pivot + 2 m drive even at 1/4 speed.
-# Pivot angular speed is capped below MAX_ANGULAR_R_S so the wheels
-# don't break traction during in-place 90° turns, then skid the body
-# sideways and wedge it against the next wall.
+# Pivot angular speed, capped below MAX_ANGULAR_R_S. The cap BINDS now: it
+# never did before commit 69b4b024b, because the solver delivered ~0.0343 of
+# a commanded Husky pivot (the velocity servo's gain was pinned at M_ii/dt,
+# so its stall torque was ~9.5 N.m against the ~25 N.m a four-tyre scrub
+# pivot needs), so a commanded 1.5 rad/s produced about 0.05 rad/s and a 90°
+# pivot took ~30 s. Post-fix the Husky delivers 0.520 of command, so 1.5
+# rad/s commanded is ~0.78 rad/s of real yaw and a 90° pivot is ~2 s.
 #
-# ⚠ THE ARITHMETIC THIS COMMENT USED TO CARRY ASSUMED FULL DELIVERY, and
-# that assumption was false when it was written. It said "1.5 rad/s = ~1.0 s
-# sim for a 90° pivot under nominal load, vs ~0.45 s at full speed". That
-# reads the commanded rate as the achieved one. Before commit 69b4b024b the
-# solver delivered ~0.0343 of a commanded Husky pivot (the velocity servo's
-# gain was pinned at M_ii/dt, so its stall torque was ~9.5 N.m against the
-# ~25 N.m a four-tyre scrub pivot needs), meaning a commanded 1.5 rad/s
-# produced about 0.05 rad/s and a 90° pivot took ~30 s. THIS CAP WAS NEVER
-# THE BINDING CONSTRAINT, so it cannot have been the source of the slow
-# pivots -- the solver was.
+# ⛔ THE JUSTIFICATION THIS COMMENT CARRIED IS FALSIFIED. It said the cap
+# exists "so the wheels don't break traction during in-place 90° turns, then
+# skid the body sideways and wedge it against the next wall". That was never
+# tested -- it could not have been, since the cap was not reachable -- and it
+# is not true of the plant that now delivers torque.
 #
-# POST 69b4b024b the Husky delivers 0.520 of command (measured 2026-09-11),
-# so a commanded 1.5 rad/s is ~0.78 rad/s achieved and a 90° pivot is ~2 s,
-# comfortably inside GOTO_TIMEOUT_S. 1.5 is also still inside the base's
-# measured envelope (max_angular 1.805 rad/s), so it remains a legal,
-# conservative cap and is LEFT AS IT IS.
+# MEASURED 2026-09-11, machine 9722d23d12a3 (OmniSim 8.4.0, repo 47d677e5e,
+# engine binary sha256 3d18d9c6ea061c5c -- named because another lane
+# relinked omnisim-bin.exe two hours later and every row below predates that;
+# Newton 1.5.0 / SolverMuJoCo cpu/mj_step read back from the .newton.json
+# sidecar, basicTimeStep 16). All five shipped husky_maze_* worlds driven
+# start-to-goal over the BFS route, every hop through
+# goto_cell(wait=true, speed=0.5), at four caps:
 #
-# ⚠ OPEN, needs a maze measurement before anyone changes it: whether 1.5 is
-# still the RIGHT cap is an empirical question about traction and wedging in
-# husky_maze specifically, and the traction margin has genuinely changed now
-# that the wheels can deliver real torque. Raising it toward the 1.805
-# ceiling would buy ~15% off each pivot; do not do so without running the
-# maze and counting wedges.
+#     cap   runs  hops  wedges  wedge rate   sim s / hop
+#     1.0      5   215       0      0.0000          6.78
+#     1.5      5   217       0      0.0000          6.31
+#     2.5      4   145       0      0.0000          6.03
+#     3.4      5   218       0      0.0000          6.01
+#
+# ZERO wedges in 795 hops, at every cap up to 3.4 rad/s -- the base's whole
+# kinematic range. A second pass sampled the pose DURING each hop rather
+# than only at settle (husky_maze, 72 hops, 47 direction changes) and the
+# worst footprint-to-wall clearance over the entire run was IDENTICAL at
+# every cap: 0.3210 / 0.3208 / 0.3208 / 0.3212 m at 1.0 / 1.5 / 2.5 / 3.4.
+# The geometric floor for a perfectly centred pivot is 0.330 m (2 m cell,
+# 1.8 m clear corridor, 1.14 m swept diameter for the 0.987 x 0.571
+# base_link), so the body skids ~9 mm and does so INDEPENDENTLY OF THE CAP.
+# The bridge's own reverse-and-unwind escape (STUCK_TICKS_THRESHOLD below)
+# did not fire once. Peak achieved yaw tracked the cap linearly -- 0.559 /
+# 0.792 / 1.347 / 1.781 rad/s, i.e. 0.52-0.56 of command throughout, with
+# 3.4 landing on the base's measured 1.805 rad/s ceiling.
+#
+# So the cap buys no traction margin. What it costs is pivot time, and the
+# curve is shallow: 1.0 -> 1.5 is worth 7% of a hop, 1.5 -> 3.4 only 5% more.
+#
+# LEFT AT 1.5, for a reason that is NOT the old one: it is inside the base's
+# measured 1.805 rad/s ceiling, it has most of the available speed already,
+# and every route measured above is shortest-path BFS -- an agent
+# wall-following into a dead end reverses and re-pivots in cells this sweep
+# never entered. Raising it to 3.4 is SAFE on everything measured here and
+# buys ~5% of hop time; that is not worth spending the margin on the
+# regime nobody has measured. Anyone who wants it back: re-run the sweep
+# (five worlds, all four caps, count faults AND during-motion clearance --
+# the settled pose alone cannot see a skid) before moving this number.
 PIVOT_ANGULAR_R_S_MAX = 1.5
 # Wheel command ramping. Original tuning was "effectively unlimited" (6.0)
 # because Webots' built-in motor torque limits smooth the diff-drive
@@ -2519,9 +2545,12 @@ def _twist_for_task(task, x, y, yaw, sim_time, v_lin, v_ang):
         # drive forward with a small heading correction. This is far more
         # robust on a 2 m maze grid than smooth pure-pursuit, which loves
         # to overshoot 90-degree turns and wedge against the next wall.
-        # Pivot is capped at PIVOT_ANGULAR_R_S_MAX (1.5 rad/s) so the
-        # skid-steer doesn't slide the body during in-place rotation —
-        # critical for legal-only navigation (no teleport recovery).
+        # Pivot is capped at PIVOT_ANGULAR_R_S_MAX (1.5 rad/s commanded,
+        # ~0.78 rad/s delivered). ⛔ NOT because "the skid-steer would
+        # otherwise slide the body during in-place rotation": measured
+        # 2026-09-11 across all five husky_maze_* worlds at caps 1.0 / 1.5 /
+        # 2.5 / 3.4, the worst during-pivot wall clearance is 0.321 m at
+        # EVERY cap and no hop ever wedged. See the constant's own block.
         if abs(err_yaw) > TURN_FIRST_RAD:
             ang = clamp(err_yaw * HEADING_KP, -PIVOT_ANGULAR_R_S_MAX, PIVOT_ANGULAR_R_S_MAX)
             return 0.0, ang, False, None

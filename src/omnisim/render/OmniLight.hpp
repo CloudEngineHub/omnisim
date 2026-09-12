@@ -43,6 +43,7 @@
 #define OMNILIGHT_HPP
 
 #include <atomic>
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <vector>
@@ -53,6 +54,7 @@ struct OmniLightTriangle {
 };
 
 struct OmniLightMaterial {
+  bool emissiveTwoSided = true;
   float albedoLin[3] = {0.5f, 0.5f, 0.5f};    // linear diffuse albedo
   float emissiveLin[3] = {0.0f, 0.0f, 0.0f};  // linear emitted radiance
 };
@@ -61,6 +63,7 @@ struct OmniLightMaterial {
 // occlusion — the cure for the real-time extras' light-through-walls and shadowlessness.
 // Layout mirrors the renderer's ExtraLight records (colour premultiplied by intensity, linear).
 struct OmniLightLocal {
+  bool physical = false;
   float pos[3] = {0, 0, 0};
   float colorLin[3] = {1, 1, 1};
   float radius = 0.0f;              // <= 0: no cutoff
@@ -84,10 +87,13 @@ struct OmniLightParams {
   // probe total here as it runs. Plain relaxed stores; may be null.
   std::atomic<int> *progressDone = nullptr;
   std::atomic<int> *progressTotal = nullptr;
+  const std::atomic<bool> *cancel = nullptr;
   // Static local lights to bake (occluded, bounced). The caller crossfades the real-time
   // unshadowed versions OUT as the volume fades in.
   std::vector<OmniLightLocal> locals;
   float localScale = 1.0f;          // brightness calibration vs the retired real-time term
+  // Optional local captures (up to three, in addition to the broad scene capture).
+  std::vector<std::array<float,3>> reflectionPositions;
   // Sky radiance sampler (linear RGB for a world-space direction). Called from WORKER threads —
   // must be pure/thread-safe (the caller passes a closure over a prebaked table).
   std::function<void(const float dir[3], float out[3])> skySample;
@@ -103,11 +109,13 @@ struct OmniLightVolume {
   std::vector<uint16_t> texels;
   int probeCount = 0;
   int validProbes = 0;
-  // Traced specular probe: one RGBA16F cubemap (3 mips: size, size/4, size/16) path-traced from
+  // Traced specular probe: one RGBA16F cubemap (3 mips: size, size/2, size/4) path-traced from
   // cubeCenter — real reflections of the actual scene for metals and glass, parallax-corrected
   // at runtime against the scene AABB. Mip layout: per mip, 6 faces of mipSize^2 texels.
   std::vector<uint16_t> cubeTexels;
   int cubeSize = 0;
+  int cubeCount = 0;
+  std::vector<float> cubeCenters, cubeBoundsMin, cubeBoundsMax;
   float cubeCenter[3] = {0, 0, 0};
   float aabbMin[3] = {0, 0, 0};
   float aabbMax[3] = {0, 0, 0};

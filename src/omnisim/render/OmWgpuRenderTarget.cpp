@@ -19,8 +19,10 @@
 #include "OmLog.hpp"
 #include "OmVulkanBackend.hpp"
 #include "OmWgpuShaders.hpp"
+#include "OmLocalShadow.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
@@ -28,12 +30,15 @@
 #include <cmath>
 #include <cstring>
 #include <map>
+#include <string>
 #include <vector>
 
 #ifdef OMNISIM_WITH_VULKAN
 #  ifdef WB_WGPU_NATIVE_AVAILABLE
 #    include "webgpu/webgpu.h"
 #    include "webgpu/wgpu.h"
+#    include "OmGpuTimer.hpp"
+#    include "OmMotionVectors.hpp"
 #    include <cstring>
 #  endif
 #endif
@@ -41,6 +46,18 @@
 #ifdef OMNISIM_WITH_VULKAN
 #  ifdef WB_WGPU_NATIVE_AVAILABLE
 namespace {
+  bool objectMotionEnabled() {
+    // All switches are value-parsed; this same gate controls the invariant lit
+    // vertex variant and the motion pass that must agree with its depth.
+    static const bool enabled =
+      (!qEnvironmentVariableIsSet("OMNISIM_WGPU_TAA") || qEnvironmentVariableIntValue("OMNISIM_WGPU_TAA") != 0) &&
+      (!qEnvironmentVariableIsSet("OMNISIM_WGPU_TAA_VALIDATION") ||
+       qEnvironmentVariableIntValue("OMNISIM_WGPU_TAA_VALIDATION") != 0) &&
+      // Per-object/deformation motion for the temporal viewport; 0 keeps camera-only reprojection.
+      (!qEnvironmentVariableIsSet("OMNISIM_WGPU_MOTION_VECTORS") ||
+       qEnvironmentVariableIntValue("OMNISIM_WGPU_MOTION_VECTORS") != 0);
+    return enabled;
+  }
   // wgpu buffer-to-buffer copy requires the bytes-per-row to be a
   // multiple of 256 (the COPY_BYTES_PER_ROW_ALIGNMENT). For RGBA8
   // that means a row stride of ceil(width*4 / 256) * 256.
@@ -126,6 +143,8 @@ OmWgpuRenderTarget::OmWgpuRenderTarget(OmVulkanBackend *backend, uint32_t width,
 OmWgpuRenderTarget::~OmWgpuRenderTarget() {
 #ifdef OMNISIM_WITH_VULKAN
 #  ifdef WB_WGPU_NATIVE_AVAILABLE
+  delete static_cast<OmGpuTimer *>(mGpuTimer);
+  delete static_cast<OmMotionVectors *>(mMotionVectors);
   // W4a overlay lines (all null unless an overlay was actually drawn this session).
   if (mOverlayLineBg)
     wgpuBindGroupRelease(static_cast<WGPUBindGroup>(mOverlayLineBg));
@@ -334,10 +353,10 @@ OmWgpuRenderTarget::~OmWgpuRenderTarget() {
     wgpuRenderPipelineRelease(static_cast<WGPURenderPipeline>(mVolPipeline));
   if (mVolShaderModule)
     wgpuShaderModuleRelease(static_cast<WGPUShaderModule>(mVolShaderModule));
-  for (void *tv : {mTaaMvView[0], mTaaMvView[1]})
+  for (void *tv : {mTaaMvView[0], mTaaMvView[1], mTaaDepthView[0], mTaaDepthView[1]})
     if (tv)
       wgpuTextureViewRelease(static_cast<WGPUTextureView>(tv));
-  for (void *tt : {mTaaMvTex[0], mTaaMvTex[1]})
+  for (void *tt : {mTaaMvTex[0], mTaaMvTex[1], mTaaDepthTex[0], mTaaDepthTex[1]})
     if (tt)
       wgpuTextureRelease(static_cast<WGPUTexture>(tt));
   if (mTaaMvBgl)
@@ -2076,7 +2095,12 @@ bool OmWgpuRenderTarget::ensureTexturedShadowPipeline() {
 
   WGPUShaderSourceWGSL wgsl = {};
   wgsl.chain.sType = WGPUSType_ShaderSourceWGSL;
-  wgsl.code.data = OmWgpuShaders::kSolidLitTexturedShadow;
+  // Invariance can change rounding even when a second pass is not used. Keep
+  // the original vertex program for sensors and TAA-off/legacy comparisons.
+  std::string regularSource = OmWgpuShaders::kSolidLitTexturedShadow;
+  const size_t invariant = regularSource.find("@invariant ");
+  if (invariant != std::string::npos) regularSource.erase(invariant, std::strlen("@invariant "));
+  wgsl.code.data = regularSource.c_str();
   wgsl.code.length = WGPU_STRLEN;
   WGPUShaderModuleDescriptor smDesc = {};
   smDesc.nextInChain = &wgsl.chain;
@@ -2086,6 +2110,15 @@ bool OmWgpuRenderTarget::ensureTexturedShadowPipeline() {
     return false;
   }
   mTexShadowShaderModule = sm;
+  struct MotionShader {
+    WGPUShaderModule module = nullptr;
+    ~MotionShader() { if (module) wgpuShaderModuleRelease(module); }
+  } motionShader;
+  if (objectMotionEnabled()) {
+    wgsl.code.data = OmWgpuShaders::kSolidLitTexturedShadow;
+    motionShader.module = wgpuDeviceCreateShaderModule(device, &smDesc);
+    if (!motionShader.module) return false;
+  }
 
   // Non-filtering sampler for the R32Float shadow map.
   WGPUSamplerDescriptor ss = {};
@@ -2134,7 +2167,7 @@ bool OmWgpuRenderTarget::ensureTexturedShadowPipeline() {
     mOmniCubeTex = wgpuDeviceCreateTexture(device, &ctd);
     if (mOmniCubeTex) {
       WGPUTextureViewDescriptor cvd = {};
-      cvd.dimension = WGPUTextureViewDimension_Cube;
+      cvd.dimension = WGPUTextureViewDimension_CubeArray;
       cvd.format = WGPUTextureFormat_RGBA16Float;
       cvd.mipLevelCount = 1;
       cvd.arrayLayerCount = 6;
@@ -2171,7 +2204,7 @@ bool OmWgpuRenderTarget::ensureTexturedShadowPipeline() {
   e[8].binding = 8;  // shared LightU (lightViewProj + shadowParams + hemisphere + fog + 8 extra lights)
   e[8].visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;  // vertex reads sceneViewProj
   e[8].buffer.type = WGPUBufferBindingType_Uniform;
-  e[8].buffer.minBindingSize = 1216;  // header..cascades + shared values + IBL palette + PCSS + OmniLight
+  e[8].buffer.minBindingSize = 4608;  // lighting, reflection captures, local shadow projections
   e[9].binding = 9;  // OmniLight probe volume (3D RGBA16F, 4 SH z-slabs)
   e[9].visibility = WGPUShaderStage_Fragment;
   e[9].texture.sampleType = WGPUTextureSampleType_Float;
@@ -2182,7 +2215,7 @@ bool OmWgpuRenderTarget::ensureTexturedShadowPipeline() {
   e[11].binding = 11;  // traced specular probe (cube, 3 mips)
   e[11].visibility = WGPUShaderStage_Fragment;
   e[11].texture.sampleType = WGPUTextureSampleType_Float;
-  e[11].texture.viewDimension = WGPUTextureViewDimension_Cube;
+  e[11].texture.viewDimension = WGPUTextureViewDimension_CubeArray;
   e[12].binding = 12;  // W3/P3 Pen paint layer (1x1 transparent default when the draw has none)
   e[12].visibility = WGPUShaderStage_Fragment;
   e[12].texture.sampleType = WGPUTextureSampleType_Float;
@@ -2267,7 +2300,9 @@ bool OmWgpuRenderTarget::ensureTexturedShadowPipeline() {
   // FAR plane after reversal — near-uniform precision, no far-field decal z-fighting).
   depthState.format = WGPUTextureFormat_Depth32Float;
   depthState.depthCompare = WGPUCompareFunction_Greater;
+  pipeDesc.vertex.module = motionShader.module ? motionShader.module : sm;
   mTexShadowPipelineHdrRev = wgpuDeviceCreateRenderPipeline(device, &pipeDesc);
+  pipeDesc.vertex.module = sm;
   colorTarget.format = WGPUTextureFormat_RGBA8Unorm;
   mTexShadowPipelineMsaaRev = wgpuDeviceCreateRenderPipeline(device, &pipeDesc);
   // Translucent variants: identical pipelines with src-over alpha blending, depth WRITE off
@@ -2290,7 +2325,9 @@ bool OmWgpuRenderTarget::ensureTexturedShadowPipeline() {
   // state here: RGBA8 + D32F/Greater + count=4 → the MsaaRev config
   mTexShadowPipelineMsaaRevBlend = wgpuDeviceCreateRenderPipeline(device, &pipeDesc);
   colorTarget.format = WGPUTextureFormat_RGBA16Float;
+  pipeDesc.vertex.module = motionShader.module ? motionShader.module : sm;
   mTexShadowPipelineHdrRevBlend = wgpuDeviceCreateRenderPipeline(device, &pipeDesc);
+  pipeDesc.vertex.module = sm;
   depthState.format = WGPUTextureFormat_Depth24Plus;
   depthState.depthCompare = WGPUCompareFunction_Less;
   mTexShadowPipelineHdrBlend = wgpuDeviceCreateRenderPipeline(device, &pipeDesc);
@@ -2786,7 +2823,7 @@ bool OmWgpuRenderTarget::ensureTaaMvPipeline() {
     return false;
   }
   mTaaMvShaderModule = sm;
-  WGPUBindGroupLayoutEntry le[5] = {};
+  WGPUBindGroupLayoutEntry le[7] = {};
   le[0].binding = 0;
   le[0].visibility = WGPUShaderStage_Fragment;
   le[0].buffer.type = WGPUBufferBindingType_Uniform;
@@ -2807,8 +2844,17 @@ bool OmWgpuRenderTarget::ensureTaaMvPipeline() {
   le[4].binding = 4;
   le[4].visibility = WGPUShaderStage_Fragment;
   le[4].sampler.type = WGPUSamplerBindingType_Filtering;
+  le[5].binding = 5;
+  le[5].visibility = WGPUShaderStage_Fragment;
+  le[5].texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;
+  le[5].texture.viewDimension = WGPUTextureViewDimension_2D;
+  le[6].binding = 6;
+  le[6].visibility = WGPUShaderStage_Fragment;
+  le[6].texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;
+  le[6].texture.viewDimension = WGPUTextureViewDimension_2D;
+  le[6].texture.multisampled = 1;
   WGPUBindGroupLayoutDescriptor ld = {};
-  ld.entryCount = 5;
+  ld.entryCount = 7;
   ld.entries = le;
   WGPUBindGroupLayout bgl = wgpuDeviceCreateBindGroupLayout(device, &ld);
   if (!bgl)
@@ -2826,15 +2872,17 @@ bool OmWgpuRenderTarget::ensureTaaMvPipeline() {
   WGPUPipelineLayout pl = wgpuDeviceCreatePipelineLayout(device, &plDesc);
   if (!pl)
     return false;
-  WGPUColorTargetState ct = {};
-  ct.format = WGPUTextureFormat_RGBA8Unorm;
-  ct.writeMask = WGPUColorWriteMask_All;
+  WGPUColorTargetState ct[2] = {};
+  ct[0].format = WGPUTextureFormat_RGBA8Unorm;
+  ct[0].writeMask = WGPUColorWriteMask_All;
+  ct[1].format = WGPUTextureFormat_R32Float;
+  ct[1].writeMask = WGPUColorWriteMask_Red;
   WGPUFragmentState fs = {};
   fs.module = sm;
   fs.entryPoint.data = "fs_main";
   fs.entryPoint.length = WGPU_STRLEN;
-  fs.targetCount = 1;
-  fs.targets = &ct;
+  fs.targetCount = 2;
+  fs.targets = ct;
   WGPURenderPipelineDescriptor pd = {};
   pd.layout = pl;
   pd.vertex.module = sm;
@@ -2934,7 +2982,7 @@ bool OmWgpuRenderTarget::ensureAdaptPipeline() {
 }
 
 bool OmWgpuRenderTarget::setOmniLightCube(const uint16_t *texels, int size, const float *center3,
-                                          const float *aabbMin3, const float *aabbMax3) {
+                                          const float *aabbMin3, const float *aabbMax3, int count) {
 #ifdef OMNISIM_WITH_VULKAN
 #  ifdef WB_WGPU_NATIVE_AVAILABLE
   if (!mUsable)
@@ -2953,40 +3001,50 @@ bool OmWgpuRenderTarget::setOmniLightCube(const uint16_t *texels, int size, cons
   td.dimension = WGPUTextureDimension_2D;
   td.format = WGPUTextureFormat_RGBA16Float;
   td.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
-  td.mipLevelCount = 3;
+  int levels=1; for (int s=size;s>1;s/=2) ++levels;
+  count=std::clamp(count,1,4);
+  td.mipLevelCount = levels;
   td.sampleCount = 1;
-  td.size = {static_cast<uint32_t>(size), static_cast<uint32_t>(size), 6};
+  td.size = {static_cast<uint32_t>(size), static_cast<uint32_t>(size), static_cast<uint32_t>(6*count)};
   mOmniCubeTex = wgpuDeviceCreateTexture(device, &td);
   if (!mOmniCubeTex)
     return false;
   WGPUTextureViewDescriptor cvd = {};
-  cvd.dimension = WGPUTextureViewDimension_Cube;
+  cvd.dimension = WGPUTextureViewDimension_CubeArray;
   cvd.format = WGPUTextureFormat_RGBA16Float;
-  cvd.mipLevelCount = 3;
-  cvd.arrayLayerCount = 6;
+  cvd.mipLevelCount = levels;
+  cvd.arrayLayerCount = 6*count;
   mOmniCubeView = wgpuTextureCreateView(static_cast<WGPUTexture>(mOmniCubeTex), &cvd);
   if (!mOmniCubeView)
     return false;
   const uint16_t *src = texels;
+  for (int probe=0;probe<count;++probe) {
   int ms = size;
-  for (int mip = 0; mip < 3; ++mip) {
+  for (int mip = 0; mip < levels; ++mip) {
     WGPUTexelCopyTextureInfo dst = {};
     dst.texture = static_cast<WGPUTexture>(mOmniCubeTex);
     dst.mipLevel = static_cast<uint32_t>(mip);
+    dst.origin.z=probe*6;
     WGPUTexelCopyBufferLayout layout = {};
     layout.bytesPerRow = static_cast<uint32_t>(ms) * 8;
     layout.rowsPerImage = static_cast<uint32_t>(ms);
     WGPUExtent3D ext = {static_cast<uint32_t>(ms), static_cast<uint32_t>(ms), 6};
     wgpuQueueWriteTexture(queue, &dst, src, static_cast<size_t>(ms) * ms * 6 * 8, &layout, &ext);
     src += static_cast<size_t>(ms) * ms * 6 * 4;
-    ms /= 4;
+    ms /= 2;  // standard GPU mip extents; the baker packs size, size/2, size/4
+  }
+  for (int k=0;k<3;++k) {
+    mReflectionCenters[probe*4+k]=center3[probe*3+k];
+    mReflectionMin[probe*4+k]=aabbMin3[probe*3+k];
+    mReflectionMax[probe*4+k]=aabbMax3[probe*3+k];
+  }
   }
   for (int k = 0; k < 3; ++k) {
     mOmniCubeCenter4[k] = center3[k];
     mOmniAabbMin4[k] = aabbMin3[k];
     mOmniAabbMax4[k] = aabbMax3[k];
   }
-  mOmniCubeCenter4[3] = 1.0f;
+  mOmniCubeCenter4[3] = static_cast<float>(count);
   for (auto &kv : mTexShadowBgCache)
     if (kv.second)
       wgpuBindGroupRelease(static_cast<WGPUBindGroup>(kv.second));
@@ -5867,10 +5925,15 @@ bool OmWgpuRenderTarget::ensureShadowMapArray(uint32_t res, uint32_t cascades) {
     return false;
   if (cascades < 1)
     cascades = 1;
-  if (cascades > kCsmMaxCascades)
-    cascades = kCsmMaxCascades;
+  if (cascades > kCsmMaxCascades + 1)
+    cascades = kCsmMaxCascades + 1;  // optional local-light atlas after the sun layers
   if (mCsmShadowArrayTexture && mCsmShadowRes == res && mCsmCascadeCount == cascades)
     return true;
+  mLocalShadowCache.invalidate();
+  // Toggling local shadows changes the array view embedded in every cached group.
+  for (auto &kv:mTexShadowBgCache)
+    if (kv.second) wgpuBindGroupRelease(static_cast<WGPUBindGroup>(kv.second));
+  mTexShadowBgCache.clear();
   // Changed size/count → release the prior array + views before rebuilding.
   for (void *v : mCsmShadowLayerViews)
     if (v)
@@ -7586,7 +7649,13 @@ bool OmWgpuRenderTarget::clearAndDrawSceneTexturedShadowed(
   float ssaoStrength, bool reversedZ, const float *extraLights, uint32_t extraLightCount,
   float ssaoRadiusScale, const float *sunEnergy3, float ssaoNearZ,
   const float *cascadeLightViewProjs, const float *cascadeSplitsFar4, uint32_t cascadeCount,
-  float bloomHdrThreshold, const float *skyScatter24, const float *iblSky8, int outputTransfer) {
+  float bloomHdrThreshold, const float *skyScatter24, const float *iblSky8, int outputTransfer,
+  const float *extraLightOptions) {
+  struct TemporalSubmission {
+    bool &valid;
+    bool submitted = false;
+    ~TemporalSubmission() { if (!submitted) valid = false; }
+  } temporalSubmission{mTaaMvHistValid};
   // rgba8 == nullptr → render-only (window-swap present samples the texture directly; the whole
   // readback section is skipped — the CPU never touches pixels).
   if (!mUsable || !viewProj16 || !lightViewProj16 || !lightDirAmbient4)
@@ -7595,8 +7664,20 @@ bool OmWgpuRenderTarget::clearAndDrawSceneTexturedShadowed(
 #  ifdef WB_WGPU_NATIVE_AVAILABLE
   const uint32_t nCsm = cascadeCount > 4u ? 4u : cascadeCount;
   const uint32_t shadowLayers = nCsm > 0u ? nCsm : 1u;
+  const uint32_t nLocal = extraLights ? std::min(extraLightCount,8u) : 0u;
+  float localMatrices[48*16] = {}, localMeta[8*4] = {};
+  mLocalShadowStats = {};
+  bool localShadows = false;
+  for (uint32_t li=0;li<nLocal;++li) {
+    if (!extraLightOptions || extraLightOptions[li*2]<.5f || extraLights[li*16+3]<.5f) continue;
+    localShadows=true;
+    localMeta[li*4]=1; localMeta[li*4+1]=static_cast<float>(shadowLayers);
+    const float radius=extraLights[li*16+7];
+    for (uint32_t face=0;face<6;++face)
+      omLocalShadowMatrix(extraLights+li*16,face,radius>0?radius:1000,localMatrices+(li*6+face)*16);
+  }
   constexpr uint32_t kShadowRes = 2048;  // per-layer resolution (VRAM: 2048^2 x 4 B x layers)
-  if (!ensureSceneClipDepthF32Pipeline() || !ensureShadowMapArray(kShadowRes, shadowLayers) ||
+  if (!ensureSceneClipDepthF32Pipeline() || !ensureShadowMapArray(kShadowRes, shadowLayers+(localShadows?1u:0u)) ||
       !ensureTexturedShadowPipeline())
     return false;
   WGPUDevice device = static_cast<WGPUDevice>(mBackend->device());
@@ -7612,6 +7693,15 @@ bool OmWgpuRenderTarget::clearAndDrawSceneTexturedShadowed(
   // matrices from these same slots (+64), so its old per-(layer, draw) staging —
   // layers x slotCount x 256 B, ~3.5 MB/frame at 3 cascades on a 4.6k-draw scene — is gone too.
   if (needed > mTexShadowScnBufferSize) {
+    // A released native handle's ADDRESS can be reused by the next allocation.
+    // Pointer comparisons below cannot detect that replacement: a cached bind
+    // group can keep the old, smaller storage alive and silently read zero for
+    // a newly inserted draw's out-of-range slot. Drop dependencies explicitly.
+    releaseTexShadowBgCache();
+    if (mClipDepthSharedBg)
+      wgpuBindGroupRelease(static_cast<WGPUBindGroup>(mClipDepthSharedBg));
+    mClipDepthSharedBg = nullptr;
+    mClipDepthSharedBgScnBuf = nullptr;
     if (mTexShadowScnBuffer)
       wgpuBufferRelease(static_cast<WGPUBuffer>(mTexShadowScnBuffer));
     WGPUBufferDescriptor ubDesc = {};
@@ -7698,7 +7788,7 @@ bool OmWgpuRenderTarget::clearAndDrawSceneTexturedShadowed(
     return false;
   if (!mCsmVpBuffer) {
     WGPUBufferDescriptor vd = {};
-    vd.size = 4 * kScnUniformStride;
+    vd.size = 52 * kScnUniformStride;
     vd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
     mCsmVpBuffer = wgpuDeviceCreateBuffer(device, &vd);
     if (!mCsmVpBuffer)
@@ -7709,6 +7799,10 @@ bool OmWgpuRenderTarget::clearAndDrawSceneTexturedShadowed(
     wgpuQueueWriteBuffer(queue, static_cast<WGPUBuffer>(mCsmVpBuffer),
                          static_cast<uint64_t>(c) * kScnUniformStride, vpC, 64);
   }
+  for (uint32_t li=0;li<nLocal;++li) if (localMeta[li*4]>.5f)
+    for (uint32_t face=0;face<6;++face)
+      wgpuQueueWriteBuffer(queue,static_cast<WGPUBuffer>(mCsmVpBuffer),
+        static_cast<uint64_t>(4+li*6+face)*kScnUniformStride,localMatrices+(li*6+face)*16,64);
   if (!mClipDepthSharedBg || mClipDepthSharedBgScnBuf != mTexShadowScnBuffer) {
     if (mClipDepthSharedBg)
       wgpuBindGroupRelease(static_cast<WGPUBindGroup>(mClipDepthSharedBg));
@@ -7741,10 +7835,15 @@ bool OmWgpuRenderTarget::clearAndDrawSceneTexturedShadowed(
   const bool msaaAvail = mTexShadowPipelineMsaa && ensureMsaaTargets();
   const bool hdrActive = agxExposure > 0.0f && msaaAvail && ensureHdrPipelines();
 
+  // Value-parsed A/B hatch for the former camera-only, unchecked history resolve.
+  static const bool temporalValidation = !qEnvironmentVariableIsSet("OMNISIM_WGPU_TAA_VALIDATION") ||
+                                         qEnvironmentVariableIntValue("OMNISIM_WGPU_TAA_VALIDATION") != 0;
+  float jitteredVP[16];
+  std::memcpy(jitteredVP, viewProj16, 64);
   // Shared LightU uniform: 144 B header + 16 B extraMeta + 8x64 B ExtraLight + 4x64 B cascade
   // view-projs + 16 B splits + 16 B per-cascade world texel + 64 B sceneViewProj + 16 B
   // sunDirAmbient + 16 B camPos = 1056 B.
-  constexpr uint32_t kLightUSize = 1216;
+  constexpr uint32_t kLightUSize = 4608;
   if (!mLightUniformBuffer) {
     WGPUBufferDescriptor ud = {};
     ud.size = kLightUSize;
@@ -7822,6 +7921,7 @@ bool OmWgpuRenderTarget::clearAndDrawSceneTexturedShadowed(
         }
       }
       std::memcpy(lu + 960, vpJ, 64);
+      std::memcpy(jitteredVP, vpJ, 64);
     }
     std::memcpy(lu + 1024, lightDirAmbient4, 16);
     if (cameraWorldPos3) {
@@ -7858,6 +7958,11 @@ bool OmWgpuRenderTarget::clearAndDrawSceneTexturedShadowed(
     std::memcpy(lu + 1136, mOmniParams4, 16);
     std::memcpy(lu + 1152, mOmniMisc4, 16);
     std::memcpy(lu + 1168, mOmniCubeCenter4, 16);
+    std::memcpy(lu + 1216, mReflectionCenters, 64);
+    std::memcpy(lu + 1280, mReflectionMin, 64);
+    std::memcpy(lu + 1344, mReflectionMax, 64);
+    std::memcpy(lu + 1408, localMatrices, sizeof(localMatrices));
+    std::memcpy(lu + 4480, localMeta, sizeof(localMeta));
     std::memcpy(lu + 1184, mOmniAabbMin4, 16);
     std::memcpy(lu + 1200, mOmniAabbMax4, 16);
     wgpuQueueWriteBuffer(queue, static_cast<WGPUBuffer>(mLightUniformBuffer), 0, lu, kLightUSize);
@@ -7875,7 +7980,16 @@ bool OmWgpuRenderTarget::clearAndDrawSceneTexturedShadowed(
   }
 
   WGPUCommandEncoderDescriptor encDesc = {};
+  const QByteArray timingPath = qgetenv("OMNISIM_WGPU_GPU_TIMING");
+  if (!mGpuTimer && !timingPath.isEmpty() && timingPath != "0")
+    mGpuTimer = new OmGpuTimer(device, queue, timingPath.constData(), mWidth, mHeight);
+  auto *gpuTimer = static_cast<OmGpuTimer *>(mGpuTimer);
+  if (gpuTimer) gpuTimer->begin(device);
   WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(device, &encDesc);
+  auto beginTimedPass = [&](WGPURenderPassDescriptor &desc, const char *name) {
+    desc.timestampWrites = gpuTimer ? gpuTimer->stamp(name) : nullptr;
+    return wgpuCommandEncoderBeginRenderPass(encoder, &desc);
+  };
   if (!encoder)
     return false;
 
@@ -7901,7 +8015,7 @@ bool OmWgpuRenderTarget::clearAndDrawSceneTexturedShadowed(
       pd.colorAttachmentCount = 1;
       pd.colorAttachments = &ca;
       pd.depthStencilAttachment = &da;
-      WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(encoder, &pd);
+      WGPURenderPassEncoder pass = beginTimedPass(pd, "sunShadow");
       if (!pass) {
         wgpuCommandEncoderRelease(encoder);
         return false;
@@ -7940,6 +8054,75 @@ bool OmWgpuRenderTarget::clearAndDrawSceneTexturedShadowed(
       wgpuRenderPassEncoderRelease(pass);
     }
   }
+
+  // Local shadows: exact input reuse plus conservative per-face caster culling.
+  // OMNISIM_WGPU_LOCAL_SHADOW_CACHE=0 / OMNISIM_WGPU_LOCAL_SHADOW_CULL=0
+  // independently restore the original work for A/B verification (default ON).
+  static const bool localCacheOn = !qEnvironmentVariableIsSet("OMNISIM_WGPU_LOCAL_SHADOW_CACHE") ||
+                                   qEnvironmentVariableIntValue("OMNISIM_WGPU_LOCAL_SHADOW_CACHE") != 0;
+  static const bool localCullOn = !qEnvironmentVariableIsSet("OMNISIM_WGPU_LOCAL_SHADOW_CULL") ||
+                                  qEnvironmentVariableIntValue("OMNISIM_WGPU_LOCAL_SHADOW_CULL") != 0;
+  const auto localStart = std::chrono::steady_clock::now();
+  if (!localShadows || !localCacheOn) mLocalShadowCache.invalidate();
+  if (localShadows) {
+    if (localCacheOn) mLocalShadowCache.begin(localMatrices,localMeta,localCullOn);
+    for (uint32_t i=0; i<numDraws; ++i) {
+      const auto &d=draws[i];
+      if (!d.vertexBuffer || !d.indexBuffer || !d.indexCount || !d.castShadows || d.translucent) continue;
+      if (localCacheOn)
+        mLocalShadowCache.caster(d.geometryRevision,d.vertexBuffer,d.indexBuffer,d.indexCount,
+                                d.modelMatrix16,d.localCenter,d.localRadius);
+      ++mLocalShadowStats.candidates;
+    }
+    uint32_t faces=0;
+    for (uint32_t li=0; li<nLocal; ++li) if (localMeta[li*4]>.5f) faces+=6;
+    mLocalShadowStats.candidates*=faces;
+    mLocalShadowStats.reused=localCacheOn && !mLocalShadowCache.needsRender();
+  }
+  const bool drawLocalShadows=localShadows && !mLocalShadowStats.reused;
+  if (drawLocalShadows) {
+    WGPURenderPassColorAttachment ca = {};
+    ca.view=static_cast<WGPUTextureView>(mCsmShadowLayerViews[shadowLayers]);
+    ca.loadOp=WGPULoadOp_Clear; ca.storeOp=WGPUStoreOp_Store;
+    ca.clearValue={1,0,0,1}; ca.depthSlice=WGPU_DEPTH_SLICE_UNDEFINED;
+    WGPURenderPassDepthStencilAttachment da = {};
+    da.view=static_cast<WGPUTextureView>(mCsmShadowDepthView);
+    da.depthLoadOp=WGPULoadOp_Clear; da.depthStoreOp=WGPUStoreOp_Store; da.depthClearValue=1;
+    WGPURenderPassDescriptor pd = {};
+    pd.colorAttachmentCount=1; pd.colorAttachments=&ca; pd.depthStencilAttachment=&da;
+    WGPURenderPassEncoder pass=beginTimedPass(pd, "localShadow");
+    if (!pass) { wgpuCommandEncoderRelease(encoder); return false; }
+    wgpuRenderPassEncoderSetPipeline(pass,static_cast<WGPURenderPipeline>(mClipDepthSharedPipeline));
+    for (uint32_t li=0;li<nLocal;++li) if (localMeta[li*4]>.5f) {
+      for (uint32_t face=0;face<6;++face) {
+        ++mLocalShadowStats.faces;
+        const uint32_t offset=(4+li*6+face)*kScnUniformStride;
+        wgpuRenderPassEncoderSetBindGroup(pass,0,p1bg,1,&offset);
+        wgpuRenderPassEncoderSetViewport(pass,li*256.0f,face*256.0f,256,256,0,1);
+        wgpuRenderPassEncoderSetScissorRect(pass,li*256,face*256,256,256);
+        void *lastVb=nullptr,*lastIb=nullptr;
+        for (uint32_t i=0;i<numDraws;++i) {
+          const auto &d=draws[i];
+          if (!d.vertexBuffer || !d.indexBuffer || !d.indexCount || !d.castShadows || d.translucent) continue;
+          if (localCullOn && omOutsideLocalShadow(d.modelMatrix16,d.localCenter,d.localRadius,
+                                                 localMatrices+(li*6+face)*16)) continue;
+          ++mLocalShadowStats.draws;
+          if (d.vertexBuffer!=lastVb) {
+            wgpuRenderPassEncoderSetVertexBuffer(pass,0,static_cast<WGPUBuffer>(d.vertexBuffer),0,WGPU_WHOLE_SIZE);
+            lastVb=d.vertexBuffer;
+          }
+          if (d.indexBuffer!=lastIb) {
+            wgpuRenderPassEncoderSetIndexBuffer(pass,static_cast<WGPUBuffer>(d.indexBuffer),WGPUIndexFormat_Uint32,0,WGPU_WHOLE_SIZE);
+            lastIb=d.indexBuffer;
+          }
+          wgpuRenderPassEncoderDrawIndexed(pass,d.indexCount,1,0,0,i);
+        }
+      }
+    }
+    wgpuRenderPassEncoderEnd(pass); wgpuRenderPassEncoderRelease(pass);
+  }
+  if (localShadows)
+    mLocalShadowStats.cpuUs=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-localStart).count();
 
   // Diagnostic (OMNISIM_WGPU_SHADOWMAP_DUMP=<path.raw>): one-shot readback of cascade layer 0 as
   // raw f32 2048x2048 (~frame 200) — the definitive "is the caster in the shadow map" instrument.
@@ -8035,7 +8218,7 @@ bool OmWgpuRenderTarget::clearAndDrawSceneTexturedShadowed(
     pd.colorAttachmentCount = 1;
     pd.colorAttachments = &ca;
     pd.depthStencilAttachment = &da;
-    WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(encoder, &pd);
+    WGPURenderPassEncoder pass = beginTimedPass(pd, "scene");
     if (!pass) {
       wgpuCommandEncoderRelease(encoder);
       return false;
@@ -8086,7 +8269,7 @@ bool OmWgpuRenderTarget::clearAndDrawSceneTexturedShadowed(
         e[7].sampler = static_cast<WGPUSampler>(mTexShadowSampler);
         e[8].binding = 8;
         e[8].buffer = static_cast<WGPUBuffer>(mLightUniformBuffer);
-        e[8].size = 1216;  // header + extras + cascades + shared values + IBL palette + PCSS + OmniLight
+        e[8].size = kLightUSize;
         e[9].binding = 9;
         e[9].textureView = static_cast<WGPUTextureView>(mOmniView);
         e[10].binding = 10;
@@ -8359,7 +8542,7 @@ bool OmWgpuRenderTarget::clearAndDrawSceneTexturedShadowed(
           WGPURenderPassDescriptor spd = {};
           spd.colorAttachmentCount = 1;
           spd.colorAttachments = &sca;
-          WGPURenderPassEncoder sp = wgpuCommandEncoderBeginRenderPass(encoder, &spd);
+          WGPURenderPassEncoder sp = beginTimedPass(spd, "ssr");
           if (sp) {
             wgpuRenderPassEncoderSetPipeline(sp, static_cast<WGPURenderPipeline>(mSsrPipeline));
             wgpuRenderPassEncoderSetBindGroup(sp, 0, static_cast<WGPUBindGroup>(mSsrBg), 0, nullptr);
@@ -8439,7 +8622,7 @@ bool OmWgpuRenderTarget::clearAndDrawSceneTexturedShadowed(
             WGPURenderPassDescriptor vrp = {};
             vrp.colorAttachmentCount = 1;
             vrp.colorAttachments = &vca;
-            WGPURenderPassEncoder vp = wgpuCommandEncoderBeginRenderPass(encoder, &vrp);
+            WGPURenderPassEncoder vp = beginTimedPass(vrp, "volume");
             if (vp) {
               wgpuRenderPassEncoderSetPipeline(vp, static_cast<WGPURenderPipeline>(mVolPipeline));
               wgpuRenderPassEncoderSetBindGroup(vp, 0, vbg, 0, nullptr);
@@ -8478,7 +8661,7 @@ bool OmWgpuRenderTarget::clearAndDrawSceneTexturedShadowed(
         WGPURenderPassDescriptor arp = {};
         arp.colorAttachmentCount = 1;
         arp.colorAttachments = &aca;
-        WGPURenderPassEncoder ap = wgpuCommandEncoderBeginRenderPass(encoder, &arp);
+        WGPURenderPassEncoder ap = beginTimedPass(arp, "exposure");
         if (ap) {
           wgpuRenderPassEncoderSetPipeline(ap, static_cast<WGPURenderPipeline>(mAdaptPipeline));
           wgpuRenderPassEncoderSetBindGroup(ap, 0, abg, 0, nullptr);
@@ -8530,7 +8713,7 @@ bool OmWgpuRenderTarget::clearAndDrawSceneTexturedShadowed(
     WGPURenderPassDescriptor pd = {};
     pd.colorAttachmentCount = 1;
     pd.colorAttachments = &ca;
-    WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(encoder, &pd);
+    WGPURenderPassEncoder pass = beginTimedPass(pd, "tonemap");
     if (pass) {
       wgpuRenderPassEncoderSetPipeline(pass, static_cast<WGPURenderPipeline>(mAgxPipeline));
       wgpuRenderPassEncoderSetBindGroup(
@@ -8658,7 +8841,7 @@ bool OmWgpuRenderTarget::clearAndDrawSceneTexturedShadowed(
         pd.colorAttachmentCount = 1;
         pd.colorAttachments = &ca;
         pd.depthStencilAttachment = &da;
-        WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(encoder, &pd);
+        WGPURenderPassEncoder pass = beginTimedPass(pd, "aoDepth");
         if (pass) {
           wgpuRenderPassEncoderSetPipeline(
             pass, static_cast<WGPURenderPipeline>(
@@ -8699,7 +8882,7 @@ bool OmWgpuRenderTarget::clearAndDrawSceneTexturedShadowed(
         WGPURenderPassDescriptor pd = {};
         pd.colorAttachmentCount = 1;
         pd.colorAttachments = &ca;
-        WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(encoder, &pd);
+        WGPURenderPassEncoder pass = beginTimedPass(pd, "ao");
         if (!pass)
           break;
         wgpuRenderPassEncoderSetPipeline(pass, static_cast<WGPURenderPipeline>(st.pipe));
@@ -8760,7 +8943,7 @@ bool OmWgpuRenderTarget::clearAndDrawSceneTexturedShadowed(
       WGPURenderPassDescriptor pd = {};
       pd.colorAttachmentCount = 1;
       pd.colorAttachments = &ca;
-      WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(encoder, &pd);
+      WGPURenderPassEncoder pass = beginTimedPass(pd, "bloom");
       if (!pass)
         break;
       wgpuRenderPassEncoderSetPipeline(pass, static_cast<WGPURenderPipeline>(s.pipe));
@@ -8784,12 +8967,17 @@ bool OmWgpuRenderTarget::clearAndDrawSceneTexturedShadowed(
     static const bool sTaaOn = !qEnvironmentVariableIsSet("OMNISIM_WGPU_TAA") ||
                                qEnvironmentVariableIntValue("OMNISIM_WGPU_TAA") != 0;
     if (sTaaOn && hdr && revActive && mScnMsaaDepthViewF32 && ensureTaaMvPipeline()) {
-      if (mTaaMvW != mWidth || mTaaMvH != mHeight || !mTaaMvView[0]) {
+      if (mTaaMvW != mWidth || mTaaMvH != mHeight || !mTaaMvView[0] || !mTaaMvView[1] ||
+          !mTaaDepthView[0] || !mTaaDepthView[1]) {
         for (int i = 0; i < 2; ++i) {
           if (mTaaMvView[i])
             wgpuTextureViewRelease(static_cast<WGPUTextureView>(mTaaMvView[i]));
           if (mTaaMvTex[i])
             wgpuTextureRelease(static_cast<WGPUTexture>(mTaaMvTex[i]));
+          if (mTaaDepthView[i])
+            wgpuTextureViewRelease(static_cast<WGPUTextureView>(mTaaDepthView[i]));
+          if (mTaaDepthTex[i])
+            wgpuTextureRelease(static_cast<WGPUTexture>(mTaaDepthTex[i]));
           WGPUTextureDescriptor td = {};
           td.dimension = WGPUTextureDimension_2D;
           td.format = WGPUTextureFormat_RGBA8Unorm;
@@ -8802,22 +8990,48 @@ bool OmWgpuRenderTarget::clearAndDrawSceneTexturedShadowed(
           mTaaMvView[i] = mTaaMvTex[i]
                           ? wgpuTextureCreateView(static_cast<WGPUTexture>(mTaaMvTex[i]), nullptr)
                           : nullptr;
+          td.format = WGPUTextureFormat_R32Float;
+          td.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding;
+          mTaaDepthTex[i] = wgpuDeviceCreateTexture(device, &td);
+          mTaaDepthView[i] = mTaaDepthTex[i]
+            ? wgpuTextureCreateView(static_cast<WGPUTexture>(mTaaDepthTex[i]), nullptr) : nullptr;
         }
         mTaaMvW = mWidth;
         mTaaMvH = mHeight;
         mTaaMvHistValid = false;
       }
       float invVP[16];
-      if (mTaaMvView[0] && mTaaMvView[1] && invert4x4ForSsr(viewProj16, invVP)) {
+      const float *historyVP = temporalValidation ? jitteredVP : viewProj16;
+      if (!mMotionVectors) mMotionVectors = new OmMotionVectors(device);
+      auto *motion = static_cast<OmMotionVectors *>(mMotionVectors);
+      const bool motionOn = objectMotionEnabled();
+      WGPUTextureView motionView = motion->dummy();
+      if (motionOn && temporalValidation) {
+        const bool cull = !qEnvironmentVariableIsSet("OMNISIM_WGPU_NO_CULL");
+        const float vpRow0 = vpRowLen(viewProj16, 0), vpRow1 = vpRowLen(viewProj16, 1),
+                    vpRow3 = vpRowLen(viewProj16, 3);
+        motionView = motion->render(queue, mWidth, mHeight, static_cast<WGPUTextureView>(mScnMsaaDepthViewF32),
+          static_cast<WGPUSampler>(mScnTexSampler), static_cast<WGPUTextureView>(mScnDefaultWhiteView),
+          historyVP, mTaaMvHistValid ? mTaaMvPrevVP : historyVP, draws, numDraws, mTaaMvHistValid,
+          beginTimedPass, [&](const OmWgpuSolidDraw &d) {
+            return d.translucent || !cull || !sphereOutsideClip(d.modelMatrix16, d.localCenter, d.localRadius,
+              viewProj16, vpRow0, vpRow1, vpRow3, false);
+          });
+        // A partial motion pass must not silently reuse camera-only history.
+        if (!motionView) { mTaaMvHistValid = false; motionView = motion->dummy(); }
+      } else motion->reset();
+      if (mTaaMvView[0] && mTaaMvView[1] && mTaaDepthView[0] && mTaaDepthView[1] &&
+          motionView && invert4x4ForSsr(historyVP, invVP)) {
         float ub[36];
         std::memcpy(ub + 0, invVP, 64);
-        std::memcpy(ub + 16, mTaaMvHistValid ? mTaaMvPrevVP : viewProj16, 64);
-        const float prm[4] = {1.0f, 0.90f, 0.0f, mTaaMvHistValid ? 1.0f : 0.0f};
+        std::memcpy(ub + 16, mTaaMvHistValid ? mTaaMvPrevVP : historyVP, 64);
+        const float prm[4] = {motionOn && temporalValidation ? 1.0f : 0.0f, 0.90f,
+                              temporalValidation ? 1.0f : 0.0f, mTaaMvHistValid ? 1.0f : 0.0f};
         std::memcpy(ub + 32, prm, 16);
         wgpuQueueWriteBuffer(queue, static_cast<WGPUBuffer>(mTaaMvUb), 0, ub, 144);
         const int cur = mTaaMvCur;
         const int prev = 1 - cur;
-        WGPUBindGroupEntry te[5] = {};
+        WGPUBindGroupEntry te[7] = {};
         te[0].binding = 0;
         te[0].buffer = static_cast<WGPUBuffer>(mTaaMvUb);
         te[0].size = 144;
@@ -8829,9 +9043,13 @@ bool OmWgpuRenderTarget::clearAndDrawSceneTexturedShadowed(
         te[3].textureView = static_cast<WGPUTextureView>(mScnMsaaDepthViewF32);
         te[4].binding = 4;
         te[4].sampler = static_cast<WGPUSampler>(mScnTexSampler);
+        te[5].binding = 5;
+        te[5].textureView = static_cast<WGPUTextureView>(mTaaDepthView[prev]);
+        te[6].binding = 6;
+        te[6].textureView = motionView;
         WGPUBindGroupDescriptor tbd = {};
         tbd.layout = static_cast<WGPUBindGroupLayout>(mTaaMvBgl);
-        tbd.entryCount = 5;
+        tbd.entryCount = 7;
         tbd.entries = te;
         WGPUBindGroup tbg = wgpuDeviceCreateBindGroup(device, &tbd);
         if (tbg) {
@@ -8840,10 +9058,12 @@ bool OmWgpuRenderTarget::clearAndDrawSceneTexturedShadowed(
           ca2.loadOp = WGPULoadOp_Clear;
           ca2.storeOp = WGPUStoreOp_Store;
           ca2.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
+          WGPURenderPassColorAttachment attachments[2] = {ca2, ca2};
+          attachments[1].view = static_cast<WGPUTextureView>(mTaaDepthView[cur]);
           WGPURenderPassDescriptor rp2 = {};
-          rp2.colorAttachmentCount = 1;
-          rp2.colorAttachments = &ca2;
-          WGPURenderPassEncoder tp = wgpuCommandEncoderBeginRenderPass(encoder, &rp2);
+          rp2.colorAttachmentCount = 2;
+          rp2.colorAttachments = attachments;
+          WGPURenderPassEncoder tp = beginTimedPass(rp2, "taa");
           if (tp) {
             wgpuRenderPassEncoderSetPipeline(tp, static_cast<WGPURenderPipeline>(mTaaMvPipeline));
             wgpuRenderPassEncoderSetBindGroup(tp, 0, tbg, 0, nullptr);
@@ -8853,24 +9073,32 @@ bool OmWgpuRenderTarget::clearAndDrawSceneTexturedShadowed(
             mTaaMvActiveView = mTaaMvView[cur];
             mTaaMvCur = prev;
             mTaaMvHistValid = true;
+            std::memcpy(mTaaMvPrevVP, historyVP, 64);
           }
           wgpuBindGroupRelease(tbg);
         }
-        std::memcpy(mTaaMvPrevVP, viewProj16, 64);
       }
     } else {
       mTaaMvHistValid = false;
     }
   }
 
+  if (!mTaaMvActiveView) mTaaMvHistValid = false;
+  if (gpuTimer) gpuTimer->resolve(encoder);
+
   if (!rgba8) {
     // Render-only: finish + submit without any texture→buffer copy or map.
     WGPUCommandBufferDescriptor cmdDescNb = {};
     WGPUCommandBuffer cmdNb = wgpuCommandEncoderFinish(encoder, &cmdDescNb);
     wgpuCommandEncoderRelease(encoder);
-    if (!cmdNb)
+    if (!cmdNb) {
+      mTaaMvHistValid = false;
       return false;
+    }
     wgpuQueueSubmit(queue, 1, &cmdNb);
+    temporalSubmission.submitted = true;
+    if (gpuTimer) gpuTimer->submitted();
+    if (drawLocalShadows && localCacheOn) mLocalShadowCache.submitted();
     wgpuCommandBufferRelease(cmdNb);
     return true;
   }
@@ -8906,9 +9134,12 @@ bool OmWgpuRenderTarget::clearAndDrawSceneTexturedShadowed(
   if (!cmd)
     return false;
   wgpuQueueSubmit(queue, 1, &cmd);
+  temporalSubmission.submitted = true;
+  if (gpuTimer) gpuTimer->submitted();
   wgpuCommandBufferRelease(cmd);
 
   // Diagnostic: dump the light-depth shadow map (pass-1 output) once, normalized to 8-bit gray.
+  if (drawLocalShadows && localCacheOn) mLocalShadowCache.submitted();
   // The five receiver-side acne cures all failed on spot.omniworld — this shows what pass 1 actually
   // stored. Env-gated; sync map; first call only.
   {

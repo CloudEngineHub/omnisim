@@ -91,7 +91,14 @@ def find_policy_path() -> Path:
         "OMNISIM_POLICY_ONNX")
     if p:
         return Path(p)
-    return (_REPO / "projects" / "rl" / "inference" / "policies"
+    # PATH: `projects/rl` was renamed to `projects/policies/research` by
+    # 1b668a910 and this default was never re-pointed, so the shipped
+    # controller took the "no ONNX -> zero residual" branch on every clean
+    # clone: it ran, it exited 0, and it never loaded the policy it exists to
+    # deploy (2026-09-11). The legacy omniquad policies were archived to
+    # research/policies/ (NOT research/inference/policies/) on 2026-06-26 --
+    # see .gitignore; this is where the tracked file actually is.
+    return (_REPO / "projects" / "policies" / "research" / "policies"
             / "omniquad_residual_main" / "policy.onnx")
 
 
@@ -121,6 +128,8 @@ def main() -> int:
             say(f"[omniquad_residual_deploy] FATAL: ONNX policy exists but failed "
                 f"to load ({e}) -- refusing to run ZERO residual and report it "
                 "as a policy result\n")
+            say(f"[omniquad_residual_deploy] path: {policy_path}\n")
+            say(f"[omniquad_residual_deploy] controller interpreter: {sys.executable}\n")
             # FATAL, deliberately: the policy file EXISTS and would not load -- a broken
             # environment (classically: onnxruntime missing from the CONTROLLER interpreter,
             # a DIFFERENT python than the engine embeds), not a mode. Falling back here keeps
@@ -129,7 +138,21 @@ def main() -> int:
             # head-to-head (2026-07-12) -- and the broken run scored BETTER than the real one.
             raise SystemExit(2)
     else:
-        say("[omniquad_residual_deploy] no ONNX found; running model walker with zero residual\n")
+        # LOUD, deliberately. Zero residual is a real mode, but it is NOT a
+        # policy result -- and while the default above pointed into the dead
+        # `projects/rl` tree this branch fired on every clean clone and said so
+        # in one quiet line (2026-09-11).
+        _bar = "!" * 72
+        say(f"{_bar}\n")
+        say("[omniquad_residual_deploy] POLICY NOT FOUND -- running the model "
+            "walker with ZERO residual. This run is NOT a policy result.\n")
+        say(f"[omniquad_residual_deploy]   tried: {policy_path}\n")
+        say(f"[omniquad_residual_deploy]   controller interpreter: {sys.executable}\n")
+        say("[omniquad_residual_deploy]   (the ENGINE spawns that python from PATH -- "
+            "it is NOT the one `python -m omnisim` runs)\n")
+        say("[omniquad_residual_deploy]   fix: point OMNIQUAD_POLICY_ONNX or "
+            "OMNISIM_POLICY_ONNX at an existing .onnx.\n")
+        say(f"{_bar}\n")
 
     # Gait geometry env-overridable to match the training agent: under the
     # post-W1 honest leg geometry the default 0.05 m swing arc grazes the

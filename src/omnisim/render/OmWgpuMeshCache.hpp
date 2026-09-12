@@ -61,10 +61,12 @@ struct OmWgpuMeshHandle {
   void *vertexBuffer = nullptr;  // WGPUBuffer (opaque)
   void *indexBuffer = nullptr;   // WGPUBuffer (opaque)
   uint32_t indexCount = 0;
+  uint64_t geometryRevision = 0;  // unique across uploads, updates, releases and cache instances
   // OmniLight bake input: CPU copies of the local-space positions (xyz per vertex) and the
   // triangle indices, retained at upload (the cache never evicts, so the pointers are stable
   // for the entry's lifetime). Null on the sentinel/miss paths.
   const std::vector<float> *cpuPositions = nullptr;
+  const std::vector<float> *cpuAttributes = nullptr;  // normal3 + uv2 for photo snapshots
   const std::vector<uint32_t> *cpuIndices = nullptr;
   // Local-space bounding sphere (AABB center + half-diagonal), computed once from the vertex
   // positions on the upload-miss path. radius < 0 = unknown -> callers must never cull the draw.
@@ -184,11 +186,13 @@ private:
     size_t indexBytes = 0;
     float localCenter[3] = {0.0f, 0.0f, 0.0f};
     float localRadius = -1.0f;
+    std::vector<float> cpuAttr;     // normal3 + uv2 per vertex
     std::vector<float> cpuPos;      // xyz per vertex (OmniLight bake)
     std::vector<uint32_t> cpuIdx;   // triangle indices, widened to u32
     // Content version of the VERTEX buffer, per cache. See vertexEpochIs() above:
     // -1.0 = never stamped, and never equal to a real simulation time.
     double vertexEpoch = -1.0;
+    uint64_t geometryRevision = 0;
   };
 
   // Derive the per-entry data that is a pure function of the VERTEX stream: the CPU

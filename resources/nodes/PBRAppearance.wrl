@@ -38,9 +38,14 @@
 #                          on geometry rendered with face culling off.
 
 PBRAppearance {
+  field SFBool emissiveTwoSided TRUE
   w3dField SFColor  baseColor             1 1 1
   field    SFNode   baseColorMap          NULL
   w3dField SFFloat  transparency          0
+  field    SFBool   refraction            FALSE
+  field    SFFloat  indexOfRefraction     1.5
+  field    SFColor  attenuationColor      1 1 1
+  field    SFFloat  attenuationDistance   1
   w3dField SFFloat  roughness             0
   field    SFNode   roughnessMap          NULL
   w3dField SFFloat  metalness             1

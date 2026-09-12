@@ -35,6 +35,11 @@ void OmPbrAppearance::init() {
   mBaseColor = findSFColor("baseColor");
   mBaseColorMap = findSFNode("baseColorMap");
   mTransparency = findSFDouble("transparency");
+  mRefraction = findSFBool("refraction");
+  mEmissiveTwoSided = findSFBool("emissiveTwoSided");
+  mIndexOfRefraction = findSFDouble("indexOfRefraction");
+  mAttenuationColor = findSFColor("attenuationColor");
+  mAttenuationDistance = findSFDouble("attenuationDistance");
   mRoughness = findSFDouble("roughness");
   mRoughnessMap = findSFNode("roughnessMap");
   mMetalness = findSFDouble("metalness");
@@ -84,6 +89,11 @@ OmPbrAppearance::OmPbrAppearance(const aiMaterial *material, const QString &file
   float opacity = 1.0f;
   material->Get(AI_MATKEY_OPACITY, opacity);
   mTransparency = new OmSFDouble(1.0 - opacity);
+  mRefraction = new OmSFBool(false);
+  mEmissiveTwoSided = new OmSFBool(true);
+  mIndexOfRefraction = new OmSFDouble(1.5);
+  mAttenuationColor = new OmSFColor(1, 1, 1);
+  mAttenuationDistance = new OmSFDouble(1);
 
   float r = 1.0f;
   if (material->Get(AI_MATKEY_SHININESS, r) == AI_SUCCESS)
@@ -166,6 +176,11 @@ OmPbrAppearance::~OmPbrAppearance() {
     delete mBaseColor;
     delete mEmissiveColor;
     delete mTransparency;
+    delete mRefraction;
+    delete mEmissiveTwoSided;
+    delete mIndexOfRefraction;
+    delete mAttenuationColor;
+    delete mAttenuationDistance;
     delete mRoughness;
     delete mMetalness;
     delete mIblStrength;
@@ -268,6 +283,11 @@ void OmPbrAppearance::postFinalize() {
   connect(mBaseColor, &OmSFColor::changed, this, &OmPbrAppearance::updateBaseColor);
   connect(mBaseColorMap, &OmSFNode::changed, this, &OmPbrAppearance::updateBaseColorMap);
   connect(mTransparency, &OmSFDouble::changed, this, &OmPbrAppearance::updateTransparency);
+  connect(mRefraction, &OmSFBool::changed, this, &OmPbrAppearance::updateFabricParameters);
+  connect(mEmissiveTwoSided, &OmSFBool::changed, this, &OmPbrAppearance::updateFabricParameters);
+  connect(mIndexOfRefraction, &OmSFDouble::changed, this, &OmPbrAppearance::updateFabricParameters);
+  connect(mAttenuationColor, &OmSFColor::changed, this, &OmPbrAppearance::updateFabricParameters);
+  connect(mAttenuationDistance, &OmSFDouble::changed, this, &OmPbrAppearance::updateFabricParameters);
   connect(mRoughness, &OmSFDouble::changed, this, &OmPbrAppearance::updateRoughness);
   connect(mRoughnessMap, &OmSFNode::changed, this, &OmPbrAppearance::updateRoughnessMap);
   connect(mMetalness, &OmSFDouble::changed, this, &OmPbrAppearance::updateMetalness);
@@ -662,6 +682,8 @@ void OmPbrAppearance::exportShallowNode(const OmWriter &writer) const {
 }
 
 void OmPbrAppearance::sanitizeFields() {
+  OmFieldChecker::resetDoubleIfNotInRangeWithIncludedBounds(this, mIndexOfRefraction, 1.0, 4.0, 1.5);
+  OmFieldChecker::resetDoubleIfNotInRangeWithIncludedBounds(this, mAttenuationDistance, 0.0001, 1000000.0, 1.0);
   OmFieldChecker::resetDoubleIfNotInRangeWithIncludedBounds(this, mTransparency, 0.0, 1.0, 0.0);
   OmFieldChecker::resetDoubleIfNotInRangeWithIncludedBounds(this, mRoughness, 0.0, 1.0, 0.0);
   OmFieldChecker::resetDoubleIfNotInRangeWithIncludedBounds(this, mMetalness, 0.0, 1.0, 0.0);
@@ -676,3 +698,11 @@ void OmPbrAppearance::sanitizeFields() {
   OmFieldChecker::resetDoubleIfNotInRangeWithIncludedBounds(this, mDiffuseWrap, 0.0, 1.0, 0.0);
   OmFieldChecker::resetDoubleIfNotInRangeWithIncludedBounds(this, mSpecularAntiAliasing, 0.0, 1.0, 0.0);
 }
+
+double OmPbrAppearance::metalness() const { return mMetalness->value(); }
+double OmPbrAppearance::normalMapFactor() const { return mNormalMapFactor->value(); }
+bool OmPbrAppearance::refraction() const { return mRefraction->value(); }
+double OmPbrAppearance::indexOfRefraction() const { return mIndexOfRefraction->value(); }
+OmRgb OmPbrAppearance::attenuationColor() const { return mAttenuationColor->value(); }
+double OmPbrAppearance::attenuationDistance() const { return mAttenuationDistance->value(); }
+bool OmPbrAppearance::emissiveTwoSided() const { return !mEmissiveTwoSided || mEmissiveTwoSided->value(); }

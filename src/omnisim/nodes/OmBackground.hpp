@@ -23,6 +23,8 @@
 class OmDownloader;
 class OmRgb;
 class OmSFString;
+class OmMFVector3;
+class OmVector3;
 
 
 class OmBackground : public OmBaseNode {
@@ -47,6 +49,8 @@ public:
 
   // accessor
   OmRgb skyColor() const;
+  int reflectionProbeCount() const;
+  OmVector3 reflectionProbePosition(int index) const;
   double luminosity() const { return mLuminosity->value(); }
   // trimmed atmosphericSky preset name ("" = none) — the wgpu main view keys its procedural dome on this
   QString atmosphericSkyPreset() const;
@@ -95,6 +99,7 @@ private:
   // (atmosphericSky preset, the image cubemap, or skyColor).
   OmMFString *mIrradianceUrlFields[6];
   OmSFDouble *mLuminosity;
+  OmMFVector3 *mReflectionProbePositions;
   OmSFString *mAtmosphericSky;
 
   // texture loading fields

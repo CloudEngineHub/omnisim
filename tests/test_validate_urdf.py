@@ -359,3 +359,68 @@ def test_physics_tier_can_be_skipped(tmp_path):
     path = _write(tmp_path, text)
     assert V.validate_file(path, tiers=("topology",)) == []
     assert V.validate_file(path, tiers=("physics",)) != []
+
+
+# ---------------------------------------------------------------------------
+# assets tier
+#
+# ⚠ Until 2026-09-11 this tier could not produce a finding AT ALL: it skipped
+# every geometry whose `mesh_path` was empty, which is exactly how urdf_import
+# spells "this reference did not resolve", and the `is_file()` test that
+# followed was true by construction for every path that survived the skip. So
+# `--check-meshes` was a no-op. Separately, resolving was the ONLY question
+# asked -- a Draco-compressed glTF sits right there on disk, cannot be decoded,
+# and silently becomes a placeholder collider.
+# ---------------------------------------------------------------------------
+
+def _mesh_link(name: str, mesh: str) -> str:
+    return (f'  <link name="{name}">\n' + _inertial()
+            + f'    <collision><geometry><mesh filename="{mesh}"/></geometry></collision>\n'
+            "  </link>\n")
+
+
+def _glb(json_doc: bytes) -> bytes:
+    import struct
+    pad = (4 - len(json_doc) % 4) % 4
+    chunk = json_doc + b" " * pad
+    total = 12 + 8 + len(chunk)
+    return (b"glTF" + struct.pack("<II", 2, total)
+            + struct.pack("<II", len(chunk), 0x4E4F534A) + chunk)
+
+
+_PLAIN_GLB = b'{"asset":{"version":"2.0"}}'
+_DRACO_GLB = b'{"asset":{"version":"2.0"},"extensionsRequired":["KHR_draco_mesh_compression"]}'
+
+
+def test_assets_tier_reports_a_mesh_that_does_not_resolve(tmp_path):
+    """The regression: an unresolvable reference used to be SKIPPED."""
+    path = _write(tmp_path, _urdf(_mesh_link("base", "meshes/absent.stl")))
+    findings = V.validate_file(path, tiers=("assets",))
+    assert _checks(findings) == {"mesh_not_found"}
+    # The message must name the reference as WRITTEN -- there is no resolved
+    # path to name when nothing resolved.
+    assert "meshes/absent.stl" in findings[0].message
+
+
+def test_assets_tier_reports_a_draco_glb_as_undecodable(tmp_path):
+    (tmp_path / "meshes").mkdir()
+    (tmp_path / "meshes" / "part.glb").write_bytes(_glb(_DRACO_GLB))
+    path = _write(tmp_path, _urdf(_mesh_link("base", "meshes/part.glb")))
+    findings = V.validate_file(path, tiers=("assets",))
+    assert _checks(findings) == {"mesh_undecodable"}
+    assert "KHR_draco_mesh_compression" in findings[0].message
+
+
+def test_assets_tier_is_quiet_on_a_readable_mesh(tmp_path):
+    """The negative control: a decodable mesh must produce nothing."""
+    (tmp_path / "meshes").mkdir()
+    (tmp_path / "meshes" / "part.glb").write_bytes(_glb(_PLAIN_GLB))
+    path = _write(tmp_path, _urdf(_mesh_link("base", "meshes/part.glb")))
+    assert V.validate_file(path, tiers=("assets",)) == []
+
+
+def test_assets_tier_stays_off_unless_asked(tmp_path):
+    """It depends on the checkout, not the model, so it must not fire by default."""
+    path = _write(tmp_path, _urdf(_mesh_link("base", "meshes/absent.stl")))
+    assert "assets" not in {f.tier for f in V.validate_file(path)}
+    assert V.main(_args([path], check_meshes=True)) == 1

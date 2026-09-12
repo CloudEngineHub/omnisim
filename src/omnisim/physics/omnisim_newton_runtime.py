@@ -8743,6 +8743,14 @@ class World:
         if getattr(self, "_kv_clamped", False):
             return
         self._kv_clamped = True
+        # Disables the velocity-servo gain clamp entirely (default 1 = on).
+        # The clamp holds dt*kv <= M_eff so a velocity servo cannot overshoot
+        # into a pogo; since 69b4b024b it reaches that bound by ADDING rotor
+        # armature rather than by starving kv, which is what unbroke stall
+        # torque. Setting this to 0 removes the bound altogether -- a
+        # diagnostic, not a fix: it was how the defect was confirmed (the
+        # Husky's stalled-pivot wheel-rate ratio goes 0.013 -> 0.99 with the
+        # clamp off). Value-parsed: =0/false/off/no disable it.
         if _os.environ.get("OMNISIM_NEWTON_VELOCITY_GAIN_CLAMP",
                            "1").strip().lower() in ("0", "false", "off", "no"):
             return

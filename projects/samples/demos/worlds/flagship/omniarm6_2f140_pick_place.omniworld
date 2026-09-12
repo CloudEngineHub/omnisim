@@ -1,22 +1,39 @@
 #OMNISIM R2025a utf8
 
-# OmniLink — OmniArm 6 + Robotiq 2F-140 REAL pick & place (friction only, no weld)
+# OmniLink — OmniArm 6 + 140 mm two-finger gripper, REAL pick & place
+# (friction only, no weld)
 #
 # ⚠ READ THIS BEFORE EDITING. Almost every "grasp" in this tree is a kinematic
 # weld: the bridge welds the nearest DEF GRASP_* node to the tool and teleports
 # it to the TCP every tick, which would hold with the fingers WIDE OPEN, for
 # ever. This demo deliberately does not use that path. Nothing writes the
-# block's pose; the only thing holding it is contact friction between two
-# Robotiq 2F-140 pads. If the physics stops working, this demo drops the block --
+# block's pose; the only thing holding it is contact friction between the two
+# gripper pads. If the physics stops working, this demo drops the block --
 # which is the entire point of it existing.
 #
-# THE GRIPPER. omniarm6_2f140_grip.urdf: every <visual> is the customer's own CAD
-# (3d_models/2F-140_Assy_Open_20191022.STEP, tessellated by
-# scripts/dev/step_to_urdf.py), and the <collision> is TEN axis-aligned boxes
-# authored to the measured mesh bounds: a gripper-body box on link6, and per jaw
-# two pad halves, a fingertip bracket and the four-bar arm. Primitives, not the
-# CAD: an 11816-triangle hull per jaw would snag on bounding boxes and lock the
-# joints (AGENTS.md), and a flat box is what gives the pads FACE contact.
+# THE GRIPPER. omniarm6_2f140_grip.urdf is OmniSim's OWN model of a 140 mm
+# two-finger parallel gripper, not a manufacturer's product model. Every
+# <visual> is primitive geometry authored in this repository -- boxes and
+# cylinders declared inline, no mesh, texture or CAD file of any kind -- and
+# the <collision> is TEN hand-authored axis-aligned boxes: a gripper-body box
+# on link6, and per jaw two pad halves, a fingertip bracket and the four-bar
+# arm. Primitives rather than a dense hull, deliberately: a triangle hull per
+# jaw would snag on bounding boxes and lock the joints (AGENTS.md), and a flat
+# box is what gives the pads FACE contact.
+#
+# ⚠ CORRECTED 2026-09-11. This paragraph used to say every <visual> was "the
+# customer's own CAD (3d_models/2F-140_Assy_Open_20191022.STEP, tessellated by
+# scripts/dev/step_to_urdf.py)". That stopped being true on 2026-08-22 and it
+# was wrong in the risky direction: it claimed THIRD-PARTY CAD LINEAGE for
+# geometry that is entirely ours. The vendor CAD was never redistributed (it
+# sat in the gitignored 3d_models/), no meshes/ directory exists, and the URDF
+# has zero <mesh> tags. The URDF carried the same correction on 2026-08-24; the
+# record is projects/robots/robotiq/PROVENANCE.md.
+#
+# ⚠ NAMING. The `2f140` in the filenames, link names and gripper-config ids is a
+# SIZE/CLASS identifier -- a 140 mm stroke, two-finger parallel gripper -- kept
+# stable for the worlds, bridges and configs that already reference it. It is
+# not a product name and this is not a manufacturer's release.
 #
 # ⚠ newtonCompoundColliders TRUE IS LOAD-BEARING FOR THAT, not decoration.
 # Without it OmSolid.cpp:3041-3067 unwraps a multi-collider link's boundingObject
@@ -65,7 +82,7 @@ EXTERNPROTO "omnisim://projects/objects/lights/protos/OmniSimSunMarker.proto"
 
 WorldInfo {
   basicTimeStep 8
-  title "OmniLink — OmniArm 6 + Robotiq 2F-140 real pick & place (friction only)"
+  title "OmniLink — OmniArm 6 + 140 mm two-finger gripper, real pick & place (friction only)"
   newtonSolver "mujoco"
   newtonStatics TRUE
   newtonCompoundColliders TRUE

@@ -424,6 +424,11 @@ struct LightU {
   omniCubeCenter : vec4<f32>,
   omniAabbMin    : vec4<f32>,
   omniAabbMax    : vec4<f32>,
+  reflectionCenters : array<vec4<f32>,4>,
+  reflectionMin : array<vec4<f32>,4>,
+  reflectionMax : array<vec4<f32>,4>,
+  localVP : array<mat4x4<f32>,48>,
+  localMeta : array<vec4<f32>,8>,
 };
 
 @group(0) @binding(0) var<storage, read> slots : array<Scene>;
@@ -437,7 +442,7 @@ struct LightU {
 @group(0) @binding(8) var<uniform> lu : LightU;
 @group(0) @binding(9) var omniTex : texture_3d<f32>;   // 4 z-slabs of SH {L00+w, L1x, L1y, L1z}
 @group(0) @binding(10) var omniSamp : sampler;
-@group(0) @binding(11) var omniCube : texture_cube<f32>;  // traced specular probe (3 mips)
+@group(0) @binding(11) var omniCube : texture_cube_array<f32>;
 // W3/P3: the Pen paint layer (OmPaintTexture). A draw with no Pen binds a 1x1 TRANSPARENT texel,
 // so the mix below is the identity and the frame is byte-identical to the pre-P3 build.
 @group(0) @binding(12) var penTex : texture_2d<f32>;
@@ -449,7 +454,7 @@ struct VertexIn {
   @location(2) uv       : vec2<f32>,
 };
 struct VertexOut {
-  @builtin(position) position : vec4<f32>,
+  @builtin(position) @invariant position : vec4<f32>,
   @location(0) worldNormal : vec3<f32>,
   @location(1) uv : vec2<f32>,
   @location(2) worldPos : vec3<f32>,
@@ -770,6 +775,26 @@ fn fs_main(in : VertexOut) -> @location(0) vec4<f32> {
         att = att * clamp((cosA - cosCut) / max(cosBeam - cosCut, 1e-4), 0.0, 1.0);
       }
     }
+    if (lu.localMeta[li].x > 0.5) {
+      let delta=in.worldPos-el.posType.xyz;
+      let ad=abs(delta);
+      var face=select(1,0,delta.x>=0.0);
+      if (ad.y>ad.x && ad.y>=ad.z) { face=select(3,2,delta.y>=0.0); }
+      if (ad.z>ad.x && ad.z>ad.y) { face=select(5,4,delta.z>=0.0); }
+      let clip=lu.localVP[li*6+face]*vec4<f32>(in.worldPos+Ngeo*0.003,1.0);
+      let ndc=clip.xyz/max(clip.w,0.0001);
+      let uv=vec2<f32>(ndc.x*.5+.5,.5-ndc.y*.5);
+      if (clip.w>0.0 && ndc.z>0.0 && ndc.z<1.0) {
+        let tile=vec2<f32>(f32(li),f32(face));
+        var visible=0.0;
+        for (var y=-1;y<=1;y=y+1) { for (var x=-1;x<=1;x=x+1) {
+          let tap=clamp(uv+vec2<f32>(f32(x),f32(y))/256.0,vec2<f32>(.5/256.0),vec2<f32>(255.5/256.0));
+          let depth=textureSampleLevel(shadowTex,shadowSamp,(tile+tap)/8.0,i32(lu.localMeta[li].y),0.0).r;
+          visible+=select(0.0,1.0,ndc.z-0.0002<=depth);
+        } }
+        att*=visible/9.0;
+      }
+    }
     let NdotLe = max(dot(N, Le), 0.0);
     if (NdotLe <= 0.0) { continue; }
     let He = normalize(V + Le);
@@ -810,23 +835,36 @@ fn fs_main(in : VertexOut) -> @location(0) vec4<f32> {
     // where it hits (added later in screen space); this replaces only the env fallback.
     if (lu.omniCubeCenter.w > 0.5) {
       let invR = 1.0 / select(R, vec3<f32>(1e-5, 1e-5, 1e-5), abs(R) < vec3<f32>(1e-5, 1e-5, 1e-5));
-      let tA = (lu.omniAabbMin.xyz - in.worldPos) * invR;
-      let tB = (lu.omniAabbMax.xyz - in.worldPos) * invR;
+      var accumulated=vec3<f32>(0.0); var total=0.0;
+      for (var probe=0;probe<i32(lu.omniCubeCenter.w);probe=probe+1) {
+      let lo=lu.reflectionMin[probe].xyz; let hi=lu.reflectionMax[probe].xyz;
+      let center=lu.reflectionCenters[probe].xyz;
+      let edge=min(in.worldPos-lo,hi-in.worldPos);
+      let inside=min(min(edge.x,edge.y),edge.z);
+      var weight=0.001;
+      if (probe>0) { weight=smoothstep(0.0,0.2,inside)/(0.25+dot(in.worldPos-center,in.worldPos-center)); }
+      let tA = (lo - in.worldPos) * invR;
+      let tB = (hi - in.worldPos) * invR;
       let tMax3 = max(tA, tB);
       let tFar = max(min(min(tMax3.x, tMax3.y), tMax3.z), 0.05);
       let hitP = in.worldPos + R * tFar;
-      let cdir = normalize(hitP - lu.omniCubeCenter.xyz);
-      let mip = clamp(effRough * 5.0, 0.0, 2.0);
-      env = textureSampleLevel(omniCube, omniSamp, cdir, mip).rgb;
+      let cdir = normalize(hitP - center);
+      let mip = clamp(effRough * 6.0, 0.0, 6.0);
+      accumulated+=textureSampleLevel(omniCube,omniSamp,cdir,probe,mip).rgb*weight;
+      total+=weight;
+      }
+      env=accumulated/max(total,0.0001);
     }
     // sun glint: tight mirror streak on smooth surfaces, broad wash on rough ones
     let sunTo = normalize(-lu.sunDirAmbient.xyz);
     let glintPow = mix(512.0, 8.0, effRough);
     let glint = pow(max(dot(R, sunTo), 0.0), glintPow) * dayIbl;
     let envR = env + lu.extraMeta.yzw * glint;
-    let Fibl = F0 + (vec3<f32>(1.0, 1.0, 1.0) - F0) * pow(1.0 - NdotV, 5.0);
-    let specScale = (1.0 - effRough) * (1.0 - effRough) * 0.9 + 0.05;
-    iblSpec = envR * Fibl * specScale * iblScale;
+    // Split-sum GGX environment BRDF fit (roughness and view angle).
+    let fit=effRough*vec4<f32>(-1.0,-0.0275,-0.572,0.022)+vec4<f32>(1.0,0.0425,1.04,-0.04);
+    let a004=min(fit.x*fit.x,exp2(-9.28*NdotV))*fit.x+fit.y;
+    let ab=vec2<f32>(-1.04,1.04)*a004+fit.zw;
+    iblSpec = envR * (F0*ab.x+vec3<f32>(ab.y)) * iblScale;
   }
   // WREN's phong shader has NO image-based specular at all (specularTotal comes from the light
   // loops only, and is forced to zero on a textured material), so the phong arm drops it.
@@ -1931,17 +1969,62 @@ fn fs_main(in : VOut) -> @location(0) vec4<f32> {
   // through depth + the previous view-proj, clamp it to the current 3x3 neighbourhood (kills
   // ghosting), and blend. With the sub-pixel projection jitter this integrates shading over
   // time — specular sparkle, leaf-card crawl and thin-feature shimmer settle out.
+  const char *kObjectMotion = R"WGSL(
+struct Camera { current : mat4x4<f32>, previous : mat4x4<f32> };
+struct MotionSlot {
+  model : mat4x4<f32>, previous : mat4x4<f32>,
+  uvA : vec4<f32>, uvB : vec4<f32>, params : vec4<f32>,
+};
+@group(0) @binding(0) var<uniform> camera : Camera;
+@group(0) @binding(1) var<storage, read> slots : array<MotionSlot>;
+@group(0) @binding(2) var<storage, read> positions : array<vec4<f32>>;
+@group(0) @binding(3) var albedo : texture_2d<f32>;
+@group(0) @binding(4) var samp : sampler;
+struct MotionOut {
+  @builtin(position) @invariant position : vec4<f32>,
+  @location(0) previous : vec4<f32>,
+  @location(1) uv : vec2<f32>,
+  @location(2) @interpolate(flat) slot : u32,
+};
+@vertex
+fn vs_main(@location(0) position : vec3<f32>, @location(2) uv : vec2<f32>,
+           @builtin(vertex_index) vertex : u32, @builtin(instance_index) slot : u32) -> MotionOut {
+  let u = slots[slot];
+  var oldPosition = vec4<f32>(position, 1.0);
+  if (u.params.y > 0.5) { oldPosition = positions[u32(u.params.z) + vertex]; }
+  var out : MotionOut;
+  // Keep exactly the lit shader's operation order for the Equal depth test.
+  let worldPos = u.model * vec4<f32>(position, 1.0);
+  out.position = camera.current * worldPos;
+  out.previous = camera.previous * (u.previous * oldPosition);
+  out.uv = vec2<f32>(dot(u.uvA.xy, uv), dot(u.uvA.zw, uv)) + u.uvB.xy;
+  out.slot = slot;
+  return out;
+}
+@fragment
+fn fs_main(in : MotionOut) -> @location(0) vec4<f32> {
+  if (textureSample(albedo, samp, in.uv).a < 0.5) { discard; }
+  if (slots[in.slot].params.x < 0.0 || in.previous.w < 1e-4) {
+    return vec4<f32>(0.0, 0.0, 0.0, -1.0);
+  }
+  let p = in.previous.xyz / in.previous.w;
+  return vec4<f32>(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5, p.z, 1.0);
+}
+)WGSL";
+
   const char *kTaaMvResolve = R"WGSL(
 struct TaaU {
   invVP  : mat4x4<f32>,
   prevVP : mat4x4<f32>,
-  params : vec4<f32>,  // x = rev-Z flag, y = history weight, z = unused, w = history valid
+  params : vec4<f32>,  // x = object motion enabled, y = history weight, z = depth/reactive validation, w = history valid
 };
 @group(0) @binding(0) var<uniform> u : TaaU;
 @group(0) @binding(1) var curTex : texture_2d<f32>;
 @group(0) @binding(2) var histTex : texture_2d<f32>;
 @group(0) @binding(3) var depthTex : texture_depth_multisampled_2d;
 @group(0) @binding(4) var samp : sampler;
+@group(0) @binding(5) var histDepth : texture_2d<f32>;
+@group(0) @binding(6) var motionTex : texture_multisampled_2d<f32>;
 
 struct VOut { @builtin(position) pos : vec4<f32> };
 
@@ -1953,29 +2036,79 @@ fn vs_main(@builtin(vertex_index) vi : u32) -> VOut {
   return o;
 }
 
+struct TaaOut { @location(0) color : vec4<f32>, @location(1) depth : f32 };
+
 @fragment
-fn fs_main(in : VOut) -> @location(0) vec4<f32> {
+fn fs_main(in : VOut) -> TaaOut {
   let dims = vec2<f32>(textureDimensions(curTex));
   let pix = vec2<i32>(in.pos.xy);
   let cur = textureLoad(curTex, pix, 0).rgb;
-  if (u.params.w < 0.5) {
-    return vec4<f32>(cur, 1.0);
+  var z = textureLoad(depthTex, pix, 0);
+  var nearestSample = 0;
+  if (u.params.z > 0.5) {
+    // Reversed Z: the nearest MSAA sample protects thin foreground edges.
+    for (var sample = 1; sample < i32(textureNumSamples(depthTex)); sample++) {
+      let sampleDepth = textureLoad(depthTex, pix, sample);
+      if (sampleDepth > z) { z = sampleDepth; nearestSample = sample; }
+    }
   }
-  let z = textureLoad(depthTex, pix, 0);
+  var result : TaaOut;
+  result.color = vec4<f32>(cur, 1.0);
+  result.depth = z;
+  if (u.params.w < 0.5) {
+    return result;
+  }
+  // Sky has no finite reconstructed surface. Never divide by its zero W.
+  if (u.params.z > 0.5 && z <= 0.0) { return result; }
   let uv = in.pos.xy / dims;
   let ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, z, 1.0);
   let w4 = u.invVP * ndc;
   let world = w4.xyz / w4.w;
   let pc = u.prevVP * vec4<f32>(world, 1.0);
-  if (pc.w < 1e-4) {
-    return vec4<f32>(cur, 1.0);
+  var pn = pc.xyz / max(pc.w, 1e-4);
+  var puv = vec2<f32>(pn.x * 0.5 + 0.5, 0.5 - pn.y * 0.5);
+  var motionValid = false;
+  if (u.params.x > 0.5 && all(textureDimensions(motionTex) == textureDimensions(curTex))) {
+    // Never average velocities across MSAA silhouettes. A 1x1 dummy means all
+    // surfaces are stationary and needs no full-resolution clear or motion pass.
+    let motion = textureLoad(motionTex, pix, nearestSample);
+    if (motion.w < -0.5) { return result; }
+    if (motion.w > 0.5) { puv = motion.xy; pn.z = motion.z; motionValid = true; }
   }
-  let pn = pc.xyz / pc.w;
-  let puv = vec2<f32>(pn.x * 0.5 + 0.5, 0.5 - pn.y * 0.5);
+  if ((!motionValid && pc.w < 1e-4) || pn.z <= 0.0 || pn.z > 1.0) { return result; }
   if (puv.x < 0.0 || puv.x > 1.0 || puv.y < 0.0 || puv.y > 1.0) {
-    return vec4<f32>(cur, 1.0);
+    return result;
   }
   var hist = textureSampleLevel(histTex, samp, puv, 0.0).rgb;
+  var historyWeight = u.params.y;
+  if (u.params.z > 0.5) {
+    // Validate all four bilinear taps before blending: sampling color first and
+    // checking only the nearest depth leaks foreground color over silhouettes.
+    let coord = puv * dims - vec2<f32>(0.5);
+    let base = vec2<i32>(floor(coord));
+    let f = fract(coord);
+    var sum = vec3<f32>(0.0);
+    var weight = 0.0;
+    for (var y = 0; y < 2; y++) {
+      for (var x = 0; x < 2; x++) {
+        let q = base + vec2<i32>(x, y);
+        if (any(q < vec2<i32>(0)) || any(q >= vec2<i32>(dims))) { continue; }
+        let previousDepth = textureLoad(histDepth, q, 0).x;
+        let tolerance = max(1e-6, 0.015 * max(abs(pn.z), previousDepth));
+        if (previousDepth <= 0.0 || abs(previousDepth - pn.z) > tolerance) { continue; }
+        let w = select(1.0-f.x, f.x, x == 1) * select(1.0-f.y, f.y, y == 1);
+        sum += textureLoad(histTex, q, 0).rgb * w;
+        weight += w;
+      }
+    }
+    if (weight < 0.25) { return result; }
+    hist = sum / weight;
+    historyWeight *= weight;
+    // Depth alone cannot see coplanar motion, animated textures, or glass.
+    // Reduce persistence when color changes; retain accumulation on stable detail.
+    let change = max(max(abs(hist.r-cur.r), abs(hist.g-cur.g)), abs(hist.b-cur.b));
+    historyWeight *= 1.0 - 0.8 * smoothstep(0.06, 0.30, change);
+  }
   // neighbourhood clamp (3x3 min/max of the current frame) — the standard anti-ghosting box
   var mn = cur;
   var mx = cur;
@@ -1988,7 +2121,8 @@ fn fs_main(in : VOut) -> @location(0) vec4<f32> {
     }
   }
   hist = clamp(hist, mn, mx);
-  return vec4<f32>(mix(cur, hist, u.params.y), 1.0);
+  result.color = vec4<f32>(mix(cur, hist, historyWeight), 1.0);
+  return result;
 }
 )WGSL";
 

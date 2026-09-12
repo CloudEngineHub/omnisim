@@ -448,6 +448,9 @@ QMenu *OmMainWindow::createFileMenu() {
   menu->addSeparator();
 
   menu->addAction(manager->action(OmAction::TAKE_SCREENSHOT));
+  action = menu->addAction(tr("Render Photo…"));
+  action->setToolTip(tr("Trace lighting and reflections for a still image of the current view."));
+  connect(action, &QAction::triggered, mSimulationView, &OmSimulationView::renderPhoto);
   menu->addAction(mSimulationView->movieAction());
   menu->addAction(manager->action(OmAction::ANIMATION));
   connect(manager->action(OmAction::ANIMATION), &QAction::triggered, this, &OmMainWindow::startAnimationRecording);

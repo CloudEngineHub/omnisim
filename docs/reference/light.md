@@ -1,5 +1,14 @@
 ## Light
 
+OmniSim's concrete light nodes also expose `rayTracing TRUE`. Set it to `FALSE`
+for a live-view proxy of an emissive surface, as used by `OmniSimAreaLight`, to
+exclude that proxy from Photo and OmniLight and avoid counting the same light
+twice. The primary sun remains selected separately.
+
+Point and spot lights with `castShadows TRUE` cast live shadows. The main view
+supports eight local lights with 256-pixel cubemap faces in a shared atlas;
+moving the light or its occluders updates those shadows each frame.
+
 ```
 Light {
   SFFloat ambientIntensity 0       # [0, 1]

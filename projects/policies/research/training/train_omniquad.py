@@ -38,6 +38,8 @@ if __name__ == "__main__":
     if not any(a == "--robot" or a.startswith("--robot=") for a in args):
         args = ["--robot", "omniquad"] + args
 
-    sys.argv = [str(REPO_ROOT / "projects" / "rl" / "training" / "train_robot.py")] + args
+    # PATH: `projects/rl` was renamed to `projects/policies/research` by 1b668a910;
+    # the old path failed SILENTLY here (2026-09-11).
+    sys.argv = [str(REPO_ROOT / "projects" / "policies" / "research" / "training" / "train_robot.py")] + args
     from projects.policies.research.training import train_robot  # noqa: E402
     sys.exit(train_robot.main())

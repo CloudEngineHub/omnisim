@@ -103,6 +103,8 @@ Combat showcase worlds (head-on, damage arena, brawl, duel) live under [`project
 
 wgpu renderer smoke worlds (`*_wgpu_*_smoke.wbt`) — quick visual checks of the wgpu backend. Distinct from the pedagogical [rendering *sample* worlds](#4-rendering-sample-worlds) under `projects/samples/rendering/worlds/`. Not user demos; not in the launcher gallery.
 
+The rendering collection also includes [`beauty_bench_realism.omniworld`](projects/samples/demos/worlds/rendering/beauty_bench_realism.omniworld), an optional content study paired with the unchanged `beauty_bench.omniworld` reference. Its robot is a kinematic rendering probe, not a physics demo; see [the capture recipe](tests/rendering/BEAUTY_BENCH.md).
+
 ### 1i. Dev — `worlds/dev/` (3)
 
 Developer scratch/preview worlds (`*_preview.wbt`, `construction_site_dev.omniworld`) for in-progress scene iteration. Not user demos.

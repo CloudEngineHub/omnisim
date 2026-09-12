@@ -23,6 +23,7 @@ import os
 import fnmatch
 import re
 import subprocess
+import hashlib
 
 from io import open
 
@@ -121,6 +122,15 @@ VENDORED_APACHE2_DIRECTORIES = [
     # Attribution and provenance: src/omnisim/external/siphash/NOTICE
     'src/omnisim/external/siphash',
 ]
+
+# Official OIDN 2.5.1 headers use SPDX instead of a full boilerplate. Pin the
+# unmodified files and accompanying license; do not exempt the directory.
+OIDN_HEADERS = {
+    'src/omnisim/render/third_party/oidn/oidn.h':
+        '60e2d0c5c21c59821aeaebbc987e6b3e1bbd4e46c5eab3d7ded54e1ed726d4c1',
+    'src/omnisim/render/third_party/oidn/config.h':
+        'adbae7e2649f02278624922dd0ea0399868fee82d5e22b7bfcf6c63ef83254fa',
+}
 
 # The Apache boilerplate with its leading copyright line removed, per comment
 # style. '//' and '#' headers open with the copyright line; the C header opens
@@ -294,7 +304,15 @@ class TestLicense(unittest.TestCase):
                 accepted = (APACHE2_LICENSE_PYTHON, OMNILINK_LICENSE_PYTHON)
             else:
                 self.fail('Unsupported file extension "%s".' % source)
-            if self._isVendoredApache2(source):
+            if relativePath in OIDN_HEADERS:
+                with open(source, 'rb') as header:
+                    digest = hashlib.sha256(header.read()).hexdigest()
+                with open(os.path.join(os.path.dirname(source), 'LICENSE.txt'), encoding='utf-8') as license_file:
+                    license_text = license_file.read()
+                verdicts[relativePath] = (digest == OIDN_HEADERS[relativePath]
+                    and content.startswith('// Copyright 2018 Intel Corporation\n// SPDX-License-Identifier: Apache-2.0')
+                    and 'Apache License' in license_text and 'Version 2.0' in license_text)
+            elif self._isVendoredApache2(source):
                 verdicts[relativePath] = self._hasVendoredApache2(content, style)
             else:
                 verdicts[relativePath] = any(content.startswith(header) for header in accepted)

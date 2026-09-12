@@ -1,5 +1,71 @@
 # wgpu renderer — current state
 
+## Temporal history and GPU timing, 2026-09-12
+
+Per-object reprojection now follows Shape/CadShape transforms and previous
+Cloth/SoftBody/Muscle vertices. Motion and depth use matching MSAA samples;
+new or unmatched geometry rejects history. Static opaque geometry avoids another
+draw pass, while visible glass and unidentified particle/Track instances use
+reactive rejection. `OMNISIM_WGPU_MOTION_VECTORS=0` selects camera-only reprojection.
+
+The live HDR viewport validates reprojected history against float depth, aligns
+reprojection with the lit pass's jitter, and reduces persistence on changing color.
+Optional asynchronous GPU timestamps identify render-pass costs separately from
+CPU submission timings and render-start intervals. Robot cameras keep their
+unjittered measurement path. Growing scene buffers now explicitly invalidate
+dependent bindings, preventing recycled handles from hiding inserted objects.
+[Temporal rendering](temporal-rendering.md) describes
+the comparison controls, tests, memory cost, and remaining temporal limits.
+
+## Local shadow performance, 2026-09-12
+
+Local point/spot shadows reuse unchanged atlas contents and cull casters per cube
+face. The main view and camera draw caches now follow geometry/opacity edits and
+completed subtree insertions. [Local shadow performance](local-shadow-performance.md)
+describes invalidation, limitations, per-frame telemetry and the repeatable
+house/warehouse/city comparison.
+
+## Photo and live lighting, 2026-09-12
+
+**File → Render Photo…** uses a separate CPU path tracer over an owned snapshot
+of the current visual scene. This is a bounded offline PNG capture, with progress
+and cancellation, not a replacement for the wgpu main view or sensor renderer.
+It traces textured GGX/diffuse reflections, indirect light, opt-in solid dielectric
+glass, soft sun shadows, and occluded point/spot lights. Bright-sky and emissive
+triangle sampling use MIS; adaptive sampling stops quiet pixels. Optional CPU
+Open Image Denoise uses sampled color/normal guides, with an explicit edge-aware
+fallback. [Photo rendering](../guide/photo-rendering.md) documents controls,
+runtime packaging, authoring and limitations.
+
+The live view supports up to three local reflection captures plus the broad
+scene capture, GGX-prefiltered full cubemap mip chains, and split-sum response.
+`Background.reflectionProbePositions` supplies local positions. Point/spot
+`castShadows TRUE` uses a live shadow atlas, including moving lamps.
+`OmniSimAreaLight` provides a rectangular photo emitter and four shadowed live
+samples. Glass refraction remains exclusive to Photo mode; live reflections and
+indirect light still follow the asynchronous OmniLight bake.
+
+For automated capture, `OMNISIM_PHOTO_OUTPUT` selects the PNG and exits after capture;
+launch with `--mode=realtime`. `OMNISIM_PHOTO_WIDTH`, `OMNISIM_PHOTO_HEIGHT`,
+`OMNISIM_PHOTO_SAMPLES` and `OMNISIM_PHOTO_SECONDS` bound the image and work.
+`OMNISIM_PHOTO_DENOISE=0` disables the optional grain filter.
+`OMNISIM_PHOTO_LIGHT_SAMPLING=0` and `OMNISIM_PHOTO_ADAPTIVE=0` select comparison
+arms. `OMNILIGHT_THREADS` bounds bake workers (zero uses automatic sizing).
+
+## Material corrections, 2026-09-11
+
+`PBRAppearance.roughnessMap` now overrides scalar `roughness`, as the node reference
+specifies. Previously the collector multiplied the map by the scalar's default
+zero, making mapped brick/concrete effectively smooth. A successful texture
+upload now supplies a unit multiplier in both the Shape and deformable collectors;
+untextured materials and failed texture uploads retain scalar roughness.
+
+OmniLight's original cubemap upload mismatch (64/16/4 packed into 64/32/16 levels)
+was corrected. It now uses all levels from 64 through 1, with GGX filtering.
+
+The unchanged house reference, optional content study, camera poses and regression
+commands are documented in [Beauty Bench comparisons](../../tests/rendering/BEAUTY_BENCH.md).
+
 *Post-deletion reference, re-verified against the tree on 2026-08-24. This document was a
 pre-deletion snapshot until that date and asserted four things that are now false (WREN as the
 per-world opt-out, WREN as the Camera-device default, an automatic WREN fallback, and WREN as a

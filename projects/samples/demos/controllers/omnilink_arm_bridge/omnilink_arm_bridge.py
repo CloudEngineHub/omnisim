@@ -126,6 +126,58 @@ _RELAY_PARENT = _os.path.abspath(_os.path.join(_THIS_DIR, ".."))
 if _RELAY_PARENT not in _sys.path:
     _sys.path.insert(0, _RELAY_PARENT)
 
+# ── omnisim_bridges MUST be resolvable BEFORE the first import of it ──
+# The engine spawns each Python controller as the bare command "python.exe"
+# (OmLanguageTools::pythonCommand -> QProcess), resolved from PATH, so WHICH
+# interpreter runs this file depends on how the sim was launched:
+# run-headless / run-agent prepend the bundled newton-runtime CPython, while
+# launch.bat and omnisim/dev/runner.py leave the system python in front. The
+# bundle does not carry omnisim_bridges and never will -- the package is an
+# editable install precisely so edits to it take effect immediately.
+#
+# The canonical source ships in the tree AND in the installer
+# (scripts/packaging/files_core.txt: `packages/omnisim-bridges [recurse]`), so
+# resolving it relative to this file works on EVERY launch path, including the
+# ones we do not control. _omnilink_relay/__init__.py already does exactly this
+# -- but it is imported ~25 lines BELOW, which is why this file used to show a
+# SPLIT failure: `omnisim_bridges.intents` (imported after the relay) worked
+# while `omnisim_bridges.intent_router` (imported here, before it) fell through
+# to the stubs. Bootstrap at the top so import order can never decide it again.
+from pathlib import Path as _Path  # noqa: E402
+_PACKAGE_SRC = _Path(__file__).resolve().parents[5] / "packages" / "omnisim-bridges" / "src"
+if _PACKAGE_SRC.is_dir() and str(_PACKAGE_SRC) not in _sys.path:
+    _sys.path.insert(0, str(_PACKAGE_SRC))
+
+
+def _bridges_stub_notice(what: str, exc: BaseException) -> None:
+    """Say, unmistakably, that a feature is running as a STUB and why.
+
+    A bare `except Exception` around these imports is how this degraded
+    silently for months: the demo came up, exited 0, and simply lacked the
+    feature.
+
+    MEASURED 2026-09-11: controller stdout AND stderr reach neither
+    omnisim_log.txt nor the `run-headless` capture, so this banner is for the
+    GUI console (launch.bat), where both streams are shown. The channel that
+    a HEADLESS operator can see is `python -m omnisim doctor`'s `bridges` row.
+    """
+    msg = (
+        "\n"
+        "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+        f"!! omnilink_arm_bridge: RUNNING A STUB for {what}\n"
+        f"!! reason      : {type(exc).__name__}: {exc}\n"
+        f"!! interpreter : {_sys.executable}\n"
+        f"!! package src : {_PACKAGE_SRC} "
+        f"({'present' if _PACKAGE_SRC.is_dir() else 'MISSING'})\n"
+        "!! fix         : keep packages/omnisim-bridges/ in the checkout, or\n"
+        "!!               pip install -e packages/omnisim-bridges\n"
+        "!! effect      : the bridge still drives the arm; it loses\n"
+        f"!!               {what} entirely.\n"
+        "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+    )
+    print(msg, file=_sys.stderr, flush=True)
+
+
 # Shared conversational intents (resume / status) + the honest /state
 # describer. Lives in omnisim_bridges so the arm and the mobile bridge
 # answer "carry on" and "what are you doing?" the same way. Optional:
@@ -137,7 +189,8 @@ try:  # noqa: E402
         is_resume as shared_is_resume,
         is_status as shared_is_status,
     )
-except Exception:  # pragma: no cover - optional dependency
+except ImportError as _exc:  # the package is ABSENT -- not "it raised"
+    _bridges_stub_notice("the shared status/resume intents", _exc)
     shared_describe_state = None
     shared_is_resume = None
     shared_is_status = None
@@ -214,7 +267,8 @@ try:  # noqa: E402
         DEFERRED_TOOLS,
         MAIN_TASK_RULE as INTENT_TASK_RULE,
     )
-except Exception:  # pragma: no cover - optional dependency
+except ImportError as _exc:  # the package is ABSENT -- not "it raised"
+    _bridges_stub_notice("the deferred-intent layer", _exc)
     IntentStore = None  # type: ignore[assignment]
     build_intent_tools = None  # type: ignore[assignment]
     DEFERRED_TOOLS = frozenset()

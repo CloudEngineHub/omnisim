@@ -45,6 +45,7 @@ class WindowsOmniSimPackage(OmniSimPackage):
         self.add_folder_recursively(os.path.join(self.omnisim_home, 'msys64'))
         self.check_newton_runtime_bundle()
         self.check_wgpu_native_bundle()
+        self.check_photo_denoise_bundle()
 
         print('creating ISS descriptor')
 
@@ -252,6 +253,18 @@ class WindowsOmniSimPackage(OmniSimPackage):
         if os.environ.get('OMNISIM_REQUIRE_RENDERER_BUNDLE') == '1':
             print_error_message_and_exit(msg)
         print('  \033[1;33mWARNING: ' + msg + '\033[0m')
+
+    def check_photo_denoise_bundle(self):
+        """The optional CPU denoiser ships with the recursively packaged msys64 tree."""
+        folder = os.path.join(self.omnisim_home, 'msys64', 'mingw64', 'bin', 'photo-denoise')
+        required = ('OpenImageDenoise.dll', 'OpenImageDenoise_core.dll',
+                    'OpenImageDenoise_device_cpu.dll', 'tbb12.dll', 'LICENSE.txt')
+        missing = [name for name in required if not os.path.isfile(os.path.join(folder, name))]
+        if missing:
+            print('  Photo denoiser is optional; this package will use the edge-aware fallback. '
+                  'Missing: ' + ', '.join(missing) + '. See docs/guide/photo-rendering.md.')
+        else:
+            print('  Open Image Denoise CPU runtime and license bundled.')
 
     def check_newton_runtime_bundle(self):
         """Report whether the Newton runtime (warp/newton + the _pth redirect) is

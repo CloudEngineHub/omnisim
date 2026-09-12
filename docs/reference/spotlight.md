@@ -15,6 +15,7 @@ SpotLight {
   SFBool  on               TRUE       # {TRUE, FALSE}
   SFFloat radius           100        # [0, inf)
   SFBool  castShadows      FALSE      # {TRUE, FALSE}
+  SFBool  rayTracing       TRUE       # exclude live proxies from traced lighting
 }
 ```
 

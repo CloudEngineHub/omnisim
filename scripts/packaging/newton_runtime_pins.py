@@ -87,6 +87,36 @@ DEPLOY_STACK: dict[str, str] = {
     # import USD assets. Matches newton 1.5.0's `importers` extra
     # (newton-usd-schemas>=0.4.1).
     "newton-usd-schemas": "0.5.0",
+    # The ONNX inference runtime every shipped RL-deploy controller imports.
+    #
+    # WHY IT IS IN THE BUNDLE (added 2026-09-11). The bundle is not just the
+    # physics runtime -- it is the interpreter the ENGINE SPAWNS FOR PYTHON
+    # CONTROLLERS whenever the launch path puts newton-runtime ahead of the
+    # system python (scripts/dev/headless_runner.py and
+    # scripts/dev/omnisim_run_agent.py both prepend it, so every
+    # `python -m omnisim run-headless` / `run-agent` controller runs here).
+    # Measured that day on this clone: a probe controller launched by the
+    # engine reported
+    #     executable = msys64\mingw64\bin\newton-runtime\python.exe
+    #     numpy      = 2.5.3
+    #     onnxruntime= MISSING (ModuleNotFoundError)
+    # while the developer's own `python` (which `python -m omnisim` runs
+    # under) had onnxruntime 1.26.0 -- which is exactly why nobody noticed.
+    # 26 shipped controllers `import onnxruntime` (every *_deploy / *_mimic
+    # under projects/policies/research/controllers, plus the anypick_cam and
+    # omniarm6_bin_picking demos); on a clean clone every one of them refused
+    # to run its policy.
+    #
+    # COST, measured: 42 MB installed against a 694 MB bundle (+6%). MIT
+    # licence, so it ships under the same terms as the rest. A platform wheel
+    # like warp/mujoco/numpy already are -- the bundle has always been
+    # platform-specific, so that is not a new constraint.
+    #
+    # NOT parity-checked: the trainer exports with `onnx` + `onnxscript`
+    # (projects/policies/research/training/requirements-train.txt) and never
+    # runs onnxruntime, so there is no trainer counterpart to match. Pinned
+    # anyway, for a reproducible bundle.
+    "onnxruntime": "1.26.0",
 }
 
 

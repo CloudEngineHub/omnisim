@@ -1336,9 +1336,30 @@ def run_once(args) -> int:
         runtime = mingw_bin / "newton-runtime"
         if (runtime / "python.exe").is_file():
             path_prefix.append(str(runtime))
+            pythonpath = []
             site_packages = runtime / "site-packages"
             if site_packages.is_dir():
-                env["PYTHONPATH"] = str(site_packages) + ";" + env.get(
+                pythonpath.append(str(site_packages))
+            # ── omnisim_bridges is SOURCE-shipped, not vendored ───────────
+            # PREPENDING newton-runtime above decides which interpreter the
+            # engine's per-controller `python.exe` resolves to, and that
+            # bundle deliberately does NOT carry omnisim_bridges: the package
+            # is an editable install so edits to it take effect immediately,
+            # and a vendored wheel in the bundle would shadow the tree with a
+            # stale copy. Its canonical source ships both in the checkout and
+            # in the installer (files_core.txt: packages/omnisim-bridges
+            # [recurse]), so point PYTHONPATH at it instead.
+            #
+            # Every bridge controller ALSO bootstraps this path for itself, so
+            # launch paths that do not run through here still work. This entry
+            # is the belt to that braces: it covers any controller that
+            # imports the package WITHOUT the relay idiom, which is how the
+            # deferred-intent layer degraded silently until 2026-09-11.
+            bridges_src = omnisim_home / "packages" / "omnisim-bridges" / "src"
+            if bridges_src.is_dir():
+                pythonpath.append(str(bridges_src))
+            if pythonpath:
+                env["PYTHONPATH"] = ";".join(pythonpath) + ";" + env.get(
                     "PYTHONPATH", ""
                 )
         env["PATH"] = ";".join(path_prefix) + ";" + env.get("PATH", "")

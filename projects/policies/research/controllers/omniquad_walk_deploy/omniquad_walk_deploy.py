@@ -98,8 +98,13 @@ def find_policy_path() -> Path:
         "OMNISIM_POLICY_ONNX")
     if p:
         return Path(p)
-    return (_REPO / "projects" / "rl" / "inference" / "policies"
-            / "gpu_omniquad_walk_main" / "policy.onnx")
+    # PATH: `projects/rl` was renamed to `projects/policies/research` by
+    # 1b668a910 and this default was never re-pointed, so the shipped
+    # controller took the "policy not found -> BARE gait model" branch on
+    # every clean clone: it ran, it exited 0, and it never loaded the policy
+    # it exists to deploy (2026-09-11).
+    return (_REPO / "projects" / "policies" / "research" / "inference"
+            / "policies" / "gpu_omniquad_walk_main" / "policy.onnx")
 
 
 def main() -> int:
@@ -169,13 +174,27 @@ def main() -> int:
             # (the "policy not found" branch below).
             say(f"[omniquad_walk_deploy] FATAL: ONNX policy exists but failed to load ({e}).\n")
             say(f"[omniquad_walk_deploy] path: {policy_path}\n")
+            say(f"[omniquad_walk_deploy] controller interpreter: {sys.executable}\n")
             say("[omniquad_walk_deploy] refusing to run with ZERO residual and report it as a "
                 "policy result. Install onnxruntime for the CONTROLLER interpreter "
                 "(the python that runs this file), not just the engine's.\n")
             raise SystemExit(2)
     else:
-        say(f"[omniquad_walk_deploy] policy not found at {policy_path}; "
-            "running the BARE gait model\n")
+        # LOUD, deliberately. The bare gait model is a real mode, but it is NOT
+        # a policy result -- and while the default above pointed into the dead
+        # `projects/rl` tree this branch fired on every clean clone and said so
+        # in one quiet line (2026-09-11).
+        _bar = "!" * 72
+        say(f"{_bar}\n")
+        say("[omniquad_walk_deploy] POLICY NOT FOUND -- running the BARE gait "
+            "model. This run is NOT a policy result.\n")
+        say(f"[omniquad_walk_deploy]   tried: {policy_path}\n")
+        say(f"[omniquad_walk_deploy]   controller interpreter: {sys.executable}\n")
+        say("[omniquad_walk_deploy]   (the ENGINE spawns that python from PATH -- it is "
+            "NOT the one `python -m omnisim` runs)\n")
+        say("[omniquad_walk_deploy]   fix: point OMNIQUAD_POLICY_ONNX or "
+            "OMNISIM_POLICY_ONNX at an existing .onnx.\n")
+        say(f"{_bar}\n")
 
     robot = _Robot()
     step_ms = int(robot.getBasicTimeStep())

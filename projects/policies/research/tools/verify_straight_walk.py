@@ -38,7 +38,9 @@ OMNISIM_BIN = REPO / "msys64" / "mingw64" / "bin" / "omnisim-bin.exe"
 # Default world uses the RL deploy controller; override with --world to
 # test the model-only walker (omniquad_model_walk_demo.omniworld) or any other
 # OmniQuad world that writes the canonical chassis-trace CSV.
-WORLD = REPO / "projects" / "rl" / "worlds" / "omniquad_walk_demo.omniworld"
+# PATH: `projects/rl` was renamed to `projects/policies/research` by 1b668a910;
+# the old path failed SILENTLY here (2026-09-11).
+WORLD = REPO / "projects" / "policies" / "research" / "worlds" / "omniquad_walk_demo.omniworld"
 
 
 def run_deploy(policy: Path, duration_s: float, vx: float,

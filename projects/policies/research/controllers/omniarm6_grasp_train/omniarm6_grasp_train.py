@@ -87,8 +87,14 @@ CUBE = 0.05
 EPISODES = int(os.environ.get("GRASP_EPISODES", "2200"))
 BATCH = int(os.environ.get("GRASP_BATCH", "32"))
 SAVE_EVERY = int(os.environ.get("GRASP_SAVE_EVERY", "150"))
-_REPO = os.path.abspath(os.path.join(_HERE, "..", "..", "..", ".."))
-OUT = os.environ.get("GRASP_OUT", os.path.join(_REPO, "projects", "rl", "inference", "policies", "omniarm6_grasp", "policy.onnx"))
+# PATH: two rots in one line, both from 1b668a910 + the research/ reorg, and
+# both silent (2026-09-11). (1) `projects/rl` is now
+# `projects/policies/research`. (2) this controller moved one level DEEPER
+# (projects/rl/controllers/ -> projects/policies/research/controllers/), so the
+# four `..` that used to reach the repo root now stop at `projects/` -- OUT was
+# building projects/projects/rl/... and LOG was landing in projects/.
+_REPO = os.path.abspath(os.path.join(_HERE, "..", "..", "..", "..", ".."))
+OUT = os.environ.get("GRASP_OUT", os.path.join(_REPO, "projects", "policies", "research", "inference", "policies", "omniarm6_grasp", "policy.onnx"))
 LOG = os.environ.get("GRASP_LOG", os.path.join(_REPO, "_grasp_train.log"))
 
 robot = Supervisor()

@@ -86,8 +86,14 @@ ITERS = int(os.environ.get("DECL_ITERS", "240"))
 EP_PER = int(os.environ.get("DECL_EPISODES_PER", "16"))
 MAX_STEPS = int(os.environ.get("DECL_MAX_STEPS", "4"))
 SAVE_EVERY = int(os.environ.get("DECL_SAVE_EVERY", "20"))
-_REPO = os.path.abspath(os.path.join(_HERE, "..", "..", "..", ".."))
-OUT = os.environ.get("DECL_OUT", os.path.join(_REPO, "projects", "rl", "inference", "policies", "omniarm6_declutter", "policy.onnx"))
+# PATH: two rots in one line, both from 1b668a910 + the research/ reorg, and
+# both silent (2026-09-11). (1) `projects/rl` is now
+# `projects/policies/research`. (2) this controller moved one level DEEPER
+# (projects/rl/controllers/ -> projects/policies/research/controllers/), so the
+# four `..` that used to reach the repo root now stop at `projects/` -- OUT was
+# building projects/projects/rl/... and LOG was landing in projects/.
+_REPO = os.path.abspath(os.path.join(_HERE, "..", "..", "..", "..", ".."))
+OUT = os.environ.get("DECL_OUT", os.path.join(_REPO, "projects", "policies", "research", "inference", "policies", "omniarm6_declutter", "policy.onnx"))
 LOG = os.environ.get("DECL_LOG", os.path.join(_REPO, "_declutter_train.log"))
 
 GAMMA, LAM, CLIP, PPO_EPOCHS = 0.99, 0.95, 0.2, 4

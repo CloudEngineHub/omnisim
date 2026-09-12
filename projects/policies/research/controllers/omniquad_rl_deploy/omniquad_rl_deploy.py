@@ -16,7 +16,10 @@
 
 A drop-in replacement for omniquad_simple_pose / omniquad_rl_agent that:
   - reads the ONNX policy from a path passed via env var OMNIQUAD_POLICY_ONNX
-    (default: projects/policies/research/inference/policies/omniquad_ppo_main/policy.onnx)
+    (default order: research/inference/policies/omniquad_walk_v12_200k -- NOT
+     shipped in this tree -- then research/inference/policies/omniquad_ppo_main
+     (gitignored export slot), then research/policies/omniquad_ppo_main, the
+     tracked copy a clean clone actually has)
   - builds the same 49-D observation the training controller built
   - runs inference each tick via onnxruntime (CPU is fine, ~1-2 ms / call)
   - sends the resulting residual joint deltas to the motors, scaled by
@@ -176,8 +179,12 @@ def projected_gravity(ori9):
     return np.array([-ori9[2], -ori9[5], -ori9[8]], dtype=np.float32)
 
 
-def find_policy_path() -> Path:
-    """Return the first path that exists, in priority order."""
+def find_policy_path(say=None, tried=None) -> Path:
+    """Return the first path that exists, in priority order.
+
+    `say` receives a WARNING when a non-preferred candidate wins; `tried`, if a
+    list, is filled with every candidate so the caller can name them all.
+    """
     candidates = []
     # Webots' batch mode drops OMNIQUAD_-prefixed env vars before they reach
     # the controller subprocess for some --batch/--mode=fast combos
@@ -190,18 +197,40 @@ def find_policy_path() -> Path:
     if env_path:
         candidates.append(Path(env_path))
     repo_root = next(_p for _p in Path(__file__).resolve().parents if (_p / "projects" / "policies").is_dir() or (_p / "AGENTS.md").exists() or (_p / ".git").exists())
+    # PATH: `projects/rl` was renamed to `projects/policies/research` by
+    # 1b668a910 and these two were never re-pointed, so with no env var set --
+    # the normal way this world runs -- find_policy_path() returned a path that
+    # could not exist and the caller reported "policy not found" forever
+    # (2026-09-11).
+    #
     # Default walker: omniquad_walk_v12_200k is the verified-stable ODE walker
-    # (upright 100%, never falls, trots ~0.5 m/s) -- the current shipped
-    # OmniQuad solution. Tried before the legacy omniquad_ppo_main slot so the
-    # deploy world "just works" with no env var.
-    candidates.append(repo_root / "projects" / "rl" / "inference" / "policies" / "omniquad_walk_v12_200k" / "policy.onnx")
-    # Legacy canonical slot -- eval_policy.py copies here.
-    candidates.append(repo_root / "projects" / "rl" / "inference" / "policies" / "omniquad_ppo_main" / "policy.onnx")
+    # (upright 100%, never falls, trots ~0.5 m/s). ⚠️ It is NOT in this tree --
+    # not under research/inference/policies/ and not under research/policies/ --
+    # so on a clean clone the next candidate wins. Re-pointed, not substituted.
+    candidates.append(repo_root / "projects" / "policies" / "research" / "inference" / "policies" / "omniquad_walk_v12_200k" / "policy.onnx")
+    # Legacy canonical slot -- eval_policy.py copies here (gitignored).
+    candidates.append(repo_root / "projects" / "policies" / "research" / "inference" / "policies" / "omniquad_ppo_main" / "policy.onnx")
+    # ...and the TRACKED copy of that same policy: the legacy omniquad policies
+    # were archived to research/policies/ on 2026-06-26 (see .gitignore), which
+    # is the only one of the two that a clean clone actually has.
+    candidates.append(repo_root / "projects" / "policies" / "research" / "policies" / "omniquad_ppo_main" / "policy.onnx")
     # Sometimes Webots starts the controller with a weird cwd; also look
     # relative to the controller dir.
     candidates.append(Path(__file__).parent / "policy.onnx")
-    for c in candidates:
+    if tried is not None:
+        tried.extend(candidates)
+    for i, c in enumerate(candidates):
         if c.exists():
+            if i and say is not None:
+                # A LATER candidate won, i.e. the policy this world means to
+                # deploy is absent and a DIFFERENT one is about to drive the
+                # robot. Never let that pass quietly -- it is the exact shape of
+                # "the demo worked and the result meant nothing".
+                say(f"[omniquad_rl_deploy] WARNING: fell back to candidate #{i + 1}; "
+                    f"the preferred policy {candidates[0]} does not exist.\n")
+                say(f"[omniquad_rl_deploy] WARNING: running {c} instead -- a "
+                    "DIFFERENT policy. Do not compare this run against one that "
+                    "used the preferred policy.\n")
             return c
     # Return the last candidate so the caller's error message points somewhere.
     return candidates[-1]
@@ -250,10 +279,21 @@ def main() -> int:
                 pass
     _say("[omniquad_rl_deploy] starting\n")
 
-    policy_path = find_policy_path()
+    _tried: list = []
+    policy_path = find_policy_path(say=_say, tried=_tried)
     _say(f"[omniquad_rl_deploy] policy: {policy_path}\n")
     if not policy_path.exists():
-        sys.stderr.write(f"[omniquad_rl_deploy] ERROR: policy not found at {policy_path}\n")
+        # Name EVERY path tried and the interpreter that tried them. The engine
+        # spawns a different python per controller (resolved from PATH), so an
+        # error that names neither sends the operator to the wrong interpreter
+        # and the wrong directory -- which is how the dead `projects/rl` default
+        # survived this long (2026-09-11).
+        sys.stderr.write(f"[omniquad_rl_deploy] ERROR: no policy found. Tried:\n")
+        for c in _tried:
+            sys.stderr.write(f"    {c}\n")
+        sys.stderr.write(f"  controller interpreter: {sys.executable}\n")
+        sys.stderr.write("  (the ENGINE spawns that python from PATH -- it is NOT the\n")
+        sys.stderr.write("   one `python -m omnisim` runs)\n")
         sys.stderr.write("  Set OMNIQUAD_POLICY_ONNX env var, or export a policy via\n")
         sys.stderr.write("  projects/policies/research/inference/export_onnx.py\n")
         return 1
@@ -427,7 +467,11 @@ def main() -> int:
     wz = float(os.environ.get("OMNIQUAD_WZ", "0.0"))
     try:
         repo_root = next(_p for _p in Path(__file__).resolve().parents if (_p / "projects" / "policies").is_dir() or (_p / "AGENTS.md").exists() or (_p / ".git").exists())
-        cmd_file = repo_root / "projects" / "rl" / "inference" / "current_command.txt"
+        # PATH: `projects/rl` -> `projects/policies/research` (1b668a910). The
+        # comment four lines up already named the NEW path while the code below
+        # still read the dead one, so this sentinel was never found and every
+        # eval silently used the env-var/default command (2026-09-11).
+        cmd_file = repo_root / "projects" / "policies" / "research" / "inference" / "current_command.txt"
         if cmd_file.exists():
             lines = cmd_file.read_text().strip().splitlines()
             if len(lines) >= 3:

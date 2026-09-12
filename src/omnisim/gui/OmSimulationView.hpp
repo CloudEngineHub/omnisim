@@ -62,6 +62,7 @@ public:
   QAction *toggleView3DAction() const { return mToggleView3DAction; }
   QAction *toggleSceneTreeAction() const { return mToggleSceneTreeAction; }
   QAction *movieAction() const { return mMovieAction; }
+  void renderPhoto();
   void cancelSupervisorMovieRecording();
 
   void modeKeyPressed(QKeyEvent *event);

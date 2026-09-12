@@ -25,6 +25,209 @@ top of that foundation.
 ---
 
 
+## [Unreleased]
+
+## [v8.5.0] — 2026-09-12
+
+### Rendering
+
+- **Photo mode** (`af23053e2`): a bounded, cancellable CPU path-traced capture,
+  from the File menu and from an automated capture path. It traces owned scene
+  geometry and material textures, importance-samples emissive surfaces and the
+  environment, adapts sampling per pixel, and optionally denoises with Open
+  Image Denoise. Solid glass now carries Fresnel reflection, Snell refraction,
+  internal reflection and thickness absorption. Live rendering gains local
+  reflection captures, complete GGX mip chains, shadowed moving point and spot
+  lights, and a reusable rectangular area light; roughness-map overrides are
+  corrected. Native checks cover sampling error, dielectric transport, energy,
+  denoising, cancellation and reflection mips; engine checks cover photo output,
+  area emission, moving-light shadows and robot-camera roughness maps.
+- **Temporal antialiasing that knows what it is reprojecting** (`c1c9e2528`,
+  `affa49d62`). A history tap from a different surface is rejected, reprojection
+  is aligned with raster jitter, persistence drops on changing colours, and
+  history is reprojected with per-object transforms and previous deformation
+  vertices so rigid and deforming surfaces both track. MSAA motion and depth
+  samples are matched, and the extra draw pass is skipped for unchanged opaque
+  geometry. TAA stays optional and the sensor path stays unjittered — invariant
+  vertex precision is confined to the motion-enabled HDR viewport — and the
+  house, warehouse and city TAA-off images match the previous executable
+  exactly. **No FPS claim:** the measurements ran against concurrent workloads,
+  which is recorded rather than rounded up.
+- **Stationary local shadows are reused instead of redrawn** (`37aa0fc84`), with
+  conservative per-cubemap-face caster culling when a redraw is needed, and the
+  shared main-view and sensor draw caches kept current across geometry and
+  material edits and completed subtree insertion. Both optimisations are
+  independently reversible. Stationary house and warehouse captures match the
+  reference exactly while the repeated local-shadow draws disappear; **the city
+  control does not establish an FPS or timing gain**, and the measured binary,
+  world and image hashes are preserved with the timing limitations attached.
+  Validated against 119,155 native frustum witnesses, with thirteen edit states
+  matching in both the main view and a camera sensor.
+- **Optional asynchronous GPU timestamp profiling** (`c1c9e2528`): per-target
+  pass timings and render-start intervals through a bounded readback ring. A
+  binding that depends on a scene buffer is now invalidated explicitly when that
+  buffer grows, so a recycled native handle can no longer hide a newly inserted
+  object.
+
+### Fixed
+
+- **A mesh preflight that reported "0 unresolved" for 8,048 references it could
+  not decode** (`93d883d42`). Pointed at a stranger's robot gallery (718 URDFs,
+  4,024 `.glb`, every one carrying `KHR_draco_mesh_compression`),
+  `urdf_import.py --report --strict`, `validate-urdf --check-meshes` and a
+  headless load all passed. The engine warned `GLTF: Draco mesh compression not
+  supported` and then substituted a collider — an AABB box, or where even that
+  was unavailable, a default 12 cm sphere. A robot whose collision geometry is a
+  sphere still loads, still steps, still exits 0, and every contact it produces
+  is fiction. The preflight was asking whether the file EXISTS and reporting
+  that as "resolved"; existence is not decodability. The boolean is now a
+  four-state classification — missing / undecodable / unverified / ok — and
+  `undecodable` is asserted only when provable from the bytes.
+- **Import order, not packaging, is why two bridge demos quietly ran without
+  their intent layer** (`ba280cb15`). `_omnilink_relay` puts
+  `packages/omnisim-bridges/src` on `sys.path`, but both bridges imported
+  `omnisim_bridges` about thirty lines above that and a bare `except Exception`
+  swallowed the `ModuleNotFoundError`. The arm bridge proved the mechanism by
+  failing only half way: its `intent_router` import at line 135 fell through to
+  a stub while `intents` at line 211 worked, same file, same run, decided purely
+  by line number. The mobile bridge had lost the shared status/resume intents
+  and the whole deferred-intent layer. Both now bootstrap the path at module top
+  level with no `try`, which is what every other consumer already did.
+- **Thirty-two files still built paths into `projects/rl`**, deleted when it
+  became `projects/policies/research` (`91d7def9e`). None of them raised: every
+  site had an `.exists()` guard and a degraded branch that exits 0, so a demo
+  that never loaded its policy reported success. The shape that hid it is a
+  candidate list whose every entry ahead of the dead path is opt-in, so running
+  it the documented way — no flag, no environment variable — made the dead path
+  the default rather than the fallback.
+- **The Newton bundle is also the CONTROLLER interpreter, so it now ships
+  `onnxruntime`** (`e0db3abcc`). Twenty-six shipped controllers import it — every
+  `*_deploy` / `*_mimic` under `projects/policies/research/controllers`, plus
+  `anypick_cam` and `omniarm6_bin_picking` — and the bundle they run under did
+  not contain it. The engine embeds CPython for physics but spawns a separate
+  python per controller, resolved from PATH, so the developer's own interpreter
+  (with onnxruntime installed) was never the one running them: every local gate
+  passed while a clean clone was broken. The bundler's `VERIFY_IMPORTS` was the
+  other half of the hole — it verified what the bundle was for, not what the
+  controllers need.
+
+### Agent bridges
+
+- **The three yaw leftovers are measured, and one constant's REASON was false**
+  (`7e99acfd4`). `PIVOT_ANGULAR_R_S_MAX` carried a traction argument — that a
+  faster pivot would break the tyres loose and wedge the Husky against a maze
+  wall. Measured across all five shipped `husky_maze_*` worlds, every hop driven
+  start-to-goal over the BFS route: 0 wedges at cap 1.0, 1.5 and 2.5. The cap
+  stays at 1.5 and its justification is now what the measurement supports, not
+  the story it was kept for. Nothing needed retuning.
+- **The Mavic flight step no longer cites a Gyro defect that was fixed**
+  (`0e592a3a2`). The comment claimed the Gyro reads a constant (0,0,0) under
+  Newton and that the defect was "documented in AGENTS.md"; the defect was fixed
+  on 2026-09-01 by `bde550489` and AGENTS.md has never contained the word gyro.
+  The IMU-differencing itself is kept, and the comment now says why it is kept:
+  it works, it is exercised, and `dt` is the basic time step rather than wall
+  clock, so `--mode=fast` does not distort it. Switching this path back to the
+  Gyro is a behaviour change on the demo that public issue #10 was filed
+  against, so it gets its own change.
+
+### Contributed
+
+- **The corridor worlds declare `newtonGroundMu`** (public PR #20,
+  lluisestape-upc). Neither world declared ground friction, so both ran at the
+  engine default and the parked airframe slid at ~0.077 m/s: on v8.4.0 the start
+  guard measured 4.846 m from the authored start and refused to fly. With 1.5
+  declared the same flight is 8/8 in 40.55 s and eighteen consecutive flights
+  start within a millimetre of each other. The worlds handed over were copies
+  made before the friction experiment, so the fix never travelled with them.
+- **The corridor hull-clearance threshold is withdrawn** (#20 follow-up). The
+  README shipped 0.17-0.21 m of hull on the `none` condition, measured the day
+  the benchmark landed. It does not reproduce: three flights on v8.4.0 measure
+  0.0934, 0.0977 and 0.1092 m here and the reporter measures 0.084-0.093 m over
+  six flights on their own machine, so the two of us agree and the published
+  figure is the outlier — as written it would have failed every flight on the
+  build it was meant to gate. Two engine changes that landed in between were
+  tested as explanations and both refuted: reverting the URDF inertia work moves
+  clearance to 0.0358 m (the fix *improves* it) and reverting the wheel rotor
+  armature leaves it at 0.0974 m. The README now quotes 0.076-0.109 m across the
+  fifteen control flights the two of us have flown, records the one wider line
+  at 0.306 m, and names the tight spot.
+- **Lane-offset scoring for the Mavic corridor benchmark** (public PR #21,
+  lluisestape-upc): `tests/benchmarks/mavic_corridor/lane_scoring.py`, called by
+  `corridor_mission.py` so a report written with `--keep-trajectories` grows a
+  `lane` block, plus a CLI that re-scores a past campaign without re-flying. It
+  measures the benchmark's third failure signature, which no summary metric
+  sees: a contact the aircraft survives delays its return to the lane, and an
+  obstacle corner inside that recovery distance is what collects, while
+  completion stays 8/8 and clearance moves only at that one corner. The three
+  rules that decide every number are in code because each had already produced a
+  disagreement in prose — forward-only nearest-segment leg assignment, a station
+  anchored at the closest approach to the leg's start waypoint (one flight
+  admitted +0.49, +1.25 and +3.02 for the same station without it), and a
+  station inside the turn returning `in-turn` rather than a number. Verified by
+  re-scoring our own twelve v8.4.0 flights with the contributor's module: it
+  reproduces our independently written script's per-leg maxima exactly
+  (`blocked_1` legs 5-7 at 0.272 / 0.302 / 0.297 m), classifies x = 4.3 as
+  in-turn in every completed flight — the objection that prompted the module —
+  and returns "not reached" rather than a number for the three flights that
+  wedged against the blocker.
+- **The station reading no longer depends on the sample rate** (follow-up to
+  #21). `offset_m` is read at the first sample past the station, and a sample
+  sits a fraction of a period past it, so on an aircraft recovering toward its
+  lane the reading is biased low — 0.002 to 0.024 m over the twelve flights
+  re-scored here, never high, which is exactly the gap between the contributor's
+  readings and the numbers we published on #14 from an interpolating script.
+  Each reading now also carries `offset_interp_m`, interpolated onto the station
+  itself, which agrees with those published numbers to the third decimal. The
+  bias grows with `SAMPLE_PERIOD_S`: at a quarter of the rate one reading moved
+  0.065 m and one changed sign, so a band published from one campaign was not
+  safely comparable with another. Pinned by a test that decimates a synthetic
+  recovery. A second test pins `CORNER_SKIP_M`, which the suite named but did
+  not exercise — the samples it used were already excluded by leg assignment, so
+  the test passed with the corner ball set to zero.
+- **A corridor flight is not reproducible with a second engine on the machine**,
+  and the README now says so. The engine runs `--mode=fast` while the bridge is
+  driven over HTTP, so wall-clock latency decides how many simulation steps pass
+  between a waypoint arriving and the next command landing. Three consecutive
+  `none` flights on one build: with a second engine running the aircraft
+  collided, 32.09 m of path in 36.37 s; alone it cleared 0.0973 m of hull,
+  33.38 m in 40.44 s, inside the published band. The benchmark already asked for
+  one engine per flight; it now asks for one engine on the host.
+
+### Tooling
+
+- **`publish_snapshot.sh` measures its worktree path before it commits
+  anything** (2026-09-11). The snapshot worktree was materialised only after
+  the changelog and version-bump commits had landed, so a checkout that could
+  not succeed failed with the bump already on private `main` — which is what
+  happened cutting v8.4.0: a 100-character `OMNISIM_PUBLISH_WORKTREE_DIR`
+  prefix plus the tree's 204-character longest tracked path crossed Windows'
+  260-character `MAX_PATH`, and 42 files under `social/` died with
+  `Filename too long`. The script now checks that the worktree's parent is
+  creatable and, on Windows, adds prefix + longest tracked path before its
+  first commit; when the sum reaches 260 it prints the number and runs the
+  checkout with `core.longpaths=true`, which git honours for the worktree's
+  own checkout. The header also records that the release token's Contents
+  write permission is not enough to comment on the tracker afterwards
+  (`addComment` needs Issues and Pull requests write), which the v8.4.0
+  replies hit.
+
+### Documentation
+
+- **Our own gripper geometry is no longer attributed to a manufacturer**
+  (`04876072d`). `DEMOS.md`, the launcher card, three world titles and two
+  controller docstrings called the 140 mm two-finger gripper a "Robotiq 2F-140",
+  while `projects/robots/robotiq/PROVENANCE.md` says in terms that the geometry
+  is original work of this repository, defined entirely by URDF primitive solids
+  with no mesh, texture or CAD file from any third party. Four more files
+  claimed third-party CAD lineage for geometry that is entirely ours. Both
+  directions are corrected at the source.
+- **AGENTS.md claimed a test pinned the environment-variable reference, and then
+  the correction was itself wrong** (`ff00cea13`, `215ec0aa9`). The test did
+  exist — in `make tests-docs`, a lane nobody runs — so the drift check now also
+  runs in the default lane as `tests/test_env_reference_current.py`. The
+  generated page is regenerated in this release: 473 variables, one newly
+  discovered.
+
 ## [v8.4.0] — 2026-09-11
 
 The release where the solver runs on what the author declared — a link's

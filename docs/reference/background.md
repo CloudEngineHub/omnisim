@@ -17,12 +17,19 @@ Background {
   MFString topIrradianceUrl    []
   SFFloat  luminosity          1          # [0, inf)
   SFString atmosphericSky      ""         # {"", "earth", "mars"}
+  MFVec3f reflectionProbePositions []     # up to three local world-space captures
 }
 ```
 
 ### Description
 
 The [Background](#background) node defines the background used for rendering the 3D world.
+
+`reflectionProbePositions` adds up to three local OmniLight reflection captures
+beside the broad scene capture. Put positions in open space inside rooms or near
+reflective objects. Captures use spatial blending, box parallax correction and
+GGX roughness filtering. They update asynchronously with the light bake; see
+[Photo and live lighting](../guide/photo-rendering.md#live-reflections-and-lights).
 
 ### Field Summary
 

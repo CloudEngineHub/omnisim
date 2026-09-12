@@ -1,5 +1,12 @@
 #VRML_SIM R2025a utf8
-# OmniLink chat demo — OmniArm 6 + Robotiq 2F-140, and the hold is REAL.
+# OmniLink chat demo — OmniArm 6 + a 140 mm two-finger gripper, and the hold is REAL.
+#
+# ⚠ NAMING. The gripper is OmniSim's own model of a 140 mm two-finger parallel
+# gripper, authored in this repository from URDF primitive solids. It is not a
+# manufacturer's product model and contains no third-party mesh or CAD. The
+# `2f140` in the filenames, link names and gripper-config ids is a SIZE/CLASS
+# identifier kept stable for the worlds and bridges that reference it, not a
+# product claim. See projects/robots/robotiq/PROVENANCE.md.
 #
 # Right-click the arm -> Show Robot Window, then type. Offline it uses the
 # regex intent router; set OMNI_KEY and it routes through OmniLink to a model.
@@ -63,7 +70,7 @@ EXTERNPROTO "omnisim://projects/objects/lights/protos/OmniSimSunMarker.proto"
 
 WorldInfo {
   basicTimeStep 8
-  title "OmniLink — OmniArm 6 + Robotiq 2F-140, talk to it (friction hold, no weld)"
+  title "OmniLink — OmniArm 6 + 140 mm two-finger gripper, talk to it (friction hold, no weld)"
   newtonSolver "mujoco"
   newtonStatics TRUE
   newtonCompoundColliders TRUE

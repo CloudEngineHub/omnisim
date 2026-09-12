@@ -33,7 +33,7 @@
         },
         {
           "id": "omniarm6_2f140",
-          "name": "OmniArm 6 + Robotiq 2F-140 (real grasp)",
+          "name": "OmniArm 6 + 140 mm two-finger gripper (real grasp)",
           "world": "projects/samples/demos/worlds/chat/omnilink_omniarm6_2f140.omniworld",
           "blurb": "Ask it to \"pick up the block\" and \"put it down\" -- and the hold is REAL friction, not the kinematic weld every other chat demo uses. Say \"open the gripper\" mid-carry and the block falls, which is the point."
         },

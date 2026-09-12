@@ -104,6 +104,13 @@ from pathlib import Path
 #   usd-core           -> newton's asset/USD dependency (imported as pxr)
 #   newton-usd-schemas -> newton's codeless USD schema plugin; add_usd hard-fails
 #                         without it (require_newton_usd_schemas raises)
+#   onnxruntime        -> the ONNX inference runtime the shipped RL-deploy
+#                         CONTROLLERS import. Not physics: this bundle is also
+#                         the interpreter the engine spawns for Python
+#                         controllers on every launch path that puts
+#                         newton-runtime ahead of the system python, so a
+#                         bundle without it ships demos that refuse to run
+#                         their own policies (see newton_runtime_pins.py).
 try:
     from newton_runtime_pins import bundle_requirements
     NEWTON_PACKAGES = bundle_requirements()
@@ -118,7 +125,42 @@ except ImportError:  # running from an odd CWD: fall back to name-only, but warn
 # Modules that must import for the runtime to be considered live.  The OmniSim
 # helper is deliberately a real bundled module (not a C++ string literal), so
 # bundle verification must cover it too or packaging can silently drift.
-VERIFY_IMPORTS = ["warp", "newton", "omnisim_newton_runtime"]
+#
+# `onnxruntime` is here for the same reason: the bundle doubles as the
+# CONTROLLER interpreter, and it was missing from it until 2026-09-11 with no
+# signal anywhere -- the bundler verified only what physics needed, so a
+# packaging gap that broke 26 shipped controllers passed every gate. Verify
+# what the bundle is USED for, not only what it was named after.
+VERIFY_IMPORTS = ["numpy", "warp", "newton", "omnisim_newton_runtime",
+                  "onnxruntime"]
+
+# Importing a name is not the same as the package WORKING. `pip install
+# --upgrade --target` rmtrees a package before reinstalling it, so a run
+# interrupted by a file lock leaves a partially-deleted tree whose top-level
+# import can still succeed while its compiled extensions are gone. That
+# happened to numpy on 2026-09-11 (341 files removed before pip hit
+# _umath_linalg.cp312-win_amd64.pyd), and no check in this file would have
+# noticed -- numpy was not even in VERIFY_IMPORTS.
+#
+# Each probe below therefore runs real work through a COMPILED extension:
+#   linalg.det -> _umath_linalg (the exact .pyd that was locked)
+#   linalg.inv -> same, different LAPACK entry point
+#   fft        -> _pocketfft_umath
+# Keep them cheap, deterministic, and dependent on native code, not Python.
+INTEGRITY_PROBES = [
+    ("numpy.linalg.det",
+     "import numpy; "
+     "d = numpy.linalg.det(numpy.array([[4.,7.],[2.,6.]])); "
+     "assert abs(d - 10.0) < 1e-9, d"),
+    ("numpy.linalg.inv",
+     "import numpy; "
+     "m = numpy.linalg.inv(numpy.array([[4.,7.],[2.,6.]])); "
+     "assert abs(m[0][0] - 0.6) < 1e-9, m"),
+    ("numpy.fft",
+     "import numpy; "
+     "f = numpy.fft.fft(numpy.array([1.,0.,0.,0.])); "
+     "assert abs(f[0].real - 1.0) < 1e-9, f"),
+]
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_TARGET = REPO_ROOT / "msys64" / "mingw64" / "bin"
@@ -315,9 +357,101 @@ def place_loader_dll(cpython_home, target_dir, tag):
     return dst
 
 
-def pip_install(python_exe, site_packages, packages):
-    cmd = [str(python_exe), "-m", "pip", "install", "--upgrade",
-           "--target", str(site_packages), *packages]
+def running_engines():
+    """Pids of live omnisim-bin processes, or None if we could not find out.
+
+    None is NOT "none running" -- callers must treat it as unknown and warn.
+    """
+    names = ("omnisim-bin.exe", "omnisim-bin", "webots-bin.exe")
+    try:
+        if os.name == "nt":
+            # tasklist is present on every Windows SKU; Get-CimInstance needs
+            # PowerShell on PATH, which a MSYS make shell does not guarantee.
+            r = subprocess.run(
+                ["tasklist", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=20)
+            if r.returncode != 0:
+                return None
+            found = []
+            for line in r.stdout.splitlines():
+                parts = [p.strip('"') for p in line.split('","')]
+                if len(parts) >= 2 and parts[0].lower() in (
+                        n.lower() for n in names):
+                    found.append(f"{parts[0]} pid {parts[1]}")
+            return found
+        r = subprocess.run(["ps", "-eo", "pid=,comm="],
+                           capture_output=True, text=True, timeout=20)
+        if r.returncode != 0:
+            return None
+        found = []
+        for line in r.stdout.splitlines():
+            bits = line.split(None, 1)
+            if len(bits) == 2 and bits[1].strip() in names:
+                found.append(f"{bits[1].strip()} pid {bits[0]}")
+        return found
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def assert_no_engine_holds_the_bundle(allow_running):
+    """REFUSE to run the destructive pip path while an engine holds the bundle.
+
+    `pip install --upgrade --target` RMTREES each existing package directory
+    before reinstalling it. A running omnisim-bin.exe holds the bundle's
+    compiled extensions open (it loads python3XX.dll from its own directory and
+    imports numpy/warp/mujoco through it), so on Windows the delete fails
+    PART WAY THROUGH and leaves a half-erased package that no longer imports.
+    Measured 2026-09-11: 341 files removed from the bundle's numpy before pip
+    hit _umath_linalg.cp312-win_amd64.pyd and died; the bundle had to be
+    hand-repaired from the wheel.
+
+    This matters because AGENTS.md §0 and §2 tell agents to run
+    `make -C src/omnisim bundle-newton-runtime` as a bootstrap step, and the
+    corruption surfaces LATER as a confusing ImportError somewhere unrelated.
+    Refuse by default; --allow-running-engines is the explicit override.
+    """
+    engines = running_engines()
+    if engines is None:
+        print("WARNING: could not enumerate processes, so this cannot check "
+              "whether an engine holds the bundle open. If one does, the pip "
+              "--target step below will CORRUPT it. Stop every omnisim-bin "
+              "before continuing.", file=sys.stderr)
+        return
+    if not engines:
+        return
+    listing = "\n".join(f"    {e}" for e in engines)
+    if allow_running:
+        print("WARNING: --allow-running-engines given; proceeding with "
+              f"{len(engines)} engine(s) live. If the bundle is corrupted, "
+              "re-run this script with them stopped.\n" + listing,
+              file=sys.stderr)
+        return
+    raise SystemExit(
+        "REFUSING to re-vendor the bundle: omnisim-bin is running.\n"
+        + listing + "\n\n"
+        "`pip install --upgrade --target` deletes each package directory "
+        "before reinstalling it. A live engine holds the bundle's .pyd files "
+        "open, so the delete fails part way through and leaves a package that "
+        "no longer imports -- unrecoverable without re-downloading the wheel.\n"
+        "\n"
+        "Stop every omnisim-bin listed above and re-run. Do NOT kill an engine "
+        "another lane or the user is driving (AGENTS.md: never kill an "
+        "omnisim-bin you did not spawn) -- wait for it instead.\n"
+        "Override only if you are certain: --allow-running-engines"
+    )
+
+
+def pip_install(python_exe, site_packages, packages, upgrade=True):
+    """Install into the bundle's site-packages.
+
+    `upgrade` selects the DESTRUCTIVE path (rmtree-then-reinstall). Callers
+    adding a single package to an otherwise-good bundle should pass
+    upgrade=False, which also implies --no-deps: it leaves every other package
+    untouched and so cannot damage them.
+    """
+    cmd = [str(python_exe), "-m", "pip", "install"]
+    cmd += ["--upgrade"] if upgrade else ["--no-deps"]
+    cmd += ["--target", str(site_packages), *packages]
     print("  " + " ".join(cmd), flush=True)
     subprocess.run(cmd).check_returncode()
 
@@ -380,7 +514,53 @@ def verify_interpreter(bundle_dir, tag):
     print(r.stdout, end="")
     if r.returncode != 0:
         print(r.stderr, file=sys.stderr)
-    return r.returncode == 0
+        return False
+    return verify_integrity(bundle_dir)
+
+
+def verify_integrity(bundle_dir):
+    """Exercise the bundle's COMPILED extensions, not just its import names.
+
+    A half-deleted package (see INTEGRITY_PROBES) imports fine and computes
+    nothing. Report that as DAMAGE with a repair instruction, because the
+    generic ImportError it otherwise produces sends the next person hunting
+    their own environment instead of the bundle.
+    """
+    bundle_dir = Path(bundle_dir)
+    py = bundle_dir / "python.exe"
+    paths = [bundle_dir / "Lib", bundle_dir / "DLLs",
+             bundle_dir / "site-packages"]
+    prelude = ("import sys; "
+               + "; ".join(f"sys.path.insert(0, r'{p}')" for p in paths) + "; ")
+    damaged = []
+    for label, probe in INTEGRITY_PROBES:
+        r = subprocess.run([str(py), "-S", "-c", prelude + probe],
+                           env=scrubbed_env(), capture_output=True, text=True)
+        if r.returncode != 0:
+            damaged.append((label, (r.stderr or "").strip().splitlines()[-1:]))
+            print(f"  INTEGRITY {label}: FAIL")
+        else:
+            print(f"  INTEGRITY {label}: ok")
+    if not damaged:
+        return True
+    print("\n"
+          "!! THE BUNDLE IS DAMAGED -- it imports but does not compute.\n"
+          "!! Failing probes: "
+          + ", ".join(d[0] for d in damaged) + "\n"
+          "!! This is the signature of a `pip install --upgrade --target` run\n"
+          "!! that was interrupted by a file lock: the package directory was\n"
+          "!! rmtree'd and only partly rewritten, so the pure-Python half\n"
+          "!! imports while the compiled extensions are missing.\n"
+          "!! REPAIR: stop every omnisim-bin, then re-run this script (the\n"
+          "!!         guard will confirm none is left). If that still fails,\n"
+          "!!         delete the affected package directory under\n"
+          f"!!         {bundle_dir / 'site-packages'} and re-run so pip\n"
+          "!!         fetches a clean wheel.\n",
+          file=sys.stderr)
+    for label, tail in damaged:
+        for line in tail:
+            print(f"    {label}: {line}", file=sys.stderr)
+    return False
 
 
 def verify_binary(binary_path, target_dir, timeout=60):
@@ -539,6 +719,10 @@ def main(argv=None):
                     help="also prove the packaged binary finalises and steps Newton")
     ap.add_argument("--inspect", action="store_true",
                     help="report current state and exit (no changes)")
+    ap.add_argument("--allow-running-engines", action="store_true",
+                    help="re-vendor even though omnisim-bin is running. This "
+                         "CORRUPTS the bundle if the engine holds a .pyd open; "
+                         "the default is to refuse.")
     args = ap.parse_args(argv)
 
     if os.name != "nt":
@@ -555,6 +739,10 @@ def main(argv=None):
         print(f"ERROR: {binary} not found; build omnisim-bin.exe first.",
               file=sys.stderr)
         return 1
+
+    # Everything past this point WRITES to the bundle. Check first -- see the
+    # function's docstring for what a live engine does to a pip --target run.
+    assert_no_engine_holds_the_bundle(args.allow_running_engines)
     dll = detect_python_dll(binary)
     if not dll:
         print(f"ERROR: {binary} imports no python3XX.dll -- this build has no "

@@ -43,8 +43,11 @@ somebody:
     a non-zero effort and velocity; joint ranges non-empty.
 
 ``assets``
-    Referenced meshes resolve. Off by default -- it is the only tier whose
-    answer depends on where the file is checked out rather than on the model.
+    Referenced meshes resolve AND decode. Existence alone is not the question:
+    a Draco-compressed glTF sits right there on disk and OmniSim's mesh reader
+    refuses it whole, and a collision mesh in that state silently becomes a
+    placeholder primitive. Off by default -- it is the only tier whose answer
+    depends on where the file is checked out rather than on the model.
 
 The two physics checks worth stating explicitly, because both have cost real
 debugging time in descriptions shipped by robot vendors:
@@ -364,16 +367,56 @@ def _check_physics(robot, findings: list[Finding], urdf) -> None:
 
 
 def _check_assets(robot, findings: list[Finding]) -> None:
+    """Referenced meshes must both RESOLVE and DECODE.
+
+    ⚠ Two silent failures lived here until 2026-09-11 and the tier could not
+    produce a finding at all:
+
+    1. ``mesh_path`` is the *resolved* path and ``urdf_import`` sets it to the
+       empty string precisely when the reference does NOT resolve -- so the
+       ``if not mesh: continue`` guard skipped exactly the case the tier
+       exists to catch, and the ``Path(mesh).is_file()`` test that followed was
+       true by construction for every surviving path. ``--check-meshes`` was a
+       no-op. The state now comes from ``geometry.mesh_status``.
+    2. Resolving was the ONLY question asked. Run over the public urdfeus
+       gallery (718 models, ``github.com/iory/urdfeus`` @ ``a5d094b``) every
+       one of its 4,024 ``.glb`` meshes is Draco-compressed and OmniSim's
+       assimp build refuses all of them -- yet nothing here objected, and the
+       engine gave each affected link a placeholder sphere collider.
+
+    Only PROVABLE defects become findings: ``missing`` and ``undecodable``. The
+    third state ``unverified`` (a required glTF extension nobody has checked)
+    is a caveat, not a proof, and stays in the ``urdf_import`` report's
+    warnings rather than failing a gate here.
+    """
     for link in robot.links.values():
-        for element in list(link.collisions) + list(link.visuals):
-            geom = getattr(element, "geometry", None)
-            mesh = getattr(geom, "mesh_path", None) if geom is not None else None
-            if not mesh:
-                continue
-            if not Path(mesh).is_file():
-                findings.append(Finding(
-                    "assets", "mesh_not_found", link.name,
-                    f"'{mesh}' does not resolve to a file"))
+        for role, elements in (("collision", link.collisions), ("visual", link.visuals)):
+            for element in elements:
+                geom = getattr(element, "geometry", None)
+                if geom is None or getattr(geom, "kind", "") != "mesh":
+                    continue
+                status = getattr(geom, "mesh_status", "")
+                issue = getattr(geom, "mesh_issue", "")
+                # `detail` is the reference as WRITTEN in the URDF, which is the
+                # only name that exists when nothing resolved to a path.
+                named = geom.mesh_path or geom.detail
+                if status == "missing":
+                    findings.append(Finding(
+                        "assets", "mesh_not_found", link.name,
+                        f"{role} mesh '{named}' does not resolve to a file"))
+                elif status == "undecodable":
+                    # The consequence is what makes this worth an exit code, and
+                    # it is not the same for the two roles.
+                    consequence = (
+                        "the link will collide as a placeholder primitive rather than as its "
+                        "declared geometry (the engine raises an ERROR for that since "
+                        "2026-09-11; OMNISIM_STRICT_COLLISION_MESH=0 downgrades it)"
+                        if role == "collision" else
+                        "the link will render with nothing in its place")
+                    findings.append(Finding(
+                        "assets", "mesh_undecodable", link.name,
+                        f"{role} mesh '{named}' resolves to a file OmniSim cannot decode "
+                        f"({issue}); {consequence}"))
 
 
 def validate_file(path: Path, tiers=DEFAULT_TIERS) -> list[Finding]:
@@ -401,7 +444,7 @@ def add_parser(sub) -> None:
         "--tiers", default=",".join(DEFAULT_TIERS),
         help=f"Comma-separated subset of {{{','.join(TIERS)}}} (default: %(default)s).")
     p.add_argument("--check-meshes", action="store_true",
-                   help="Also run the 'assets' tier (mesh files must resolve).")
+                   help="Also run the 'assets' tier (referenced meshes must resolve AND decode).")
     p.add_argument("--json", action="store_true", help="Emit JSON instead of text.")
     p.add_argument("--quiet", "-q", action="store_true",
                    help="Print nothing; use the exit code.")

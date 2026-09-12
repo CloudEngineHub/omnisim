@@ -37,7 +37,9 @@ from pathlib import Path
 import numpy as np
 
 REPO_ROOT = next(_p for _p in Path(__file__).resolve().parents if (_p / "projects" / "policies").is_dir() or (_p / "AGENTS.md").exists() or (_p / ".git").exists())
-WORLD = REPO_ROOT / "projects" / "rl" / "worlds" / "omniquad_rl_deploy.omniworld"
+# PATH: `projects/rl` was renamed to `projects/policies/research` by 1b668a910;
+# the old path failed SILENTLY here (2026-09-11).
+WORLD = REPO_ROOT / "projects" / "policies" / "research" / "worlds" / "omniquad_rl_deploy.omniworld"
 OMNISIM_BIN = REPO_ROOT / "msys64" / "mingw64" / "bin" / "omnisim-bin.exe"
 TRACE_DIR = Path(r"C:\tmp\omnisim_rl_deploy")
 

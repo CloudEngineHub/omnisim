@@ -348,17 +348,33 @@ PUSH_Z = 0.05
 PUSH_BACK = 0.05
 PUSH_LEN = 0.08
 
-_gp_path = os.environ.get(
-    "GRASP_POLICY_ONNX",
-    os.path.join(_HERE, "..", "..", "..", "..", "rl", "inference",
-                 "policies", "omniarm6_grasp", "policy.onnx"))
+# PATH: the four `..` land on `projects/`, and `projects/rl` was renamed to
+# `projects/policies/research` by 1b668a910. The dead path failed SILENTLY --
+# BINPICK_USE_RL defaults to "1" but os.path.exists() was always False, so the
+# demo ran its scripted fallback and exited 0 with no mention of the policy
+# (2026-09-11).
+_gp_path = os.path.join(_HERE, "..", "..", "..", "..", "policies", "research",
+                        "inference", "policies", "omniarm6_grasp", "policy.onnx")
+_gp_path = os.path.abspath(os.environ.get("GRASP_POLICY_ONNX", _gp_path))
 _gp = None
 if os.environ.get("BINPICK_USE_RL", "1") != "0":
     try:
         import onnxruntime as ort
         if os.path.exists(_gp_path):
             _gp = ort.InferenceSession(_gp_path, providers=["CPUExecutionProvider"])
-    except Exception:
+        else:
+            sys.stderr.write(
+                "[omniarm6_bin_picking] grasp policy NOT found -- running the "
+                "scripted fallback, NOT the learned push policy.\n"
+                f"[omniarm6_bin_picking]   tried: {_gp_path}\n"
+                f"[omniarm6_bin_picking]   controller interpreter: {sys.executable}\n"
+                "[omniarm6_bin_picking]   set GRASP_POLICY_ONNX, or "
+                "BINPICK_USE_RL=0 to ask for the fallback on purpose.\n")
+    except Exception as _e:
+        sys.stderr.write(
+            f"[omniarm6_bin_picking] grasp policy failed to load ({_e!r}) -- "
+            "running the scripted fallback, NOT the learned push policy.\n"
+            f"[omniarm6_bin_picking]   controller interpreter: {sys.executable}\n")
         _gp = None
 
 

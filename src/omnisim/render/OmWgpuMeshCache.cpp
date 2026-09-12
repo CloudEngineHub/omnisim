@@ -15,6 +15,7 @@
 #include "OmWgpuMeshCache.hpp"
 
 #include <cmath>
+#include <atomic>
 #include <cstring>
 
 #include "OmLog.hpp"
@@ -56,11 +57,13 @@ bool OmWgpuMeshCache::tryGet(uint64_t meshId, OmWgpuMeshHandle &out) const {
   out.vertexBuffer = e.vertexBuffer;
   out.indexBuffer = e.indexBuffer;
   out.indexCount = e.indexCount;
+  out.geometryRevision = e.geometryRevision;
   out.localCenter[0] = e.localCenter[0];
   out.localCenter[1] = e.localCenter[1];
   out.localCenter[2] = e.localCenter[2];
   out.localRadius = e.localRadius;
   out.cpuPositions = e.cpuPos.empty() ? nullptr : &e.cpuPos;
+  out.cpuAttributes = e.cpuAttr.empty() ? nullptr : &e.cpuAttr;
   out.cpuIndices = e.cpuIdx.empty() ? nullptr : &e.cpuIdx;
   return true;
 }
@@ -152,11 +155,13 @@ OmWgpuMeshHandle OmWgpuMeshCache::acquire(uint64_t meshId, const void *vertexByt
   h.vertexBuffer = se.vertexBuffer;
   h.indexBuffer = se.indexBuffer;
   h.indexCount = se.indexCount;
+  h.geometryRevision = se.geometryRevision;
   h.localCenter[0] = se.localCenter[0];
   h.localCenter[1] = se.localCenter[1];
   h.localCenter[2] = se.localCenter[2];
   h.localRadius = se.localRadius;
   h.cpuPositions = se.cpuPos.empty() ? nullptr : &se.cpuPos;
+  h.cpuAttributes = se.cpuAttr.empty() ? nullptr : &se.cpuAttr;
   h.cpuIndices = se.cpuIdx.empty() ? nullptr : &se.cpuIdx;
   return h;
 #  else
@@ -180,7 +185,10 @@ OmWgpuMeshHandle OmWgpuMeshCache::acquire(uint64_t meshId, const void *vertexByt
 
 void OmWgpuMeshCache::refreshVertexDerived(Entry &e, const void *vertexBytes, size_t vertexBytesLen,
                                            uint32_t vertexStride) {
+  static std::atomic<uint64_t> revision{0};
+  e.geometryRevision = revision.fetch_add(1, std::memory_order_relaxed) + 1;
   e.cpuPos.clear();
+  e.cpuAttr.clear();
   e.localCenter[0] = e.localCenter[1] = e.localCenter[2] = 0.0f;
   e.localRadius = -1.0f;
   if (vertexStride < 12 || !vertexBytes || vertexBytesLen < vertexStride)
@@ -188,6 +196,7 @@ void OmWgpuMeshCache::refreshVertexDerived(Entry &e, const void *vertexBytes, si
   const uint8_t *vsrc = static_cast<const uint8_t *>(vertexBytes);
   const size_t n = vertexBytesLen / vertexStride;
   e.cpuPos.reserve(n * 3);
+  if (vertexStride >= 32) e.cpuAttr.reserve(n * 5);
   float mn[3] = {3.4e38f, 3.4e38f, 3.4e38f};
   float mx[3] = {-3.4e38f, -3.4e38f, -3.4e38f};
   for (size_t vi = 0; vi < n; ++vi) {
@@ -196,6 +205,11 @@ void OmWgpuMeshCache::refreshVertexDerived(Entry &e, const void *vertexBytes, si
     e.cpuPos.push_back(pos[0]);
     e.cpuPos.push_back(pos[1]);
     e.cpuPos.push_back(pos[2]);
+    if (vertexStride >= 32) {
+      float attr[5];
+      std::memcpy(attr, vsrc + vi * vertexStride + 12, 20);
+      e.cpuAttr.insert(e.cpuAttr.end(), attr, attr + 5);
+    }
     for (int k = 0; k < 3; ++k) {
       if (pos[k] < mn[k])
         mn[k] = pos[k];

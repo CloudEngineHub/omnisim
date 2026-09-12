@@ -55,7 +55,9 @@ def main() -> int:
         env["OMNISIM_SESSION"] = uuid.uuid4().hex[:8]
 
     env["OMNIQUAD_TRAIN_WORLD"] = str(
-        repo / "projects" / "rl" / "worlds" / "omniquad_residual_train_newton.omniworld"
+        # PATH: `projects/rl` was renamed to `projects/policies/research` by 1b668a910;
+        # the old path failed SILENTLY here (2026-09-11).
+        repo / "projects" / "policies" / "research" / "worlds" / "omniquad_residual_train_newton.omniworld"
     )
     env["OMNISIM_URDF_USE_INERTIA"] = "1"
     env["OMNISIM_NEWTON_FORCE_MUJOCO"] = "1"
@@ -68,7 +70,7 @@ def main() -> int:
 
     cmd = [
         sys.executable,
-        str(repo / "projects" / "rl" / "training" / "train_residual.py"),
+        str(repo / "projects" / "policies" / "research" / "training" / "train_residual.py"),
         *sys.argv[1:],
     ]
     return subprocess.call(cmd, env=env)

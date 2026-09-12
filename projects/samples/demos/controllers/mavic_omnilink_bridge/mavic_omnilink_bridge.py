@@ -1397,13 +1397,26 @@ def main():
     def _flight_step():
         roll, pitch, yaw = imu.getRollPitchYaw()
         x_pos, y_pos, altitude = gps.getValues()
-        # The Gyro device reads a constant (0,0,0) under Newton (engine defect,
-        # documented in AGENTS.md: device-type-specific -- the InertialUnit in
-        # the same carrier tracks angles to 4 decimals). The classic law's only
-        # damping was the gyro rate, so the attitude loop flew UNDAMPED and
-        # flipped on lift-off (public issue #10). Derive the rates from the IMU
-        # angles across one SIM tick instead; dt is the basic time step, not
-        # wall clock, so --mode=fast does not distort them.
+        # Rates are DIFFERENCED from the InertialUnit angles rather than read
+        # from the Gyro. History, because the original reason is no longer true:
+        # the Gyro device used to read a constant (0,0,0) under Newton, the
+        # classic law's only damping was that rate, so the attitude loop flew
+        # UNDAMPED and flipped on lift-off (public issue #10).
+        #
+        # ⚠ CORRECTED 2026-09-11. That defect was FIXED on 2026-09-01 by
+        # bde550489 (carrierBodyHandle() resolution for Gyro/Accelerometer/GPS);
+        # the lane-4 probe `device.gyro` now PASSES, reading 2.0 rad/s against a
+        # supervisor-measured turntable. This comment also claimed the defect was
+        # "documented in AGENTS.md" -- AGENTS.md has never contained the word
+        # gyro. That false citation was quoted outward in two cold emails on
+        # 2026-09-11 before anyone checked it, so it is corrected here at the
+        # source rather than only in the outbound copy.
+        #
+        # The differencing below is KEPT: it works, it is exercised, and dt is
+        # the basic time step rather than wall clock so --mode=fast does not
+        # distort it. Switching this flight path back to the Gyro would be a
+        # behaviour change on a demo that public issue #10 was filed against,
+        # and it needs its own measurement rather than a comment edit.
         dt_sim = max(time_step / 1000.0, 1e-4)
         prev_rp = state.prev_rp
         if prev_rp is None:

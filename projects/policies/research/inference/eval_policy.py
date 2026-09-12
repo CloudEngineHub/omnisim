@@ -38,7 +38,9 @@ from pathlib import Path
 
 REPO_ROOT = next(_p for _p in Path(__file__).resolve().parents if (_p / "projects" / "policies").is_dir() or (_p / "AGENTS.md").exists() or (_p / ".git").exists())
 OMNISIM_BIN = REPO_ROOT / "msys64" / "mingw64" / "bin" / "omnisim-bin.exe"
-DEPLOY_WORLD = REPO_ROOT / "projects" / "rl" / "worlds" / "omniquad_rl_deploy.omniworld"
+# PATH: `projects/rl` was renamed to `projects/policies/research` by 1b668a910;
+# the old path failed SILENTLY here (2026-09-11).
+DEPLOY_WORLD = REPO_ROOT / "projects" / "policies" / "research" / "worlds" / "omniquad_rl_deploy.omniworld"
 TRACE_PATH = Path(r"C:\tmp\husky_trace\omniquad_deploy.csv")
 
 
@@ -98,12 +100,18 @@ def main() -> int:
     # so we ALSO copy the policy + a 'current_command.txt' to canonical
     # locations that the deploy controller reads directly.
     import shutil
-    canonical_dir = REPO_ROOT / "projects" / "rl" / "inference" / "policies" / "omniquad_ppo_main"
+    # PATH: `projects/rl` -> `projects/policies/research` (1b668a910). The dead
+    # path made this copy land where no controller reads, so the "also copy to a
+    # canonical slot" belt-and-braces has been inert since the rename
+    # (2026-09-11). This slot is gitignored and is the EXPORT target the deploy
+    # controllers try FIRST; the tracked shipped copy of the same policy lives
+    # at projects/policies/research/policies/omniquad_ppo_main/.
+    canonical_dir = REPO_ROOT / "projects" / "policies" / "research" / "inference" / "policies" / "omniquad_ppo_main"
     canonical_dir.mkdir(parents=True, exist_ok=True)
     canonical_policy = canonical_dir / "policy.onnx"
     if canonical_policy.resolve() != args.policy.resolve():
         shutil.copy2(args.policy, canonical_policy)
-    cmd_file = REPO_ROOT / "projects" / "rl" / "inference" / "current_command.txt"
+    cmd_file = REPO_ROOT / "projects" / "policies" / "research" / "inference" / "current_command.txt"
     cmd_file.write_text(f"{args.vx}\n{args.vy}\n{args.wz}\n")
 
     env = os.environ.copy()

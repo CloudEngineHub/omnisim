@@ -41,10 +41,12 @@ import argparse
 import json
 import math
 import re
+import struct
 import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import unquote
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +76,13 @@ class Geometry:
     detail: str = ""           # mesh filename as written in the URDF
     mesh_path: str = ""        # resolved absolute filesystem path, empty if unresolvable
     mesh_scale: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    # ⚠ EXISTENCE IS NOT DECODABILITY. mesh_path above answers only "is there a
+    # file there?", and this checker reported 0 problems on a 718-model gallery
+    # in which every single mesh was undecodable. mesh_status carries the answer
+    # to the question that actually matters -- see classify_mesh_file().
+    #   "" (not a mesh) | "ok" | "missing" | "undecodable" | "unverified"
+    mesh_status: str = ""
+    mesh_issue: str = ""       # human-readable reason when status != ok
 
 
 @dataclass
@@ -333,6 +342,195 @@ def _resolve_mesh_path(filename_attr: str, urdf_dir: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Mesh decodability
+# ---------------------------------------------------------------------------
+#
+# ⚠ WHY THIS EXISTS. Until 2026-09-11 this preflight's ONLY mesh check was
+# "does a file exist at the resolved path?" (_resolve_mesh_path, above). Run
+# with --report --strict over the public urdfeus gallery (718 models,
+# github.com/iory/urdfeus @ a5d094b, 8,048 <mesh> references) it reported
+# ZERO unresolved meshes. All 4,024 of that gallery's .glb files are
+# KHR_draco_mesh_compression and the engine's assimp build has no Draco
+# decoder, so it refuses every one of them: loading the gallery measured 119
+# "GLTF: Draco mesh compression not supported" warnings and 116 bodies that
+# silently took a placeholder sphere collider in place of their declared
+# <collision><mesh>. The tool whose entire job is catching import problems
+# before a run had declared the gallery clean.
+#
+# So the three states are kept DISTINCT and are never collapsed:
+#
+#   missing      no file at the resolved path -- the old check's only finding.
+#   undecodable  a file is there and OmniSim's reader provably cannot turn it
+#                into triangles. Asserted only when it can be PROVEN from the
+#                bytes (an empty file, a truncated container, a glTF whose
+#                own extensionsRequired names something the reader does not
+#                implement). A false alarm here is worse than useless, so
+#                anything short of proof is "unverified", not "undecodable".
+#   unverified   a file is there and something about it is a known risk but is
+#                not proof (a required glTF extension nobody has checked).
+#   ok           a file is there and nothing provably wrong was found. This is
+#                NOT a promise that assimp will succeed -- a full answer needs
+#                a real decoder, which this offline checker does not have.
+#                What changed is that a provable failure is no longer silent.
+
+# Provably unsupported by the engine's mesh reader (assimp 5.2.3, built
+# WITHOUT draco -- see src/omnisim/Makefile, -lassimp-5). Keyed on the
+# extension name a glTF lists in `extensionsRequired`, which by spec means
+# "you cannot load this asset without supporting this".
+UNSUPPORTED_GLTF_EXTENSIONS = {
+    # PROVEN: the shipped libassimp-5.dll carries exactly the strings of the
+    # #else arm of assimp's draco branch -- "draco_mesh_compression" and
+    # "Draco mesh compression not supported" -- and nothing from a decoder. It
+    # detects the extension and refuses the WHOLE file.
+    "KHR_draco_mesh_compression":
+        "Draco-compressed geometry; OmniSim's assimp build has no Draco decoder and refuses the "
+        "whole file (it logs 'GLTF: Draco mesh compression not supported'). Re-export uncompressed",
+    # assimp 5.2.3 has no meshopt decoder at all. It does not refuse the file the
+    # way it refuses Draco, which is worse: the encoded buffers are read as if
+    # they were plain vertex data, so the geometry is garbage rather than absent.
+    "EXT_meshopt_compression":
+        "meshopt-compressed buffers; OmniSim's assimp build has no meshopt decoder, so the vertex "
+        "data cannot be recovered. Re-export uncompressed",
+}
+# NOT listed above on purpose: KHR_texture_basisu. It is a TEXTURE extension --
+# unreadable Basis textures do not stop the geometry decoding -- so calling it
+# undecodable would be a false alarm. Being absent from both sets it lands in
+# "unverified", which is the honest answer.
+
+# Required extensions the reader is known to TOLERATE (it either implements
+# them or ignores them without rejecting the asset), so they must not raise
+# an alarm. Membership here only decides whether an 'unverified' note is
+# emitted; it never turns anything into a failure.
+SUPPORTED_GLTF_EXTENSIONS = {
+    "KHR_materials_pbrSpecularGlossiness",
+    "KHR_materials_unlit",
+    "KHR_texture_transform",
+    "KHR_materials_emissive_strength",
+    "KHR_lights_punctual",
+}
+
+
+def _classify_gltf_extensions(required: list, label: str) -> tuple[str, str]:
+    """Verdict for a glTF's `extensionsRequired` list."""
+    for ext in required:
+        if not isinstance(ext, str):
+            continue
+        if ext in UNSUPPORTED_GLTF_EXTENSIONS:
+            return "undecodable", f"{label} requires {ext}: {UNSUPPORTED_GLTF_EXTENSIONS[ext]}"
+    unknown = [e for e in required
+               if isinstance(e, str) and e not in SUPPORTED_GLTF_EXTENSIONS]
+    if unknown:
+        return ("unverified",
+                f"{label} requires glTF extension(s) {', '.join(sorted(unknown))}, which are not on "
+                "OmniSim's known-supported list; confirm the mesh loads before trusting its collider")
+    return "ok", ""
+
+
+def _classify_glb(path: Path, size: int) -> tuple[str, str]:
+    with path.open("rb") as fh:
+        header = fh.read(12)
+        if len(header) < 12 or header[:4] != b"glTF":
+            return "undecodable", "not a GLB container (the 'glTF' magic is missing)"
+        version, declared = struct.unpack("<II", header[4:12])
+        if version != 2:
+            return "undecodable", f"GLB container version {version}; OmniSim reads glTF 2.0 only"
+        if declared > size:
+            return "undecodable", (f"GLB is truncated: the header declares {declared} bytes but the "
+                                   f"file is {size}")
+        chunk_header = fh.read(8)
+        if len(chunk_header) < 8:
+            return "undecodable", "GLB is truncated: no JSON chunk header"
+        chunk_len, chunk_type = struct.unpack("<II", chunk_header)
+        if chunk_type != 0x4E4F534A:  # 'JSON'
+            return "undecodable", "GLB's first chunk is not the JSON chunk"
+        raw = fh.read(chunk_len)
+        if len(raw) < chunk_len:
+            return "undecodable", "GLB is truncated inside its JSON chunk"
+    try:
+        doc = json.loads(raw.decode("utf-8", errors="replace"))
+    except ValueError as exc:
+        return "undecodable", f"GLB's JSON chunk does not parse: {exc}"
+    return _classify_gltf_extensions(doc.get("extensionsRequired") or [], "GLB")
+
+
+def _classify_gltf(path: Path) -> tuple[str, str]:
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except ValueError as exc:
+        return "undecodable", f".gltf does not parse as JSON: {exc}"
+    # A .gltf keeps its geometry in sidecar .bin files. A missing sidecar is a
+    # decode failure that the "does the .gltf exist?" check cannot see.
+    for buf in doc.get("buffers") or []:
+        uri = buf.get("uri") if isinstance(buf, dict) else None
+        if not uri or uri.startswith("data:"):
+            continue
+        if uri.startswith(("http://", "https://")):
+            continue
+        if not (path.parent / unquote(uri)).is_file():
+            return "undecodable", f"referenced buffer '{uri}' is missing next to the .gltf"
+    return _classify_gltf_extensions(doc.get("extensionsRequired") or [], ".gltf")
+
+
+def _classify_stl(path: Path, size: int) -> tuple[str, str]:
+    with path.open("rb") as fh:
+        head = fh.read(84)
+    if head[:5].lower() == b"solid" and b"\n" in head:
+        return "ok", ""  # ASCII STL; length is not derivable without a full scan
+    if len(head) < 84:
+        return "undecodable", "binary STL is shorter than its 84-byte header"
+    (count,) = struct.unpack("<I", head[80:84])
+    expected = 84 + 50 * count
+    if size < expected:
+        return "undecodable", (f"binary STL is truncated: the header declares {count} triangles "
+                               f"({expected} bytes) but the file is {size}")
+    return "ok", ""
+
+
+_MESH_CLASS_CACHE: dict[str, tuple[str, str]] = {}
+
+
+def classify_mesh_file(resolved_path: str) -> tuple[str, str]:
+    """(status, reason) for one resolved mesh path. See the block comment above.
+
+    Offline and cheap: reads a header, never a whole mesh. It proves FAILURE,
+    it does not certify success. Memoised because a link's <visual> and
+    <collision> almost always name the same file.
+    """
+    hit = _MESH_CLASS_CACHE.get(resolved_path)
+    if hit is not None:
+        return hit
+    verdict = _classify_mesh_file_uncached(resolved_path)
+    _MESH_CLASS_CACHE[resolved_path] = verdict
+    return verdict
+
+
+def _classify_mesh_file_uncached(resolved_path: str) -> tuple[str, str]:
+    if not resolved_path:
+        return "missing", "no file at any path this reference resolves to"
+    path = Path(resolved_path)
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        return "missing", f"cannot stat the file: {exc}"
+    if size == 0:
+        return "undecodable", "the file is empty (0 bytes)"
+    suffix = path.suffix.lower()
+    try:
+        if suffix == ".glb":
+            return _classify_glb(path, size)
+        if suffix == ".gltf":
+            return _classify_gltf(path)
+        if suffix == ".stl":
+            return _classify_stl(path, size)
+    except OSError as exc:
+        return "undecodable", f"the file could not be read: {exc}"
+    # .dae / .obj / .ply / .fbx and friends: no cheap proof of failure exists,
+    # and guessing would produce false alarms. Reported as ok, which this
+    # module's docstring is explicit is "nothing provably wrong", not "loads".
+    return "ok", ""
+
+
+# ---------------------------------------------------------------------------
 # Parsing
 # ---------------------------------------------------------------------------
 
@@ -385,11 +583,15 @@ def parse_geometry(elem: ET.Element, urdf_dir: Path) -> Geometry | None:
     if mesh is not None:
         filename = mesh.get("filename", "")
         scale = _parse_floats(mesh.get("scale"), 3, (1.0, 1.0, 1.0)) if mesh.get("scale") else (1.0, 1.0, 1.0)
+        resolved = _resolve_mesh_path(filename, urdf_dir)
+        status, issue = classify_mesh_file(resolved)
         return Geometry(
             kind="mesh",
             detail=filename,
-            mesh_path=_resolve_mesh_path(filename, urdf_dir),
+            mesh_path=resolved,
             mesh_scale=scale,
+            mesh_status=status,
+            mesh_issue=issue,
         )
 
     for child in list(elem):
@@ -1095,10 +1297,31 @@ def build_report(robot: UrdfRobot) -> dict:
             f"Multiple root links found: {', '.join(root_links)}. The importer uses '{root_links[0]}'."
         )
 
+    # Whole-robot tally of the three mesh states, so a gallery sweep can read one
+    # number instead of walking every link.
+    mesh_status_counts: dict[str, int] = {"ok": 0, "missing": 0, "undecodable": 0, "unverified": 0}
+
+    def _mesh_issues(geometries, want: str) -> list[str]:
+        """"file (reason)" for every mesh geometry in `want` state."""
+        out = []
+        for g in geometries:
+            if g is not None and g.kind == "mesh" and g.mesh_status == want:
+                out.append(f"{g.detail} ({g.mesh_issue})" if g.mesh_issue else g.detail)
+        return out
+
     link_entries = []
     for link_name in robot.link_order:
         link = robot.links[link_name]
         link_notes: list[str] = []
+        for _g in [v.geometry for v in link.visuals] + [c.geometry for c in link.collisions]:
+            if _g is not None and _g.kind == "mesh" and _g.mesh_status in mesh_status_counts:
+                mesh_status_counts[_g.mesh_status] += 1
+        visual_geoms = [v.geometry for v in link.visuals]
+        collision_geoms = [c.geometry for c in link.collisions]
+        undecodable_v = _mesh_issues(visual_geoms, "undecodable")
+        undecodable_c = _mesh_issues(collision_geoms, "undecodable")
+        unverified_v = _mesh_issues(visual_geoms, "unverified")
+        unverified_c = _mesh_issues(collision_geoms, "unverified")
         # A geometry is "imported" if it's a primitive or a resolved mesh.
         supported_visuals = sum(1 for visual in link.visuals if is_supported_geometry(visual.geometry))
         unresolved_meshes_v = [
@@ -1196,6 +1419,29 @@ def build_report(robot: UrdfRobot) -> dict:
             link_notes.append(
                 f"Collision mesh(es) could not be resolved on disk and will be skipped: {', '.join(unresolved_meshes_c)}"
             )
+        # ⚠ The file being THERE is not the file being READABLE. An undecodable
+        # COLLISION mesh is the expensive one: the link keeps its <collision>
+        # declaration, the world loads, the run exits 0, and the body collides as
+        # a placeholder sphere. State the consequence, not just the fact.
+        if undecodable_c:
+            link_notes.append(
+                "Collision mesh(es) EXIST but OmniSim cannot decode them, so this link will collide as a "
+                "placeholder primitive instead of its declared geometry -- every contact, grasp and resting "
+                f"pose it produces will be wrong, and the run will still exit 0: {'; '.join(undecodable_c)}"
+            )
+        if undecodable_v:
+            link_notes.append(
+                "Visual mesh(es) exist but OmniSim cannot decode them; the link will render with nothing "
+                f"in their place: {'; '.join(undecodable_v)}"
+            )
+        if unverified_c:
+            link_notes.append(
+                f"Collision mesh(es) carry a requirement this checker cannot verify offline: {'; '.join(unverified_c)}"
+            )
+        if unverified_v:
+            link_notes.append(
+                f"Visual mesh(es) carry a requirement this checker cannot verify offline: {'; '.join(unverified_v)}"
+            )
         if unsupported_visuals:
             link_notes.append(f"Unsupported visual geometries are skipped: {', '.join(unsupported_visuals)}")
         if unsupported_collisions:
@@ -1207,10 +1453,14 @@ def build_report(robot: UrdfRobot) -> dict:
                 "visual_count": len(link.visuals),
                 "supported_visual_count": supported_visuals,
                 "unresolved_meshes_visual": unresolved_meshes_v,
+                "undecodable_meshes_visual": undecodable_v,
+                "unverified_meshes_visual": unverified_v,
                 "unsupported_visuals": unsupported_visuals,
                 "collision_count": len(link.collisions),
                 "supported_collision_count": supported_collisions,
                 "unresolved_meshes_collision": unresolved_meshes_c,
+                "undecodable_meshes_collision": undecodable_c,
+                "unverified_meshes_collision": unverified_c,
                 "unsupported_collisions": unsupported_collisions,
                 "has_inertial": link.inertial is not None,
                 "has_inertia_matrix": bool(link.inertial and link.inertial.has_inertia_matrix),
@@ -1333,6 +1583,10 @@ def build_report(robot: UrdfRobot) -> dict:
         "link_count": len(robot.links),
         "joint_count": len(robot.joints),
         "sensor_count": len(robot.sensors),
+        # One line that answers "did the meshes survive?" without walking links.
+        # `ok` here means "nothing provably wrong", NOT "assimp will succeed" --
+        # see the Mesh decodability block comment.
+        "mesh_status_counts": mesh_status_counts,
         "warnings": warnings,
         "links": link_entries,
         "joints": joint_entries,

@@ -50,7 +50,9 @@ def main() -> int:
     if not env.get("OMNISIM_SESSION"):
         import uuid
         env["OMNISIM_SESSION"] = uuid.uuid4().hex[:8]
-    env["OMNIQUAD_TRAIN_WORLD"] = str(repo / "projects" / "rl" / "worlds" / "omniquad_rl_newton.omniworld")
+    # PATH: `projects/rl` was renamed to `projects/policies/research` by 1b668a910;
+    # the old path failed SILENTLY here (2026-09-11).
+    env["OMNIQUAD_TRAIN_WORLD"] = str(repo / "projects" / "policies" / "research" / "worlds" / "omniquad_rl_newton.omniworld")
     env["OMNISIM_URDF_USE_INERTIA"] = "1"
     env["OMNISIM_NEWTON_FORCE_MUJOCO"] = "1"
     env["OMNISIM_NEWTON_WRAPPER_USES_OWN_SHAPE"] = "1"
@@ -118,7 +120,7 @@ def main() -> int:
     env.setdefault("PYTHONIOENCODING", "utf-8")
     cmd = [
         sys.executable,
-        str(repo / "projects" / "rl" / "training" / "train_omniquad.py"),
+        str(repo / "projects" / "policies" / "research" / "training" / "train_omniquad.py"),
         *sys.argv[1:],
     ]
     return subprocess.call(cmd, env=env)

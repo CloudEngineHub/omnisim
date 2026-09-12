@@ -1043,6 +1043,9 @@ OTHER_SOURCES = \
   OmRenderBackend.cpp \
   OmVulkanBackend.cpp \
   OmniLight.cpp \
+  OmPhoto.cpp \
+  OmPhotoDenoise.cpp \
+  OmPhotoSnapshot.cpp \
   OmDragArrowLines.cpp \
   OmGizmoLines.cpp \
   OmScenePicker.cpp \

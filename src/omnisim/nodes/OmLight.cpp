@@ -41,6 +41,7 @@ void OmLight::init() {
   mIntensity = findSFDouble("intensity");
   mOn = findSFBool("on");
   mCastShadows = findSFBool("castShadows");
+  mRayTracing = findSFBool("rayTracing");
   mCastLensFlares = findSFBool("castLensFlares");
 }
 
@@ -78,6 +79,7 @@ void OmLight::postFinalize() {
   connect(mIntensity, &OmSFDouble::changed, this, &OmLight::updateIntensity);
   connect(mOn, &OmSFBool::changed, this, &OmLight::updateOn);
   connect(mCastShadows, &OmSFBool::changed, this, &OmLight::updateCastShadows);
+  connect(mRayTracing, &OmSFBool::changed, this, &OmLight::updateIntensity);
 
   if (!OmWorld::instance()->isLoading())
     emit OmWrenRenderingContext::instance()->numberOfOnLightsChanged();
@@ -210,3 +212,5 @@ QStringList OmLight::fieldsToSynchronizeWithW3d() const {
          << "castShadows";
   return fields;
 }
+
+bool OmLight::rayTracing() const { return !mRayTracing || mRayTracing->value(); }

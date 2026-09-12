@@ -30,6 +30,9 @@ Config fields:
     max_wheel_speed_radps     ceiling on rad/s for each wheel
     cruise_frac               fraction of max used for default forward speed
     spin_speed                rad/s for the "spin in place" intent preset
+                              (and, via min(spin_speed, v_max_angular), the
+                              `turn` pulse rate and the `circle` curvature --
+                              see SPIN_SPEED below)
     yaw_rate_gain             the fraction of the IDEAL kinematic yaw
                               ceiling the base can actually hold, 0..1
 
@@ -111,6 +114,66 @@ is too high makes the bridge accept turns the base cannot finish. A base
 with no entry defaults to 1.0, i.e. "assume the ideal kinematics" -- the
 behaviour every base had before this was measured.
 
+SPIN_SPEED -- REVIEWED 2026-09-11, and every value LEFT AS IT IS.
+
+These presets had never been reviewed, because until 69b4b024b they could not
+bind: the bridge takes `min(spin_speed, v_max_angular)` and v_max_angular was
+0.03-0.33 rad/s on every base, so the CEILING always won and the preset was
+inert. Post-fix every ceiling is 1.3-3.5 rad/s, so every preset binds, on
+every base, for the first time -- and it binds in THREE places: the `spin`
+chat verb (`set_velocity(0, spin_speed)`), the `circle` chat verb
+(`set_velocity(cruise*0.6, spin_speed*0.6)`), and the magnitude of each
+`turn` pulse while the residual is above TURN_SLOW_RAD.
+
+Measured through the bridge on each base's own chat world, machine
+9722d23d12a3, OmniSim 8.4.0, engine binary sha256 2b44bbbdf9587eb0 -- ALL
+SEVEN on that one binary, verified before and after each run, because the
+first pass straddled a relink by another lane and silently mixed two engines.
+Newton 1.5.0 SolverMuJoCo cpu/mj_step (sidecar-confirmed), basicTimeStep 16,
+each figure differenced in SIM time over a 12 s hold -- i.e. exactly what an
+operator typing "spin" or "circle" gets:
+
+    base           cmd    held   ratio   rev in 12 s   in-place drift
+    husky          0.60   0.565  0.941      1.08         0.018 mm
+    jackal         0.80   0.752  0.940      1.44        36.90  mm
+    rosbot         0.90   0.894  0.994      1.71         0.001 mm
+    rosbot_xl      0.90   0.856  0.951      1.63         0.006 mm
+    tb3_burger     1.00   1.000  1.000      1.91         0.040 mm
+    tb3_waffle     0.90   0.898  0.998      1.72         0.249 mm
+    tb3_waffle_pi  0.90   0.905  1.006      1.73         0.248 mm
+
+EVERY preset is held to within 6% (the yaw servo closes the feed-forward; the
+shortfall is the spin-up inside the window, not a ceiling -- the two skid
+steers that read lowest here measured 0.995 and 1.003 on the previous
+binary), every one produces 1.1-1.9 revolutions inside the VELOCITY_MAX_S
+window -- visible, and nowhere near dizzying -- and "spin in place" really is
+in place: sub-millimetre translation on six of seven. The Jackal walks 37 mm
+over 12 s of spinning, which is 2000x the others and still 3.7 cm; it is the
+same base whose yaw curve is the only non-monotonic one here, and it is not
+worth trading pivot rate for. Nothing in this table asks to be changed.
+
+⚠ ONE THING THE REVIEW DID TURN UP, and it is NOT a fault of these numbers.
+`circle` derives its turn radius as cruise_frac*v_max_linear / spin_speed,
+and those two quantities are independent, so on a base that is slow but
+nimble the radius collapses below the machine itself. Measured radii
+(commanded -> traced):
+
+    husky 0.908 -> 0.886 m    jackal    0.404 -> 0.405 m
+    rosbot 0.255 -> 0.250 m   rosbot_xl 0.320 -> 0.313 m
+    tb3_burger 0.089 -> 0.087 m        tb3_waffle(_pi) 0.099 -> 0.097 m
+
+The four-wheelers trace 2.1-3.1 half-tracks and look like circles. The TB3
+Waffle traces 0.67 of a half-track: the instantaneous centre of rotation sits
+INSIDE its own wheelbase and the inner wheel runs backwards, so `circle` on a
+Waffle is a pirouette, not a circle. Left alone deliberately -- `circle` is
+only a documented prompt for the Husky (docs/guide/omnilink-chat-demos.md),
+where it measures 0.89 m, and the obvious fixes all cost something real: a
+radius floor slows the arc on the one base that cannot afford it (a Waffle
+covers 0.64 m of path in 12 s, so a 0.43 m-radius circle is 85 degrees of
+arc, not a circle), and lowering spin_speed to buy radius would slow every
+`turn` pulse on that base too. Flagged here with the numbers rather than
+changed on taste.
+
 Motor names per layout (the URDF importer derives them):
 
     4wheel_full -> front_left_wheel_motor / front_right_wheel_motor / ...
@@ -126,6 +189,9 @@ HUSKY = {
     "half_track_m": 0.2854,
     "max_wheel_speed_radps": 6.0,
     "cruise_frac": 0.55,
+    # Reviewed 2026-09-11: binds (it never did before 69b4b024b),
+    # held at 0.565 rad/s = 1.08 revolutions inside VELOCITY_MAX_S,
+    # in place. Full table in the module docstring under SPIN_SPEED.
     "spin_speed": 0.6,
     # Measured 2026-09-11: real ceiling 1.808 rad/s against a 3.471 rad/s
     # kinematic one -- 15.2x the 0.119 rad/s this base held before
@@ -143,6 +209,9 @@ JACKAL = {
     "half_track_m": 0.187,
     "max_wheel_speed_radps": 6.0,
     "cruise_frac": 0.55,
+    # Reviewed 2026-09-11: binds (it never did before 69b4b024b),
+    # held at 0.752 rad/s = 1.44 revolutions inside VELOCITY_MAX_S,
+    # in place. Full table in the module docstring under SPIN_SPEED.
     "spin_speed": 0.8,
     # MEASURED 2026-09-11 on its own world -- it no longer inherits the
     # Husky's number. Real ceiling 1.552 rad/s against a 3.144 rad/s
@@ -160,6 +229,9 @@ ROSBOT = {
     "half_track_m": 0.105,
     "max_wheel_speed_radps": 12.0,
     "cruise_frac": 0.45,
+    # Reviewed 2026-09-11: binds (it never did before 69b4b024b),
+    # held at 0.894 rad/s = 1.71 revolutions inside VELOCITY_MAX_S,
+    # in place. Full table in the module docstring under SPIN_SPEED.
     "spin_speed": 0.9,
     # MEASURED 2026-09-11 on its own world -- it no longer inherits the
     # XL's number, and it is materially BETTER: real ceiling 3.503 rad/s
@@ -178,6 +250,9 @@ ROSBOT_XL = {
     "half_track_m": 0.124,
     "max_wheel_speed_radps": 12.0,
     "cruise_frac": 0.5,
+    # Reviewed 2026-09-11: binds (it never did before 69b4b024b),
+    # held at 0.856 rad/s = 1.63 revolutions inside VELOCITY_MAX_S,
+    # in place. Full table in the module docstring under SPIN_SPEED.
     "spin_speed": 0.9,
     # Measured 2026-09-11: real ceiling 2.435 rad/s against a 4.645 rad/s
     # kinematic one -- 76x the 0.0322 rad/s it held before 69b4b024b, which
@@ -201,6 +276,9 @@ TB3_BURGER = {
     "half_track_m": 0.080,
     "max_wheel_speed_radps": 6.0,
     "cruise_frac": 0.45,
+    # Reviewed 2026-09-11: binds (it never did before 69b4b024b),
+    # held at 1.000 rad/s = 1.91 revolutions inside VELOCITY_MAX_S,
+    # in place. Full table in the module docstring under SPIN_SPEED.
     "spin_speed": 1.0,
     # Measured 2026-09-11: 0.947..0.962 of command, FLAT from 0.3 rad/s
     # right up to the 2.475 rad/s kinematic ceiling -- a single constant is
@@ -218,6 +296,9 @@ TB3_WAFFLE = {
     "half_track_m": 0.144,
     "max_wheel_speed_radps": 6.0,
     "cruise_frac": 0.45,
+    # Reviewed 2026-09-11: binds (it never did before 69b4b024b),
+    # held at 0.898 rad/s = 1.72 revolutions inside VELOCITY_MAX_S,
+    # in place. Full table in the module docstring under SPIN_SPEED.
     "spin_speed": 0.9,
     # MEASURED 2026-09-11 on its own world -- it no longer inherits the
     # Burger's number. 0.972..0.975 of command, FLAT; real ceiling
@@ -248,6 +329,8 @@ OMNITUG500 = {
     "half_track_m": 0.30,
     "max_wheel_speed_radps": 10.0,     # -> 1.0 m/s linear ceiling
     "cruise_frac": 0.6,                # 0.60 m/s cruise (AMR walking pace)
+    # Reviewed 2026-09-11: a supervisor-integrated body turns at exactly
+    # the rate asked for, so this preset is delivered verbatim.
     "spin_speed": 0.9,
     # A supervisor-integrated body has no wheels to scrub: it turns at
     # exactly the rate it is asked for.

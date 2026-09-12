@@ -272,6 +272,16 @@ OmVulkanBackend::OmVulkanBackend() : mAvailable(false) {
 
     // --- device ---
     WGPUDeviceDescriptor deviceDesc = {};
+    // Optional GPU profiling: never require a feature an adapter cannot provide.
+    const QByteArray gpuTimingPath = qgetenv("OMNISIM_WGPU_GPU_TIMING");
+    const bool wantTiming = !gpuTimingPath.isEmpty() && gpuTimingPath != "0";
+    const WGPUFeatureName timestampFeature = WGPUFeatureName_TimestampQuery;
+    if (wantTiming && wgpuAdapterHasFeature(aCap.adapter, timestampFeature)) {
+      deviceDesc.requiredFeatureCount = 1;
+      deviceDesc.requiredFeatures = &timestampFeature;
+    } else if (wantTiming) {
+      note("GPU timing unavailable: adapter does not support timestamp queries");
+    }
     deviceDesc.uncapturedErrorCallbackInfo.callback = onUncapturedError;
     DeviceCapture dCap;
     WGPURequestDeviceCallbackInfo deviceCb = {};

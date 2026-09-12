@@ -33,6 +33,7 @@
 #include <QtCore/QSet>
 
 #include <array>
+#include <functional>
 #include <vector>
 #include <atomic>
 #include <memory>
@@ -40,6 +41,8 @@
 
 #include "OmWgpuRenderTarget.hpp"    // OmWgpuSolidDraw (cached main-view draw list)
 #include "OmWgpuSceneRenderer.hpp"   // OmWgpuDrawRefresh
+struct OmPhotoSettings;
+struct OmPhotoScene;
 
 class QTimer;
 
@@ -117,6 +120,10 @@ public:
   // main view), and renders the grab presentation-free when nothing was presented.
   QImage grabWindowBufferNow() override;
 
+  // Optional bounded still capture; simulation is paused during the snapshot/render.
+  bool renderPhotoToFile(const QString &path, const OmPhotoSettings &settings, QString &message,
+                         bool interactive = true);
+
 
   void logWrenStatistics();
   void handleModifierKey(QKeyEvent *event, bool pressed);
@@ -162,6 +169,10 @@ private:
   // presented the frame. Returns false for the WREN default (the caller then runs the byte-identical WREN
   // path) and whenever the wgpu render is unavailable — so a wgpu failure degrades safely to WREN.
   bool renderMainFrameViaWgpu(bool culling, bool offScreen);
+  bool mPhotoSnapshotRequested = false;
+  bool mPhotoRendering = false;
+  bool mPhotoAutoAttempted = false;
+  std::unique_ptr<OmPhotoScene> mPhotoScene;
 
   // P10: cheap mirror of renderMainFrameViaWgpu's early gates — "would a main-view frame render
   // through wgpu right now?" — used only to pick the recording capture path at recording start.
@@ -193,6 +204,7 @@ private:
   // world-space triangles (no live-scene pointers); the main thread polls and uploads.
   std::thread mOmniBakeThread;
   std::atomic<bool> mOmniBakeDone{false};
+  std::atomic<bool> mOmniBakeCancel{false};
   bool mOmniBakeRunning = false;
   std::atomic<int> mOmniProgressDone{0};
   std::atomic<int> mOmniProgressTotal{0};
@@ -210,7 +222,7 @@ private:
   const OmSolid *mWgpuSelTintTop = nullptr;
   std::vector<uint32_t> mWgpuSelTintIdx;
   std::vector<std::array<float, 3>> mWgpuSelTintRgb;
-  std::vector<QMetaObject::Connection> mWgpuDrawListConns;  // destroyed() hooks of referenced nodes
+  std::function<void()> mWgpuDrawInputsDisconnect;  // cleanup for referenced-node invalidation hooks
   bool mWgpuDrawListDirty = true;
   int mWgpuDrawListAge = 0;
   // Bounded retry counter for incomplete collects (shapes whose WREN mesh is not created yet).

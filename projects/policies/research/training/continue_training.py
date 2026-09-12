@@ -69,7 +69,9 @@ def main() -> int:
                         "advantages before the actor moves.")
     args = p.parse_args()
 
-    run_dir = REPO_ROOT / "projects" / "rl" / "training" / "runs" / args.run_name
+    # PATH: `projects/rl` was renamed to `projects/policies/research` by 1b668a910;
+    # the old path failed SILENTLY here (2026-09-11).
+    run_dir = REPO_ROOT / "projects" / "policies" / "research" / "training" / "runs" / args.run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[continue] warm-starting from {args.from_zip}")
@@ -88,7 +90,7 @@ def main() -> int:
     from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
     from stable_baselines3.common.callbacks import CheckpointCallback
 
-    sys.path.insert(0, str(REPO_ROOT / "projects" / "rl" / "envs"))
+    sys.path.insert(0, str(REPO_ROOT / "projects" / "policies" / "research" / "envs"))
     from omniquad_env import OmniQuadEnv
 
     def make_env(env_id):

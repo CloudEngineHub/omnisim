@@ -37,8 +37,11 @@ import projects.policies.control.gait.g1_human_gait as ghg
 
 MJCF = os.path.join(_REPO, "projects", "robots", "unitree", "g1", "urdf",
                     "g1_full_kp100.mjcf.xml")
+# PATH: `projects/rl` was renamed to `projects/policies/research` by 1b668a910;
+# the old path failed SILENTLY here (2026-09-11).
 POLICY = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
-    _REPO, "projects", "rl", "training", "runs", "gpu_g1_walk26_shape_c8", "policy.pt")
+    _REPO, "projects", "policies", "research", "training", "runs",
+    "gpu_g1_walk26_shape_c8", "policy.pt")
 OUT = os.path.join(os.path.dirname(ghg.__file__), "datasets", "g1_achieved_gait.npz")
 W_N = ghg._W_N
 MIRROR_SIGN = np.array([1, -1, -1, 1, 1, -1], dtype=np.float64)   # HP,HR,HY,KN,AP,AR

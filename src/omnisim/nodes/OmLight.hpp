@@ -43,6 +43,7 @@ public:
   // field accessors
   bool isOn() const;
   bool castShadows() const;
+  bool rayTracing() const;
   bool castLensFlares() const;
   double intensity() const;
   double ambientIntensity() const;
@@ -80,6 +81,7 @@ protected:
   OmSFBool *mOn;
   OmSFDouble *mAmbientIntensity;
   OmSFBool *mCastShadows;
+  OmSFBool *mRayTracing;
   OmSFBool *mCastLensFlares;
 
 protected slots:

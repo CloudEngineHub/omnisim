@@ -130,7 +130,8 @@ extern const char *kSkyScatterLut;
 extern const char *kSsrCombine;
 extern const char *kOmniProgress;
 extern const char *kAdaptLum;
-extern const char *kTaaMvResolve;
+  extern const char *kTaaMvResolve;
+  extern const char *kObjectMotion;
 extern const char *kVolScatter;
 extern const char *kTaaResolve;
 // Image-cubemap skybox (Background's six *Url faces): same fullscreen-triangle + camera-basis ray

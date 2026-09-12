@@ -56,7 +56,9 @@ def eval_in_env(policy_path: Path, duration_s: float, vx_target: float,
                 wz_target: float = 0.0, verbose: bool = False) -> dict:
     """Run the policy inside the training OmniSim env at a fixed command."""
     import onnxruntime as ort
-    sys.path.insert(0, str(REPO_ROOT / "projects" / "rl" / "envs"))
+    # PATH: `projects/rl` was renamed to `projects/policies/research` by 1b668a910;
+    # the old path failed SILENTLY here (2026-09-11).
+    sys.path.insert(0, str(REPO_ROOT / "projects" / "policies" / "research" / "envs"))
     from omniquad_env import OmniQuadEnv, OBS_DIM, ACT_DIM
 
     sess = ort.InferenceSession(str(policy_path), providers=["CPUExecutionProvider"])
@@ -169,7 +171,7 @@ def eval_in_deploy(policy_path: Path, duration_s: float,
     env["OMNIQUAD_WZ"] = f"{wz_target}"
 
     webots = REPO_ROOT / "msys64" / "mingw64" / "bin" / "omnisim-bin.exe"
-    world = REPO_ROOT / "projects" / "rl" / "worlds" / "omniquad_rl_deploy.omniworld"
+    world = REPO_ROOT / "projects" / "policies" / "research" / "worlds" / "omniquad_rl_deploy.omniworld"
     cmd = [str(webots), str(world), "--batch", "--mode=fast", "--no-rendering",
            "--minimize", "--stdout", "--stderr"]
     # Redirect Webots stdout/stderr to DEVNULL. If we use subprocess.PIPE
