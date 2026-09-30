@@ -30,7 +30,20 @@ def convert_to_windows_path_separator(path):
 
 
 def list_dependencies(package):
-    return subprocess.check_output(['pactree', '-u', package]).decode().strip().split('\n')
+    return [line for line in subprocess.check_output(['pactree', '-u', package]).decode().strip().split('\n') if line]
+
+
+def package_files(package):
+    """Files and folders pacman lists for an installed package.
+
+    A package that owns no files prints nothing, and ''.split('\n') is [''], so
+    the empty string used to land in msys64_files and become `Source: "<msys64
+    root>"` in the .iss -- Inno Setup then aborts ("Source file ... msys64 does
+    not exist"). That is what failed the v9.1.0 installer: MSYS2's GCC 16.2 split
+    gcc-libs into libstdc++ / libatomic / libquadmath and left
+    mingw-w64-x86_64-cc-libs as a package with no files.
+    """
+    return [line for line in subprocess.check_output(['pacman', '-Qql', package]).decode().strip().split('\n') if line]
 
 
 class WindowsOmniSimPackage(OmniSimPackage):
@@ -367,7 +380,7 @@ class WindowsOmniSimPackage(OmniSimPackage):
         # add all the files and folders corresponding to the pacman dependencies
         for dependency in dependencies:
             print("  processing " + dependency, flush=True)
-            for file in subprocess.check_output(['pacman', '-Qql', dependency]).decode().strip().split('\n'):
+            for file in package_files(dependency):
                 skip = False
                 for skip_path in skip_paths:
                     if file.startswith(skip_path):

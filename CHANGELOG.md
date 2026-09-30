@@ -25,6 +25,19 @@ top of that foundation.
 ---
 
 
+## [v9.1.1] — 2026-09-30
+
+### Fixed
+
+- **The v9.1.0 Windows installer did not build, so v9.1.0 has no installer.**
+  The build runner's MSYS2 had moved to GCC 16.2, which split `gcc-libs` into
+  separate packages and left `mingw-w64-x86_64-cc-libs` owning no files. The
+  packager turned that empty file list into an empty path, and Inno Setup
+  aborted on it (`Source file "...\msys64" does not exist`). Packages with no
+  files are now skipped. Everything else is v9.1.0 unchanged; use this release
+  for the Windows installer. Pinned by
+  `tests/packaging/test_windows_distro_empty_package.py`.
+
 ## [v9.1.0] — 2026-09-30
 
 Physics corrections that change what some worlds do, a harness that reports the
