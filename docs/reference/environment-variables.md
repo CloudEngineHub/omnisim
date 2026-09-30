@@ -375,8 +375,8 @@ carries no comment there.
 | `OMNISIM_PUBLISH_WORKTREE_DIR` | string | `scripts/release/publish_snapshot.sh:124` | The throwaway snapshot worktree. Overridable because it materializes the WHOLE tracked tree (~GBs): on 2026-09-01 the repo drive hit 100% full and the... |
 | `OMNISIM_PYTHON` *(undocumented elsewhere)* | string | `scripts/dev/run_go2_baton_deploy.sh:37`, `projects/policies/training/run_walk_rl.sh:113` | Interpreter resolution (2026-07-17): a bash spawned from a Windows process (skill_lib subprocess, machine_conformance, CI) rebuilds PATH with the MSYS dirs... |
 | `OMNISIM_REPO` *(undocumented elsewhere)* | string | `scripts/packaging/mirror_build_deps.sh:50` | Mirror OmniSim's prebuilt build dependencies to OmniSim's own GitHub Releases. WHY THIS EXISTS Building OmniSim used to download its prebuilt dependencies... |
-| `OMNISIM_REQUIRE_NEWTON_BUNDLE` | value | `scripts/packaging/windows_distro.py:295` |  |
-| `OMNISIM_REQUIRE_RENDERER_BUNDLE` | value | `scripts/packaging/windows_distro.py:253` | Report whether wgpu_native.dll -- the ONLY renderer since the WREN deletion -- is staged next to the binary. Like the Newton bundle it rides the recursive... |
+| `OMNISIM_REQUIRE_NEWTON_BUNDLE` | value | `scripts/packaging/windows_distro.py:308` |  |
+| `OMNISIM_REQUIRE_RENDERER_BUNDLE` | value | `scripts/packaging/windows_distro.py:266` | Report whether wgpu_native.dll -- the ONLY renderer since the WREN deletion -- is staged next to the binary. Like the Newton bundle it rides the recursive... |
 | `OMNISIM_ROLL_BINARY` *(undocumented elsewhere)* | string | `scripts/dev/roll_check.py:348` |  |
 | `OMNISIM_SKIP_TORCH` *(undocumented elsewhere)* | value | `scripts/install/linux_bootstrap.sh:398`, `scripts/install/linux_bootstrap.sh:407` | $SUDO_H, not --user: the wheels have to land in the SYSTEM interpreter the binary links. --user would install somewhere this script cannot prove the... |
 | `OMNISIM_SKY_BENCH_KEEP` *(undocumented elsewhere)* | presence | `scripts/bench_sky.py:152` |  |

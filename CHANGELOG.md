@@ -25,6 +25,17 @@ top of that foundation.
 ---
 
 
+## [v9.1.2] — 2026-09-30
+
+### Fixed
+
+- **The unit-test check was red on v9.1.1, on one test:** the generated
+  environment-variable reference (`docs/reference/environment-variables.md`)
+  still cited the pre-fix line numbers of two variables that v9.1.1's
+  packaging fix moved, so its drift check failed (1 failed, 2635 passed). The
+  page is regenerated; line numbers only. No product code changed; the v9.1.1
+  installer and runtime are unaffected.
+
 ## [v9.1.1] — 2026-09-30
 
 ### Fixed
