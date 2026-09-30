@@ -230,7 +230,14 @@ Endpoints:
     GET  /robots               -> {robots: [{def, name, model, controller, type,
                                               position, orientation, num_joints}]}
     GET  /robot/{def}/joints   -> {robot, joints: [{name, type, position, velocity,
-                                                     lower, upper, hit_limit}]}
+                                                     lower, upper, limit_source,
+                                                     stop_lower, stop_upper,
+                                                     motor_lower, motor_upper,
+                                                     hit_limit}]}
+                                lower/upper are the EFFECTIVE limits (motor
+                                minPosition/maxPosition when they differ, else
+                                minStop/maxStop, else null); limit_source says
+                                which ("motor" | "stops" | null). PROTOCOL.md 7.14.
     GET  /robot/{def}/devices  -> {robot, devices: [{name, type}]}
     GET  /robot/{def}/sensor/{name}  501 — supervisor cannot read live sensor data
                                 from devices it does not own; use /joints for joint
@@ -764,7 +771,7 @@ ROUTES: tuple[dict, ...] = (
                 "supervisor is EXCLUDED (it is not in your .wbt) and named in `harness_injected`; "
                 "?include_harness=1 lists it, flagged.",
      "params": ["include_harness"]},
-    {"method": "GET", "path": "/robot/<def>/joints", "summary": "Per-joint position/velocity/limits + hit_limit."},
+    {"method": "GET", "path": "/robot/<def>/joints", "summary": "Per-joint position/velocity + EFFECTIVE limits (lower/upper, limit_source motor|stops|null) with the raw stop_*/motor_* values + hit_limit."},
     {"method": "GET", "path": "/robot/<def>/devices", "summary": "Device inventory of a robot's subtree."},
     {"method": "GET", "path": "/robot/<def>/sensor/<name>", "summary": "501 by design; see not_supported."},
     {"method": "GET", "path": "/robot/damage", "summary": "Damage state of the tracked robot."},

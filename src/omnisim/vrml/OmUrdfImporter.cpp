@@ -54,6 +54,11 @@ struct UrdfMaterial {
   // flat roughness 0.5 / metalness 0 and read as plastic. Negative = unset, which
   // keeps those constants byte-for-byte for any URDF that does not opt in.
   double roughness = -1.0, metalness = -1.0;
+  // Standard URDF <texture filename="..."/>, resolved like a mesh path; empty =
+  // none. Emitted as baseColorMap, and colour alpha < 1 as transparency
+  // (2026-09-25): both were parsed-and-dropped, so a textured or see-through
+  // part (a carbon frame, a rotor blur disc) needed a hand-patched robot.
+  QString texturePath;
 };
 
 struct UrdfGeometry {
@@ -460,9 +465,19 @@ UrdfGeometry parseGeometry(const QDomElement &elem, const QString &urdfDir) {
   return g;
 }
 
-UrdfMaterial parseMaterial(const QDomElement &elem, QHash<QString, UrdfMaterial> &materials) {
+UrdfMaterial parseMaterial(const QDomElement &elem, QHash<QString, UrdfMaterial> &materials,
+                           const QString &urdfDir) {
   UrdfMaterial m;
   m.name = elem.attribute("name");
+  const QDomElement texture = elem.firstChildElement("texture");
+  if (!texture.isNull()) {
+    const QString filename = texture.attribute("filename");
+    m.texturePath = resolveMeshPath(filename, urdfDir);
+    if (m.texturePath.isEmpty() && !filename.isEmpty())
+      OmLog::warning(QObject::tr("URDF material '%1': texture '%2' not found; the part renders untextured.")
+                       .arg(m.name)
+                       .arg(filename));
+  }
   const QDomElement pbr = elem.firstChildElement("omnisim");
   if (!pbr.isNull()) {
     bool ok = false;
@@ -487,6 +502,13 @@ UrdfMaterial parseMaterial(const QDomElement &elem, QHash<QString, UrdfMaterial>
       materials.insert(m.name, m);
     return m;
   }
+  if (!m.texturePath.isEmpty()) {
+    // A texture with no colour is a complete definition too.
+    m.r = m.g = m.b = 1.0;
+    if (!m.name.isEmpty())
+      materials.insert(m.name, m);
+    return m;
+  }
   if (!m.name.isEmpty() && materials.contains(m.name))
     return materials.value(m.name);
   return m;
@@ -503,7 +525,7 @@ UrdfLink parseLink(const QDomElement &elem, QHash<QString, UrdfMaterial> &materi
     warnUnsupportedGeometry(link.name, "visual", vis.geometry);
     const QDomElement matEl = v.firstChildElement("material");
     if (!matEl.isNull()) {
-      vis.material = parseMaterial(matEl, materials);
+      vis.material = parseMaterial(matEl, materials, urdfDir);
       vis.hasMaterial = true;
     }
     link.visuals.append(vis);
@@ -795,7 +817,7 @@ bool parseRobotXml(const QByteArray &xml, const QString &sourceLabel, const QStr
   robot.name = root.attribute("name", "robot");
 
   for (QDomElement m = root.firstChildElement("material"); !m.isNull(); m = m.nextSiblingElement("material"))
-    parseMaterial(m, robot.materials);
+    parseMaterial(m, robot.materials, urdfDir);
 
   for (QDomElement l = root.firstChildElement("link"); !l.isNull(); l = l.nextSiblingElement("link")) {
     UrdfLink link = parseLink(l, robot.materials, urdfDir);
@@ -1013,6 +1035,14 @@ QString emitVisual(const UrdfVisual &v, const QString &indent, const QString &li
   const double mtl = (v.hasMaterial && v.material.metalness >= 0.0) ? v.material.metalness : 0.0;
   out += innerIndent + QString("    roughness %1\n").arg(rgh);
   out += innerIndent + QString("    metalness %1\n").arg(mtl);
+  if (v.hasMaterial && v.material.a < 1.0)
+    out += innerIndent + QString("    transparency %1\n").arg(1.0 - qBound(0.0, v.material.a, 1.0));
+  if (v.hasMaterial && !v.material.texturePath.isEmpty())
+    out += innerIndent + QString("    baseColorMap ImageTexture { url [ \"%1\" ] }\n").arg(v.material.texturePath);
+  // The URDF material name, so a controller can find a part's appearance
+  // (e.g. rotor blur discs faded with rotor speed). Omitted when unnamed.
+  if (v.hasMaterial && !v.material.name.isEmpty())
+    out += innerIndent + QString("    name \"%1\"\n").arg(v.material.name);
   out += innerIndent + "  }\n";
 
   out += emitGeometry(v.geometry, innerIndent + "  ");

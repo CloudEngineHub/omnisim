@@ -147,6 +147,9 @@ def _bridges_stub_notice(what: str, exc: BaseException) -> None:
 # CONNECTED bridge cheaper; it never makes an unconnected one answer.
 try:  # noqa: E402
     from omnisim_bridges.route import (
+        interrupts_motion as shared_interrupts_motion,
+        with_halt_note as shared_with_halt,
+        is_halt_order as shared_is_halt_order,
         parser_first_window as shared_parser_window,
         parser_stats as shared_parser_stats,
         reply_payload as shared_reply_payload,
@@ -156,6 +159,11 @@ try:  # noqa: E402
 except ImportError as _exc:  # the package is ABSENT -- not "it raised"
     _bridges_stub_notice("the deterministic interpreter", _exc)
     shared_short_circuit = None
+    shared_is_halt_order = None
+    shared_interrupts_motion = None
+
+    def shared_with_halt(halted, out):  # type: ignore[misc]
+        return out
     shared_parser_window = None
     shared_reply_payload = None
     shared_parser_stats = None
@@ -175,6 +183,8 @@ try:  # noqa: E402
         build_intent_tools,
         DEFERRED_TOOLS,
         MAIN_TASK_RULE as INTENT_TASK_RULE,
+        clip_drive,
+        clip_zones,
     )
 except ImportError as _exc:  # the package is ABSENT -- not "it raised"
     _bridges_stub_notice("the deferred-intent layer", _exc)
@@ -182,6 +192,23 @@ except ImportError as _exc:  # the package is ABSENT -- not "it raised"
     build_intent_tools = None  # type: ignore[assignment]
     DEFERRED_TOOLS = frozenset()
     INTENT_TASK_RULE = ""
+    clip_drive = None  # type: ignore[assignment]
+    clip_zones = None  # type: ignore[assignment]
+
+# Route planning (around keep-out zones and obstacles the robot has met).
+# Absent package -> drive_to keeps its old turn-then-drive-straight form.
+try:  # noqa: E402
+    from omnisim_bridges.navigation import NavMap, obstacle_ahead
+except ImportError:  # the package is ABSENT
+    NavMap = None  # type: ignore[assignment]
+    obstacle_ahead = None  # type: ignore[assignment]
+
+# The gate, for actions this bridge fires ON ITS OWN (scheduled orders). No
+# gate means no scheduled action runs: fail closed, never fire unvetted.
+try:  # noqa: E402
+    from omnisim_bridges.gate import check as gate_check
+except ImportError:  # the package is ABSENT
+    gate_check = None  # type: ignore[assignment]
 
 # D1/D4/D6: the two clocks, the event ring and its detectors, the hold.
 # Optional for the same reason as everything above -- a bare clone without
@@ -1327,6 +1354,15 @@ class MobileBridge:
         # bridge restart for seq=1 from the process it originally dispatched
         # to. Generated once here and immutable for this process lifetime.
         self.bridge_instance_id = str(uuid.uuid4())
+        # OPERATOR HALTS, counted. A multi-leg parser plan reads this between
+        # legs so a stop ends the whole plan, not one leg of it; and every
+        # hook here runs on each operator halt (the relay registers
+        # cancel_inflight, so its model turn stops issuing steps too).
+        self.halt_seq = 0
+        self.on_operator_halt: List[Any] = []
+        # Only an EXPLICIT stop runs these (it cancels scheduled orders too);
+        # the implicit halt before a new instruction keeps them.
+        self.on_operator_stop: List[Any] = []
         self.motion_seq = 0
         self.last_completion: Optional[dict] = None
         self.fault: Optional[str] = None
@@ -1386,6 +1422,12 @@ class MobileBridge:
             Tuple[float, float, float, float, float]] = []
         self.idle_mode: Optional[str] = None
         self.idle_loop: Optional["MavIdleLoop"] = None
+        # The operator's last MOTION ORDER and where it was meant to end, so
+        # "carry on" / "finish the job" after a stop or a block resumes it.
+        # Without this the model had to invent the remaining distance, and
+        # the gate rightly refused it (invented_magnitude).
+        self._last_order: Optional[dict] = None
+        self._compound = 0
         self._carries: List[dict] = []
         self.mt = MainThreadCalls()
 
@@ -1442,6 +1484,12 @@ class MobileBridge:
                 legs=list(self.KNOWN_LEGS),
                 on_pause=self._on_intent_pause,
                 on_notify=self._on_intent_notify,
+                # act_drive_forward clips every drive at an active boundary
+                # (_boundary_clip), so this bridge may offer boundary rules.
+                spatial=True,
+                # tick() fires due actions and measures bumps
+                # (_tick_scheduled), so this bridge may offer "do it later".
+                scheduler=gate_check is not None,
             ) if (IntentStore is not None
                  # A/B kill-switch, same shape as OMNILINK_AVOID=0:
                  # OMNILINK_INTENTS=0 reverts this bridge to the
@@ -1450,6 +1498,20 @@ class MobileBridge:
                  # block, no hold. Used to A/B the baseline honestly.
                  and _os.environ.get("OMNILINK_INTENTS", "1")
                  .strip() not in ("0", "false", "no")) else None)
+
+        if self.intents is not None and getattr(self.intents, "scheduler", False):
+            self.intents.sim_clock = lambda: self.sim_time
+            # An operator halt cancels every scheduled motion not yet started:
+            # "stop" means stop, not "stop, and then do the thing you
+            # promised to do in ten seconds".
+            self.on_operator_stop.append(
+                lambda: self.intents.cancel_actions("operator halt"))
+            # ...but only what is due within two minutes: "stop, hold up a
+            # second" at minute nine must not erase the charger check ordered
+            # for minute fifteen, nor a standing bump watch.
+            self.intents.halt_horizon_s = 120.0
+        self._rest_anchor: Optional[Tuple[float, float, float]] = None
+        self._idle_since_sim: Optional[float] = None
 
         # wwi outbox.
         self.window_outbox: List[str] = []
@@ -2007,6 +2069,16 @@ class MobileBridge:
                             .get("released"))
         loop = self.idle_loop
         if loop is None:
+            # No autonomy to hand back to: "carry on" means the operator's own
+            # unfinished order.
+            order = self._last_order
+            if order:
+                gx, gy = order["goal_xy"]
+                x, y, _ = self._read_pose()
+                if math.hypot(gx - x, gy - y) > 0.15:
+                    out = self.act_resume_last_order()
+                    out.update({"autonomy": "none", "hold_released": released})
+                    return out
             return {"accepted": True, "autonomy": "none",
                     "hold_released": released,
                     "detail": "this robot has no idle loop to resume"}
@@ -2086,6 +2158,16 @@ class MobileBridge:
     DRIVE_TOL_MIN_M = 0.03       # settled-error tolerance floor …
     DRIVE_TOL_FRAC = 0.02        # … or 2% of the commanded distance
     DRIVE_SETTLE_S = 1.0         # sim-s of zero command before re-measuring
+    # STALL: commanding a drive and not moving. Without it a blocked drive
+    # pushed until its timeout -- 17 s against the ops-bench block -- and then
+    # its correction legs rammed the block again. Under DRIVE_STALL_PROGRESS_M
+    # of progress in DRIVE_STALL_S sim-seconds ends the leg as `blocked`.
+    DRIVE_STALL_S = 1.5
+    DRIVE_STALL_PROGRESS_M = 0.01
+    DRIVE_PUSH_WINDOW_S = 0.5
+    DRIVE_PUSH_GRACE_S = 1.0       # acceleration after a start or a turn
+    DRIVE_PUSH_MIN_REMAIN_M = 0.4  # not during the deliberate slow approach
+    DRIVE_PUSH_RATIO = 0.3
     DRIVE_MAX_CORRECTIONS = 4
     DRIVE_BIAS_MAX_M = 0.8
     # TURNS are settle-and-verified too, on the same three-phase shape.
@@ -2275,6 +2357,160 @@ class MobileBridge:
             contact_bodies(mine, candidates),
             sim_time=self.sim_time, step=self.sim_step, robot=self.robot_id)
 
+    # ── Scheduled actions ("do it later") ─────────────────────────
+    #
+    # SIM THREAD: this only DECIDES. Every action runs on its own worker,
+    # because act_* block waiting for ticks and would deadlock the sim thread.
+    #
+    # A BUMP is measured, not sensed: a controller's contact readback cannot
+    # see a URDF robot's chassis at all (getContactPoints is blind to URDF
+    # sub-links), and the contact watchlist only knows the warehouse's named
+    # props. What a real base can always tell is that it MOVED while standing
+    # still with no command -- which is exactly what being bumped is. The
+    # ops-bench bump (a 400 kg block placed against the Husky) moved it 9.5 mm
+    # from a pose that had not changed by a micron at rest.
+    DISTURB_M = 0.005
+    DISTURB_RAD = 0.02
+    DISTURB_REST_S = 1.0
+
+    ZONE_LOOKAHEAD_M = 0.35
+
+    def _zone_ahead(self, x: float, y: float, yaw: float, direction: float) -> bool:
+        """Is the robot's centre about to enter an active keep-out zone it is
+        not already in? Zones are re-read at most 4 times a sim-second."""
+        store = self.intents
+        if store is None or not hasattr(store, "zones"):
+            return False
+        cache = getattr(self, "_zones_cache", None)
+        if cache is None or self.sim_time - cache[0] > 0.25:
+            cache = (self.sim_time, store.zones())
+            self._zones_cache = cache
+        zones = cache[1]
+        if not zones:
+            return False
+        ax = x + direction * self.ZONE_LOOKAHEAD_M * math.cos(yaw)
+        ay = y + direction * self.ZONE_LOOKAHEAD_M * math.sin(yaw)
+
+        def inside(px, py):
+            return any(z["x_min"] < px < z["x_max"] and z["y_min"] < py < z["y_max"] for z in zones)
+
+        return inside(ax, ay) and not inside(x, y)
+
+    def _tick_site(self, x: float, y: float, yaw: float) -> None:
+        """SIM THREAD. A pose step the robot's own driving cannot explain is a
+        DISTURBANCE (a shove, a collision) -- recorded so the drive in progress
+        can say it was pushed off course. Arrivals at named places are counted
+        from the same measured pose."""
+        prev = getattr(self, "_site_prev", None)
+        self._site_prev = (self.sim_time, x, y)
+        if prev is not None:
+            dt = self.sim_time - prev[0]
+            step = math.hypot(x - prev[1], y - prev[2])
+            if 0 < dt <= 0.5 and step >= max(self.JUMP_MIN_M, 4.0 * dt):
+                if not hasattr(self, "_jumps"):
+                    self._jumps = []
+                self._jumps.append({"sim_s": round(self.sim_time, 2), "moved_m": round(step, 3),
+                                    "dx": round(x - prev[1], 3), "dy": round(y - prev[2], 3)})
+                del self._jumps[:-50]
+                self.queue_window(f"system:I was pushed {step:.2f} m off my position "
+                                  f"(sim {self.sim_time:.1f} s)")
+        store = self.intents
+        if store is not None and hasattr(store, "note_pose"):
+            arrived = store.note_pose(x, y)
+            if arrived:
+                self.queue_window(f"system:arrived at {arrived}")
+
+    def _tick_scheduled(self, x: float, y: float, yaw: float) -> None:
+        store = self.intents
+        if store is None or not getattr(store, "scheduler", False):
+            return
+        for rec in store.take_due_actions(self.sim_time):
+            self._spawn_scheduled(rec)
+        if not store.has_watch():
+            self._rest_anchor = None
+            self._idle_since_sim = None
+            return
+        with self.lock:
+            kind = self.motion[0]
+        if kind != "idle":
+            self._rest_anchor = None
+            self._idle_since_sim = None
+            return
+        if self._idle_since_sim is None:
+            self._idle_since_sim = self.sim_time
+        if self._rest_anchor is None:
+            if self.sim_time - self._idle_since_sim >= self.DISTURB_REST_S:
+                self._rest_anchor = (x, y, yaw)
+            return
+        ax, ay, ayaw = self._rest_anchor
+        moved = math.hypot(x - ax, y - ay)
+        turned = abs(wrap_pi(yaw - ayaw))
+        if moved < self.DISTURB_M and turned < self.DISTURB_RAD:
+            return
+        detail = (f"moved {moved:.3f} m / {math.degrees(turned):.1f} deg while "
+                  f"standing still (sim {self.sim_time:.2f} s)")
+        self._rest_anchor = None
+        self._idle_since_sim = None
+        for rec in store.note_disturbance(detail):
+            self._spawn_scheduled(rec)
+
+    def _spawn_scheduled(self, rec: dict) -> None:
+        threading.Thread(target=self._run_scheduled, args=(rec,),
+                         name=f"scheduled-{rec.get('id')}", daemon=True).start()
+
+    def _run_scheduled(self, rec: dict) -> None:
+        """Run one fired order, gating each frame NOW with the operator's words."""
+        store = self.intents
+        done: List[str] = []
+        ok = True
+        try:
+            for f in rec.get("frames") or []:
+                tool, args = f.get("tool"), dict(f.get("args") or {})
+                if gate_check is None:
+                    ok = False; done.append("refused: no safety gate"); break
+                rej = gate_check(rec.get("action_text") or "",
+                                 [{"tool": tool, "args": args}], surface="mobile")
+                if rej:
+                    ok = False; done.append(f"refused by the gate: {rej[0].detail}"); break
+                if tool == "stop":
+                    res = self.act_stop()
+                else:
+                    # A motion in progress (the operator's, or the reaction to
+                    # the bump itself) finishes first; this never clobbers it.
+                    deadline = time.time() + 15.0
+                    while time.time() < deadline:
+                        with self.lock:
+                            if self.motion[0] == "idle":
+                                break
+                        time.sleep(0.05)
+                    if tool == "drive_forward":
+                        res = self.act_drive_forward(float(args.get("distance", 0.0)), wait=True)
+                    elif tool == "go_to_place":
+                        res = self.act_go_to_place(str(args.get("place") or ""))
+                    elif tool == "drive_to":
+                        res = self.act_drive_to(float(args.get("x", 0.0)), float(args.get("y", 0.0)),
+                                                wait=True)
+                    elif tool == "wait":
+                        secs = max(0.0, min(600.0, float(args.get("s", args.get("seconds", 0.0)))))
+                        t_end = self.sim_time + secs
+                        while self.sim_time < t_end:
+                            time.sleep(0.05)
+                        res = {"accepted": True, "achieved": secs}
+                    else:
+                        res = self.act_turn(float(args.get("angle_rad", 0.0)), wait=True)
+                if (not isinstance(res, dict) or res.get("accepted") is False
+                        or isinstance(res.get("error"), str) or res.get("superseded")):
+                    ok = False
+                    why = (res or {}).get("error") or (res or {}).get("say") or "not completed"
+                    done.append(f"{tool} failed: {why}")
+                    break
+                ach = res.get("achieved")
+                done.append(f"{tool} done" + (f", achieved {ach:+.3f}" if isinstance(ach, (int, float)) else ""))
+        except Exception as exc:  # recorded, never silent
+            ok = False
+            done.append(f"error: {type(exc).__name__}: {exc}")
+        store.finish_action(rec.get("id", "?"), ok, "; ".join(done) or "nothing to do")
+
     # ── Tick loop ─────────────────────────────────────────────────
 
     def tick(self, dt_s: float) -> None:
@@ -2318,6 +2554,8 @@ class MobileBridge:
         # costs a supervisor call per watched body, and the tick is the
         # thread the whole simulation waits on.
         self._poll_contacts()
+        self._tick_scheduled(x, y, yaw)
+        self._tick_site(x, y, yaw)
 
         # SITE FENCE — checked before any motion is applied, so no command of
         # any origin (chat, HTTP, idle loop) can leave the building.
@@ -2369,9 +2607,17 @@ class MobileBridge:
                     # on a 1 m drive) by fighting the correction leg. What
                     # actually fixed the overshoot was slowing the correction
                     # leg down -- see DRIVE_APPROACH_FINE.
-                    self._drive_bias = clamp(self._drive_bias + 0.8 * err,
-                                             0.0, self.DRIVE_BIAS_MAX_M)
+                    # ...but only from a drive that ran FREE. A blocked or
+                    # timed-out drive's shortfall is the obstacle's, not the
+                    # stop rollback's: one pallet taught the Husky to aim
+                    # 0.8 m past every later target, and its next drive sailed
+                    # 0.78 m through the goal (ops-bench blocked_resume_husky,
+                    # 2026-09-26).
+                    if not p.get("blocked") and not timed_out:
+                        self._drive_bias = clamp(self._drive_bias + 0.8 * err,
+                                                 0.0, self.DRIVE_BIAS_MAX_M)
                     if (abs(err) > tol and not timed_out
+                            and not p.get("blocked")
                             and p.get("corrections", 0)
                             < self.DRIVE_MAX_CORRECTIONS):
                         with self.lock:
@@ -2379,6 +2625,10 @@ class MobileBridge:
                             p2["phase"] = "approach"
                             p2["corrections"] = p.get("corrections", 0) + 1
                             p2["timeout_s"] = p["timeout_s"] + 3.0
+                            # Each leg measures its own progress.
+                            p2.pop("stall_ref", None)
+                            p2.pop("prog_hist", None)
+                            p2.pop("drive_t0_sim", None)
                             self.motion = ("drive", p2)
                     else:
                         with self.lock:
@@ -2407,6 +2657,8 @@ class MobileBridge:
                         # achieved, 4 corrections, settled: true, with the
                         # 8.6% error sitting in a field the caller had been
                         # told it could trust.
+                        if abs(err) <= tol:
+                            p = dict(p); p.pop("blocked", None)  # got there
                         self._record_completion(
                             p, achieved,
                             settled=(abs(err) <= tol) and not timed_out,
@@ -2416,7 +2668,53 @@ class MobileBridge:
                             f"along the start heading, path {travelled:.2f} m)")
             else:
                 remaining = p["distance"] + self._drive_bias - travelled
-                if abs(remaining) <= self.DRIVE_BRAKE_M or timed_out:
+                ref = p.get("stall_ref")
+                if ref is None or travelled - ref[1] >= self.DRIVE_STALL_PROGRESS_M:
+                    p["stall_ref"] = (self.sim_time, travelled)
+                    stalled = False
+                else:
+                    stalled = self.sim_time - ref[0] >= self.DRIVE_STALL_S
+                # PUSHING. A base shoving a heavy pallet still creeps forward,
+                # so "no progress for 1.5 s" never fired and the Husky pushed a
+                # 400 kg pallet 0.17 m before anything noticed (ops-bench
+                # dev_goaround_pallet_husky). Mid-drive, well short of the
+                # target, moving at a fraction of the commanded speed IS the
+                # contact signal.
+                hist = p.setdefault("prog_hist", [])
+                hist.append((self.sim_time, travelled))
+                while hist and self.sim_time - hist[0][0] > self.DRIVE_PUSH_WINDOW_S:
+                    hist.pop(0)
+                t_run = self.sim_time - p.setdefault("drive_t0_sim", self.sim_time)
+                span = self.sim_time - hist[0][0] if hist else 0.0
+                pushing = (t_run > self.DRIVE_PUSH_GRACE_S
+                           and abs(remaining) > self.DRIVE_PUSH_MIN_REMAIN_M
+                           and span >= 0.8 * self.DRIVE_PUSH_WINDOW_S
+                           and (travelled - hist[0][1])
+                           < self.DRIVE_PUSH_RATIO * abs(float(p.get("speed") or 0.0)) * span)
+                if pushing and not stalled:
+                    stalled = True
+                    p["push_detected"] = True
+                # A ZONE THAT BECAME ACTIVE MID-DRIVE ("aisle's live again")
+                # binds the leg already under way: stop short of it, and
+                # drive_to plans again with the zone in the map.
+                if not stalled and abs(remaining) > 0.05 and self._zone_ahead(x, y, yaw, direction):
+                    stalled = True
+                    p["zone_ahead"] = True
+                if stalled and abs(remaining) > self.DRIVE_BRAKE_M and not timed_out:
+                    with self.lock:
+                        p2 = dict(p)
+                        p2["phase"] = "settle"
+                        p2["settle_t0"] = self.sim_time
+                        p2["blocked"] = (
+                            f"a keep-out zone is directly ahead after {travelled:.2f} m"
+                            if p.get("zone_ahead") else
+                            f"pushing against something: moving at under "
+                            f"{self.DRIVE_PUSH_RATIO:.0%} of the commanded speed after {travelled:.2f} m"
+                            if p.get("push_detected") else
+                            f"no progress for {self.DRIVE_STALL_S:g} sim-s after {travelled:.2f} m")
+                        self.motion = ("drive", p2)
+                    self._command_velocity(0.0, 0.0)
+                elif abs(remaining) <= self.DRIVE_BRAKE_M or timed_out:
                     with self.lock:
                         p2 = dict(p)
                         p2["phase"] = "settle"
@@ -3508,7 +3806,8 @@ class MobileBridge:
                 "mode": getattr(loop, "mode", "?"),
                 "leg_when_stopped": getattr(loop, "leg", "idle")}
 
-    def act_stop(self, source: str = "external") -> dict:
+    def act_stop(self, source: str = "external",
+                 keep_scheduled: bool = False) -> dict:
         """Stop the wheels, then MEASURE and report whether they stopped.
 
         THE DEFECT THIS REPLACES, captured live: this returned
@@ -3528,6 +3827,24 @@ class MobileBridge:
         control path.
         """
         operator = (source == self.SOURCE_EXTERNAL)
+        if operator:
+            # COUNT THE HALT BEFORE ANYTHING IS RELEASED. Superseding the
+            # running leg below wakes its waiter -- a multi-leg plan -- and
+            # that thread reads halt_seq at once. Counted after, the plan saw
+            # no halt and began its next leg (measured: a stop 0.3 m into
+            # "drive, turn 90, drive" still made the full turn, ops-bench
+            # omnilink-after-fix-01). The hooks cancel the relay's turn for
+            # the same reason: before its tool call can return and it plans on.
+            self.halt_seq += 1
+            hooks = list(self.on_operator_halt)
+            if not keep_scheduled:
+                hooks += list(self.on_operator_stop)
+            for hook in hooks:
+                try:
+                    hook()
+                except Exception as exc:  # a hook must never block a stop
+                    print(f"[omnilink_mobile_bridge] halt hook failed: {exc}",
+                          flush=True)
         # D6: STOP ALWAYS RUNS. Under lockstep the world is frozen between
         # commands, and a stop that cannot reach the wheels is not a stop --
         # so this asks the LOOP to lift the hold. It is a flag, not a call:
@@ -3643,6 +3960,8 @@ class MobileBridge:
             "settled": bool(settled),
             "timed_out": bool(timed_out),
             "corrections": int(p.get("corrections", 0)),
+            **({"blocked": True, "blocked_detail": str(p["blocked"])}
+               if p.get("blocked") else {}),
             "sim_time": self.sim_time,
             "sim_time_start": (None if t0 is None else round(float(t0), 6)),
             "sim_time_end": round(self.sim_time, 6),
@@ -3926,6 +4245,18 @@ class MobileBridge:
                           timeout_s: Optional[float] = None,
                           source: str = SOURCE_EXTERNAL) -> dict:
         x, y, yaw0 = self._read_pose()
+        requested = float(distance)
+        if not self._compound and source == self.SOURCE_EXTERNAL:
+            conflict = self._order_conflict()
+            if conflict:
+                return conflict
+            self._note_order("drive_forward", x + requested * math.cos(yaw0),
+                             y + requested * math.sin(yaw0), f"drive {requested:+.2f} m")
+        clip = self._boundary_clip(x, y, yaw0, distance)
+        if clip is not None:
+            if clip["refused"]:
+                return clip["result"]
+            distance = clip["distance"]
         actual_speed = speed if speed is not None else self.cruise_linear
         signed_speed = actual_speed if distance >= 0 else -actual_speed
         target = abs(distance)
@@ -3956,14 +4287,17 @@ class MobileBridge:
                 "phase": "approach",
                 "corrections": 0,
             })
+        clipped = ({} if clip is None else
+                   {"requested": requested, "clipped_by": clip["rule"],
+                    "note_boundary": clip["note"]})
         if wait:
             wait_budget_s = eta * 3.0 + 12.0 if timeout_s is None else float(timeout_s)
             return {"accepted": True, "commanded": float(distance), "unit": "m",
-                    **self._await_completion(seq, wait_budget_s)}
+                    **clipped, **self._await_completion(seq, wait_budget_s)}
         return {"accepted": True,
                 "bridge_instance_id": self.bridge_instance_id,
                 "seq": seq, "commanded": float(distance),
-                "unit": "m", "eta_s": eta,
+                "unit": "m", "eta_s": eta, **clipped,
                 "note": "NOT complete -- this returns on acceptance. Pass "
                         "wait=true, or poll get_robot_state until "
                         "last_command identity matches this "
@@ -3971,6 +4305,72 @@ class MobileBridge:
                         "Match BOTH fields: a later command's "
                         "record is a measurement of a different motion, and "
                         "a superseded motion reports achieved: null."}
+
+    # Halts, new orders and questions all get past this bridge's action lock
+    # (do_POST), so a parsed plan may wait for its last leg and answer from
+    # what was measured (route.execute; ops-bench P7).
+    replies_after_motion = True
+
+    def working(self, relay: Any = None) -> bool:
+        """Is the robot moving, or a model turn still running for it?"""
+        with self.lock:
+            if self.motion[0] != "idle":
+                return True
+        return bool(relay is not None and getattr(relay, "turn_active", None)
+                    and relay.turn_active())
+
+    # How far short of a boundary a clipped drive aims. The drive controller
+    # settles within ~1 cm; the rest is braking and wheel slip.
+    BOUNDARY_MARGIN_M = 0.05
+    # Less room than this and the drive is refused rather than crept.
+    BOUNDARY_MIN_MOVE_M = 0.02
+
+    def _boundary_clip(self, x: float, y: float, heading: float,
+                       distance: float) -> Optional[dict]:
+        """Shorten a straight drive so it stops short of every active boundary.
+
+        None when no boundary binds. Otherwise {refused, distance, rule, note,
+        result}: a drive with (almost) no room is REFUSED with the rule named;
+        one with room is clipped, and the result says requested vs commanded,
+        so nobody reads a shortened drive as the drive they asked for.
+        """
+        store = self.intents
+        if (store is None or clip_drive is None
+                or not hasattr(store, "boundaries")):
+            return None
+        hit = clip_drive(store.boundaries(), x, y, heading, distance,
+                         margin=self.BOUNDARY_MARGIN_M)
+        # A keep-out ZONE binds a straight drive the same way: it stops at
+        # the zone's edge (drive_to plans around zones instead; see
+        # _plan_route). The nearer of the two limits wins.
+        if clip_zones is not None and hasattr(store, "zones"):
+            zhit = clip_zones(store.zones(), x, y, heading, distance,
+                              margin=self.BOUNDARY_MARGIN_M)
+            if zhit is not None and (hit is None or zhit["allowed"] < hit["allowed"]):
+                zr = dict(zhit["rule"])
+                zr.setdefault("means", f"keep out of {zr.get('name', 'the zone')}")
+                hit = {"allowed": zhit["allowed"], "rule": zr}
+        if hit is None:
+            return None
+        allowed, rule = hit["allowed"], hit["rule"]
+        sgn = 1.0 if distance > 0 else -1.0
+        if allowed < self.BOUNDARY_MIN_MOVE_M:
+            store.note_block("boundary", f"refused drive {distance:+.2f} m")
+            return {"refused": True, "rule": rule, "result": {
+                "accepted": False, "refused": "boundary", "rule": "boundary",
+                "boundary": rule, "requested": float(distance),
+                "error": (f"refused: I am already at the boundary "
+                          f"({rule.get('means')}); driving {distance:+.2f} m would "
+                          "cross it. Lift the rule first."),
+                "say": (f"I can't drive that way: I'm at the line "
+                        f"({rule.get('means')}) you told me to keep. Tell me when "
+                        "the rule no longer applies.")}}
+        store.note_block("boundary", f"clipped drive {distance:+.2f} -> {sgn * allowed:+.2f} m")
+        return {"refused": False, "distance": sgn * allowed, "rule": rule,
+                "note": (f"Shortened from {distance:+.2f} m to {sgn * allowed:+.2f} m "
+                         f"to stop at the boundary you set ({rule.get('means')}). "
+                         "Tell the operator the drive stopped at the line."),
+                "result": None}
 
     def act_turn(self, angle_rad: float, wait: bool = False,
                  source: str = SOURCE_EXTERNAL) -> dict:
@@ -4064,6 +4464,241 @@ class MobileBridge:
                                 f"|y| <= {self.SITE_HALF_Y} metres."),
                     "bounds": {"half_x_m": self.SITE_HALF_X,
                                "half_y_m": self.SITE_HALF_Y}}
+        if not self._compound:
+            conflict = self._order_conflict()
+            if conflict:
+                return conflict
+            self._note_order("drive_to", tx, ty, f"go to ({tx:.2f}, {ty:.2f})")
+        self._compound += 1
+        try:
+            if NavMap is not None and self.intents is not None:
+                return self._drive_to_planned(tx, ty)
+            return self._drive_to_straight(tx, ty)
+        finally:
+            self._compound -= 1
+
+    def _note_order(self, kind: str, gx: float, gy: float, means: str) -> None:
+        store = self.intents
+        who = store.current_speaker() if store is not None and hasattr(store, "current_speaker") else ""
+        self._last_order = {"kind": kind, "goal_xy": [gx, gy], "means": means,
+                            "sim_s": self.sim_time, "by": who}
+
+    def outranked(self, text: Any) -> bool:
+        """Would this speaker's order be refused against the supervisor's
+        order under way? Then it must not halt that order on its way in
+        either: the worker's "belay that" is answered beside the running
+        work, and _order_conflict refuses the order itself. A STOP never
+        comes here -- it halts through its own path, from anyone."""
+        store = self.intents
+        order = self._last_order
+        if store is None or not order or not hasattr(store, "roles"):
+            return False
+        try:
+            from omnisim_bridges.intents import speaker_of
+        except ImportError:
+            return False
+        who = speaker_of(text)
+        boss = order.get("by") or ""
+        if not who or who == boss or store.roles.get(who) != "worker":
+            return False
+        if store.roles.get(boss) not in ("supervisor", "safety"):
+            return False
+        gx, gy = order["goal_xy"]
+        x, y, _ = self._read_pose()
+        return math.hypot(gx - x, gy - y) > 0.3
+
+    def _order_conflict(self) -> Optional[dict]:
+        """A floor worker does not override the supervisor's CURRENT order.
+
+        Current = given by someone the store knows as supervisor (or safety
+        lead), and not yet reached. Checked where motion orders start, so it
+        binds the parser, the model and any /tool caller alike. A STOP is not
+        an order and is never refused."""
+        store = self.intents
+        order = self._last_order
+        if store is None or not order or not hasattr(store, "current_speaker"):
+            return None
+        who = store.current_speaker()
+        roles = getattr(store, "roles", {})
+        boss = order.get("by") or ""
+        if not who or who == boss or roles.get(who) != "worker":
+            return None
+        if roles.get(boss) not in ("supervisor", "safety"):
+            return None
+        gx, gy = order["goal_xy"]
+        x, y, _ = self._read_pose()
+        if math.hypot(gx - x, gy - y) <= 0.3:
+            return None                              # that order is done
+        return {"accepted": False, "refused": "authority",
+                "error": f"refused: {boss}'s order ({order['means']}) is still in progress",
+                "say": (f"Sorry {who}, I'm still on {boss}'s order ({order['means']}), and "
+                        f"it stands until {boss} changes it.")}
+
+    def act_resume_last_order(self) -> dict:
+        """Finish the last motion order after a stop or a block: drive to the
+        place it was meant to END, by a planned route. Never a re-guessed
+        distance -- the goal was fixed when the order was given."""
+        order = self._last_order
+        if not order:
+            return {"accepted": False, "refused": "no_order",
+                    "say": "There's no earlier drive of mine to finish."}
+        gx, gy = order["goal_xy"]
+        x, y, _ = self._read_pose()
+        if math.hypot(gx - x, gy - y) <= 0.15:
+            return {"accepted": True, "already_done": True, "achieved_xy": [x, y],
+                    "commanded_xy": [gx, gy], "arrived": True,
+                    "error_m": math.hypot(gx - x, gy - y),
+                    "say": f"That order ({order['means']}) is already done: I'm there."}
+        keep = dict(order)
+        self._compound += 1
+        try:
+            out = self.act_drive_to(gx, gy, wait=True)
+        finally:
+            self._compound -= 1
+        self._last_order = keep            # still the operator's order
+        out["resumed_order"] = keep["means"]
+        if keep.get("place"):
+            out["place"] = keep["place"]
+        return out
+
+    # ── route planning ────────────────────────────────────────────────
+    #
+    # A warehouse cart does not drive "turn, then straight". Straight through
+    # a keep-out zone it was clipped at the edge and stopped short; straight
+    # into a pallet it stalled and reported blocked, and the operator had to
+    # talk it round (ops-bench holdout v1, F4: 0/8). It keeps a map instead:
+    # the operator's keep-out rules, and every obstacle a blocked drive has
+    # met, and routes around both (omnisim_bridges.navigation).
+    DRIVE_TO_REPLANS = 3
+    JUMP_MIN_M = 0.12            # a pose step no drive of ours can make in one tick
+
+    def _nav(self):
+        nav = getattr(self, "_navmap", None)
+        if nav is not None:
+            return nav
+        hx, hy = self._stage_half_extent()
+        radius = float(self.cfg.get("body_radius_m",
+                                    float(self.cfg.get("half_track_m", 0.2)) + 0.15))
+        self._navmap = NavMap(hx, hy, robot_radius=radius)
+        return self._navmap
+
+    def _stage_half_extent(self) -> Tuple[float, float]:
+        """The floor this robot is actually on: the stage's floorSize when the
+        world has one, else the site fence. A route planned inside the fence
+        but outside the stage walls would drive "around" a keep-out zone
+        through a wall."""
+        try:
+            children = self.robot.getRoot().getField("children")
+            for i in range(children.getCount()):
+                f = children.getMFNode(i).getField("floorSize")
+                if f is not None:
+                    sx, sy = f.getSFVec2f()
+                    return (min(sx / 2.0, self.SITE_HALF_X), min(sy / 2.0, self.SITE_HALF_Y))
+        except Exception:
+            pass
+        return (self.SITE_HALF_X, self.SITE_HALF_Y)
+
+    OBSTACLE_MEMORY_S = 180.0    # a pallet moves; forget what was not met again
+    OBSTACLE_GAP_M = 0.3         # contact point to the centre of what was met
+    OBSTACLE_RADIUS_M = 0.9
+    OBSTACLE_BACKOFF_M = 0.3
+
+    def _plan_route(self, x: float, y: float, tx: float, ty: float) -> dict:
+        nav = self._nav()
+        nav.obstacles = [o for o in nav.obstacles
+                         if self.sim_time - float(o.get("sim_s", self.sim_time)) <= self.OBSTACLE_MEMORY_S]
+        # A REMEMBERED obstacle only steers the route; it never makes a goal
+        # unreachable. One sitting on the goal is dropped (the operator is
+        # sending the robot there, so it has likely been cleared), and when
+        # no route exists with the remembered ones, plan without them: the
+        # drive itself will find out, and report, if something is still there.
+        rr = nav.robot_radius
+        nav.obstacles = [o for o in nav.obstacles
+                         if math.hypot(tx - o["x"], ty - o["y"]) >= o["radius"] + rr]
+        store = self.intents
+        zones = store.zones() if hasattr(store, "zones") else []
+        bounds = store.boundaries() if hasattr(store, "boundaries") else []
+        plan = nav.plan((x, y), (tx, ty), zones=zones, bounds=bounds)
+        if not plan["ok"] and nav.obstacles:
+            kept, nav.obstacles = nav.obstacles, []
+            plan = nav.plan((x, y), (tx, ty), zones=zones, bounds=bounds)
+            nav.obstacles = kept
+        return plan
+
+    def _drive_to_planned(self, tx: float, ty: float) -> dict:
+        x0, y0, _ = self._read_pose()
+        jumps0 = len(getattr(self, "_jumps", []))
+        route_log, learned, legs_all = [], [], []
+        out = None
+        for attempt in range(self.DRIVE_TO_REPLANS + 1):
+            x, y, _ = self._read_pose()
+            plan = self._plan_route(x, y, tx, ty)
+            if not plan["ok"]:
+                if attempt == 0:
+                    self.act_stop(source=self.SOURCE_IDLE_LOOP)
+                    xf, yf, yawf = self._read_pose()
+                    return {"accepted": False, "refused": "no_route",
+                            "error": f"refused: {plan['why']}",
+                            "say": (f"I can't get to ({tx:.2f}, {ty:.2f}): {plan['why']}. "
+                                    "Nothing moved."),
+                            "commanded_xy": [tx, ty], "achieved_xy": [xf, yf],
+                            "arrived": False, "error_m": math.hypot(tx - xf, ty - yf)}
+                break
+            route_log.append([list(p) for p in plan["waypoints"]])
+            blocked_at = None
+            for wx, wy in plan["waypoints"]:
+                out = self._drive_to_straight(wx, wy)
+                legs_all.extend(out.get("legs") or [])
+                blocked = any((l.get("drive") or {}).get("blocked") for l in out.get("legs") or [])
+                if blocked or (not out.get("arrived") and out.get("aborted") and
+                               "superseded" not in str(out.get("aborted"))):
+                    blocked_at = out
+                    break
+                if out.get("aborted") and "superseded" in str(out.get("aborted")):
+                    blocked_at = None
+                    break
+            if blocked_at is None:
+                break
+            # A leg stopped at a zone that became active: plan again with it.
+            if any("keep-out zone" in str((l.get("drive") or {}).get("blocked") or "")
+                   for l in (blocked_at.get("legs") or [])):
+                continue
+            # Blocked on a leg: remember what is ahead, and plan again.
+            bx, by, byaw = self._read_pose()
+            # Pallet-sized: a 1.2 m pallet met anywhere on its face must lie
+            # inside the circle, or the first route round clips its corner.
+            ob = obstacle_ahead(bx, by, byaw, float(self.cfg.get("half_length_m",
+                                                                 self._nav().robot_radius)),
+                                gap=self.OBSTACLE_GAP_M, radius=self.OBSTACLE_RADIUS_M)
+            met = self._nav().learn_obstacle(ob["x"], ob["y"], ob["radius"],
+                                             note=f"blocked at sim {self.sim_time:.1f}s")
+            met["sim_s"] = self.sim_time
+            learned.append({"x": round(ob["x"], 2), "y": round(ob["y"], 2)})
+            if math.hypot(tx - ob["x"], ty - ob["y"]) < ob["radius"] + self._nav().robot_radius:
+                # What blocks the robot sits ON the goal: there is no going
+                # round it, and trying again would only shove it. Report.
+                break
+            # Back off before going round: a 1 m base pivoting with its nose
+            # against a pallet sweeps its corners into it.
+            self.act_drive_forward(-self.OBSTACLE_BACKOFF_M, wait=True)
+        xf, yf, yawf = self._read_pose()
+        err = math.hypot(tx - xf, ty - yf)
+        res = dict(out or {})
+        res.update({
+            "accepted": True, "unit": "m",
+            "commanded_xy": [tx, ty], "achieved_xy": [xf, yf], "achieved_yaw": yawf,
+            "error_m": err, "arrived": err <= self.DRIVE_TO_TOL_M,
+            "tolerance_m": self.DRIVE_TO_TOL_M, "start_xy": [x0, y0],
+            "legs": legs_all, "route": route_log,
+            "detoured": len(route_log) > 1 or any(len(r) > 1 for r in route_log),
+            "obstacles_met": learned,
+            "disturbances": list(getattr(self, "_jumps", [])[jumps0:]),
+        })
+        if not res["arrived"]:
+            res.setdefault("aborted", res.get("aborted") or "blocked")
+        return res
+
+    def _drive_to_straight(self, tx: float, ty: float) -> dict:
         x0, y0, _ = self._read_pose()
         legs = []
         # `settled` is EARNED, not asserted. Every leg here waits on
@@ -4096,13 +4731,20 @@ class MobileBridge:
             dist = math.hypot(tx - x, ty - y)
             r = self.act_drive_forward(dist, wait=True)
             legs.append({"drive": {"commanded_m": dist,
-                                   "achieved_m": r.get("achieved")}})
+                                   "achieved_m": r.get("achieved"),
+                                   **({"blocked": r.get("blocked")} if r.get("blocked") else {})}})
             if r.get("accepted") is False:
                 aborted = r.get("error") or "drive_refused"
                 break
             if r.get("timed_out") or r.get("superseded"):
                 timed_out = bool(r.get("timed_out"))
                 aborted = "drive_timed_out" if timed_out else "drive_superseded"
+                break
+            if r.get("blocked"):
+                # Stalled against something. Driving the same line again only
+                # shoves it (a 400 kg pallet, three times); the planner routes
+                # around it instead (_drive_to_planned).
+                aborted = "blocked"
                 break
         if aborted is not None:
             # STOP BEFORE MEASURING. A pose sampled off a still-moving base
@@ -4133,6 +4775,43 @@ class MobileBridge:
             out["note"] = ("a leg did not complete, so the robot was stopped "
                            "before this pose was read: it is where the robot "
                            "gave up, not where it was asked to go")
+        return out
+
+    def act_go_to_place(self, place: str) -> dict:
+        store = self.intents
+        xy = store.place_xy(place) if store is not None and hasattr(store, "place_xy") else None
+        if xy is None:
+            known = ", ".join(v["name"] for v in getattr(store, "places", {}).values()) or "none yet"
+            return {"accepted": False, "refused": "unknown_place",
+                    "error": f"refused: I don't know a place called {place!r}",
+                    "say": f"I don't know where {place} is. Places I know: {known}."}
+        conflict = self._order_conflict()
+        if conflict:
+            return conflict
+        self._note_order("go_to_place", xy[0], xy[1], f"go to {place}")
+        self._last_order["place"] = place
+        self._compound += 1
+        try:
+            out = self.act_drive_to(xy[0], xy[1], wait=True)
+        finally:
+            self._compound -= 1
+        out["place"] = place
+        return out
+
+    def act_return_home(self) -> dict:
+        """"Go home" / "back to the start" / "return to the dock", DRIVEN.
+        The parser maps those words to reset_to_home, which used to be a
+        supervisor teleport: fine for resetting a scene, impossible for a real
+        robot, and wrong on a shift where "the dock" is a named place."""
+        text = str(getattr(self.intents, "_turn_text", "") or "").lower()
+        store = self.intents
+        for word in ("dock", "home", "charger", "start"):
+            if word in text and store is not None and hasattr(store, "place_xy"):
+                if store.place_xy(word) is not None:
+                    return self.act_go_to_place(word)
+        sx, sy = self.start_xyz[0], self.start_xyz[1]
+        out = self.act_drive_to(sx, sy, wait=True)
+        out["place"] = "the start"
         return out
 
     def act_reset_to_home(self) -> dict:
@@ -7958,7 +8637,42 @@ def make_handler(bridge: MobileBridge, relay: Any = None):
                 # reason: they mutate nothing, and a 20 Hz ROS 2 poll holding
                 # the action lock would serialise every motion command behind
                 # it.
-                if path in ("/stop_robot", "/read_sensor", "/list_sensors"):
+                # A HALT, however it is phrased, is the same escape hatch:
+                # POST /tool stop_robot and a /prompt the parser answers as a
+                # pure stop used to queue here behind the very motion they
+                # were sent to end -- measured, a "Stop!" 0.5 m into a 2 m
+                # drive returned after the drive finished (ops-bench F3,
+                # 2026-09-25). The gate still vets both on their own routes.
+                halt = (path == "/prompt" and relay is not None
+                        and shared_is_halt_order is not None
+                        and shared_is_halt_order(body.get("text"), "mobile"))
+                # A NEW INSTRUCTION WHILE THE ROBOT WORKS STOPS THE WORK FIRST,
+                # here, before the lock the running work holds and before any
+                # model is asked (ops-bench P8: "go back to where you started"
+                # waited on an unreachable model while the drive went on).
+                # Questions, acknowledgements and orders for later do not.
+                self._halted_first = None
+                aside = False
+                if (path == "/prompt" and relay is not None and not halt
+                        and shared_interrupts_motion is not None
+                        and bridge.working(relay)):
+                    if (shared_interrupts_motion(body.get("text"), "mobile", bridge=bridge)
+                            and not bridge.outranked(body.get("text"))):
+                        res = bridge.act_stop(keep_scheduled=True)
+                        self._halted_first = {
+                            "pose": res.get("pose_at_halt"),
+                            "stopped_motion": res.get("stopped_motion"),
+                            "stationary": res.get("stationary")}
+                    else:
+                        # A question, a "thanks" or an order for later, said
+                        # while the robot works: answered NOW, beside the
+                        # running work, not after it. It cannot move the
+                        # robot -- the gate refuses motion on a question, and
+                        # a later order only schedules.
+                        aside = True
+                if (path in ("/stop_robot", "/read_sensor", "/list_sensors")
+                        or (path == "/tool" and body.get("tool") == "stop_robot")
+                        or halt or aside):
                     self._route_post(body)
                 else:
                     with action_lock:
@@ -7992,8 +8706,30 @@ def make_handler(bridge: MobileBridge, relay: Any = None):
                         "drive": "POST /drive_forward {\"distance\": 1.0, \"wait\": true}",
                         "turn": "POST /turn {\"angle\": 1.5708, \"wait\": true}",
                         "stop": "POST /stop_robot {}",
+                        "tools": "GET /tools",
                     },
                 })
+            if self.path == "/main_task":
+                # The system instructions this robot's relay gives ITS model,
+                # verbatim. Published beside /tools so an agent built on any
+                # framework can be given the same brief (ops-bench v2: the
+                # full-tier competitors get the same tools AND the same
+                # instructions; the difference left is the runtime).
+                if relay is None:
+                    return self._json(200, {"main_task": "", "note": "no relay"})
+                return self._json(200, {"main_task": str(getattr(relay, "main_task", "") or "")})
+            if self.path == "/tools":
+                # The EXACT tool definitions this robot's relay hands its
+                # model -- names, descriptions, JSON schemas. Every one is
+                # callable at POST /tool, gated. Published so any agent, not
+                # only OmniLink's, can be given the same surface (ops-bench
+                # competitor arms read it; a fair comparison needs it).
+                if relay is None:
+                    return self._json(200, {"tools": [], "note": "no relay: tools unavailable"})
+                defs = relay.tool_defs          # a property on OmniLinkRelay
+                defs = defs() if callable(defs) else defs
+                return self._json(200, {"tools": list(defs or []),
+                                        "call": "POST /tool {\"tool\": name, ...args}"})
             if self.path == "/protocol":
                 return self._json(200, {
                     "ok": True, "omnisim_wire": WIRE_VERSION,
@@ -8193,7 +8929,7 @@ def make_handler(bridge: MobileBridge, relay: Any = None):
                                     actions=out.get("actions"),
                                     error=out.get("error") or "")
                             return self._json(200,
-                                              shared_stamp_via(out))
+                                              shared_stamp_via(shared_with_halt(getattr(self, "_halted_first", None), out)))
                         # Low-water mark for the turn's journal slice, so the
                         # relay's own auto-reads (which emit no "tool" event)
                         # can be reported below. See _auto_reads_since.
@@ -8210,7 +8946,7 @@ def make_handler(bridge: MobileBridge, relay: Any = None):
                         # §5.7.2 / D3: `via` is REQUIRED on a 200 from
                         # /prompt. The parser stamps itself; anything that
                         # reaches here was answered by the model relay.
-                        return self._json(200, shared_stamp_via(out))
+                        return self._json(200, shared_stamp_via(shared_with_halt(getattr(self, "_halted_first", None), out)))
                     return self._json(503, connection_error())
                 finally:
                     if bridge.intents is not None:
@@ -8258,11 +8994,23 @@ def make_handler(bridge: MobileBridge, relay: Any = None):
                 # `gate.refused` event. It is the one thing that happens here
                 # which nobody ever sees -- the caller gets a 400 and the
                 # robot's own agent learns nothing at all.
-                code, payload = serve_tool(
-                    tool_name, body, _dispatch, surface="mobile",
-                    bridge=bridge, origin="tool",
-                    registered=(relay is not None
-                                and tool_name in getattr(relay, "tools", {})))
+                # The store judges WHO may lift a rule from the operator's own
+                # words, exactly as on /prompt. A /tool caller that sends the
+                # utterance (the gate needs it anyway) gets the same authority
+                # check -- otherwise a worker's "the aisle rule is off" would be
+                # refused on one path and honoured on the other.
+                said = str(body.get("utterance") or "")
+                if said and bridge.intents is not None:
+                    bridge.intents.set_turn_text(said)
+                try:
+                    code, payload = serve_tool(
+                        tool_name, body, _dispatch, surface="mobile",
+                        bridge=bridge, origin="tool",
+                        registered=(relay is not None
+                                    and tool_name in getattr(relay, "tools", {})))
+                finally:
+                    if said and bridge.intents is not None:
+                        bridge.intents.set_turn_text("")
                 return self._json(code, payload)
             return self._json(404, error_envelope("not_found", "Endpoint not found.", {"path": p}))
     return _H
@@ -8590,6 +9338,20 @@ def _build_base_tools(bridge: MobileBridge) -> List[Any]:
                 float(args.get("x", 0.0)), float(args.get("y", 0.0)), wait=True),
         ),
         Tool(
+            name="go_to_place",
+            description=(
+                "Drive to a NAMED PLACE the operator defined earlier (remember_place): "
+                "'go to the dock', 'take this to packing', 'back to the charger'. "
+                "Same as drive_to at that place's coordinates: it plans a route "
+                "around keep-out zones and anything it runs into, blocks until it "
+                "settles, and reports where it actually ended up. Refused, with "
+                "nothing moving, when the name is unknown."),
+            parameters={"type": "object",
+                        "properties": {"place": {"type": "string"}},
+                        "required": ["place"]},
+            dispatch=lambda args: bridge.act_go_to_place(str(args.get("place") or "")),
+        ),
+        Tool(
             name="drive_forward",
             description=(
                 "Drive a distance along the CURRENT heading (body frame). "
@@ -8727,9 +9489,21 @@ def _build_base_tools(bridge: MobileBridge) -> List[Any]:
         ),
         Tool(
             name="reset_to_home",
-            description="Teleport the robot back to its spawn pose (supervisor reset).",
+            description=("Go back to where this robot started (or to the dock / "
+                         "charger / home if one was named): DRIVEN there by a "
+                         "planned route, blocking, reporting where it ended up."),
             parameters={"type": "object", "properties": {}},
-            dispatch=lambda args: bridge.act_reset_to_home(),
+            dispatch=lambda args: bridge.act_return_home(),
+        ),
+        Tool(
+            name="resume_last_order",
+            description=(
+                "FINISH THE LAST MOTION ORDER after it was stopped, interrupted or "
+                "blocked ('carry on with that', 'finish the job', 'OK, continue'). "
+                "Drives to where that order was meant to END, by a planned route. "
+                "Use this instead of guessing the remaining distance."),
+            parameters={"type": "object", "properties": {}},
+            dispatch=lambda args: bridge.act_resume_last_order(),
         ),
         Tool(
             name="get_robot_state",
@@ -9121,6 +9895,10 @@ def setup_omnilink_relay(bridge: MobileBridge, http_port: int = 8765) -> Optiona
             # instead of the strictest one.
             surface="mobile",
         )
+        # Places, people, rules and counts, rebuilt on every model call: the
+        # conversation window forgets minute one by minute ten.
+        if bridge.intents is not None and hasattr(bridge.intents, "memory_text"):
+            relay.memory_provider = bridge.intents.memory_text
         # Push a per-robot profile so operators can pick this base in
         # the omnilink-agents.com web UI and chat to the sim from
         # there. Tool calls round-trip back via /tool below.
@@ -9392,6 +10170,8 @@ def main() -> int:
     bridge.idle_peer_port = int(args.idle_peer_port or 0)
     bridge.idle_arm_port = int(args.idle_arm_port or 0)
     relay = setup_omnilink_relay(bridge, http_port=args.port)
+    if relay is not None and hasattr(relay, "cancel_inflight"):
+        bridge.on_operator_halt.append(relay.cancel_inflight)
     start_http(bridge, args.port, relay)
 
     # Opt-in ambient idle loop (keeps the tug demo alive when nobody is

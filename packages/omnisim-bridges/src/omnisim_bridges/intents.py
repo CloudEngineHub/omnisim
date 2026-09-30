@@ -73,12 +73,13 @@ returns copies.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import tempfile
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 __all__ = [
     "IntentStore",
@@ -91,7 +92,11 @@ __all__ = [
 # Bounded by construction. A never-satisfied trigger must age out and say so
 # in the log, not sit in the store forever pretending to be live.
 DEFAULT_TTL_S = 900.0             # 15 min for a pending intent
-DEFAULT_CONSTRAINT_TTL_S = 1800.0  # 30 min for a standing rule
+# A standing rule lasts until it is lifted. It used to lapse after 30
+# minutes, so a keep-out rule set at the start of a shift quietly expired
+# before the shift ended -- a safety rule must never time out on its own.
+# The ceiling (one long shift) only bounds a rule nobody ever lifts.
+DEFAULT_CONSTRAINT_TTL_S = 12 * 3600.0
 DEFAULT_HOLD_MAX_S = 1800.0       # 30 min ceiling on "hold until told"
 
 # Canonical trigger vocabulary. Robot-specific aliases map onto these so the
@@ -224,8 +229,22 @@ class IntentStore:
                  constraint_ttl_s: float = DEFAULT_CONSTRAINT_TTL_S,
                  hold_max_s: float = DEFAULT_HOLD_MAX_S,
                  state_path: Optional[str] = None,
-                 persist: Optional[bool] = None) -> None:
+                 persist: Optional[bool] = None,
+                 spatial: bool = False,
+                 scheduler: bool = False) -> None:
         self.robot_id = robot_id
+        # A robot whose bridge ENFORCES coordinate boundaries at motion start
+        # (the mobile bridge clips drive_forward). Only then are the boundary
+        # tools offered: a store must never invite a rule nothing enforces.
+        self.spatial = bool(spatial)
+        # A robot whose bridge RUNS scheduled actions (a clock that fires
+        # them and a disturbance detector). Only then is schedule_action
+        # offered: never invite a promise nothing will keep.
+        self.scheduler = bool(scheduler)
+        self._actions: List[_Rec] = []
+        # The bridge's SIM clock (a zero-arg callable), set by the bridge.
+        # Timed actions are due in sim seconds, never wall seconds.
+        self.sim_clock: Optional[Callable[[], float]] = None
         self.task_noun = task_noun
         self.task_plural = task_plural
         self.conditions = list(conditions)
@@ -295,6 +314,28 @@ class IntentStore:
         self.hold_intent = ""
         # The operator's verbatim text for the turn in flight (see hold_now).
         self._turn_text = ""
+
+        # SITE MEMORY: what a shift establishes once and refers to by name
+        # for the rest of it. The conversation window is the last few dozen
+        # messages; "the dock is at ..." said in minute one is gone from it
+        # by minute ten. These live here instead and are shown to the model
+        # on every call (memory_text), so remembering them does not depend
+        # on the chat history.
+        self.places: Dict[str, dict] = {}     # name -> {x, y, words, set_by}
+        self.roles: Dict[str, str] = {}       # person -> supervisor|worker|safety|other
+        self.visits: Dict[str, int] = {}      # place -> arrivals this run
+        self._at_place: Optional[str] = None
+        self.shift_t0 = _now()
+        # ODOMETER: metres actually driven this shift, from the measured pose
+        # with a 2 cm deadband (a stalled base vibrating by millimetres is not
+        # travel). "How far have you driven today?" was answered "I do not
+        # track that" (ops-bench shift_husky_dev) -- every cart has one.
+        self.odometer_m = 0.0
+        # Rules lifted this shift, with who lifted them: "what's the status
+        # on the aisle?" needs "lifted by Owen, then back on" as much as it
+        # needs the rules still active.
+        self.lifted: List[dict] = []
+        self._odo_anchor: Optional[Tuple[float, float]] = None
 
         # LAST, on purpose: restoring rebases onto self.counters and may set
         # self.hold, so it has to run after both exist or a restored hold
@@ -615,6 +656,527 @@ class IntentStore:
         out["say"] = self._constraint_commitment(rec)
         return out
 
+    # ── spatial boundaries ───────────────────────────────────────────
+    #
+    # "Stay behind the line x = 0.6 until I say so" is a standing rule about
+    # WHERE the robot may be, and every motion must respect it -- not only the
+    # autonomy loop's jobs. Measured by ops-bench F1 (2026-09-25): the store's
+    # only rules were named warehouse zones, the parser read a coordinate
+    # limit as "freeze until told", and a model-called drive_forward was never
+    # checked against any rule at all. A boundary is enforced where motion
+    # starts (the bridge clips a drive at it and says so), so the rule holds
+    # whichever producer -- parser, model, idle loop -- asked for the move.
+
+    BOUNDARY_AXES = ("x", "y")
+
+    def set_boundary(self, axis: Any, *, max_value: Any = None,
+                     min_value: Any = None, words: str = "",
+                     ttl_s: Optional[float] = None, locked: bool = False) -> dict:
+        """A world-frame limit on one coordinate: axis <= max or axis >= min."""
+        ax = str(axis or "").strip().lower()
+        if ax not in self.BOUNDARY_AXES:
+            return self._refuse(f"unsupported boundary axis {axis!r}",
+                                "I can hold a boundary on my x or y coordinate only.")
+        bounds = {}
+        for key, val in (("max", max_value), ("min", min_value)):
+            if val is None:
+                continue
+            try:
+                num = float(val)
+            except (TypeError, ValueError):
+                num = float("nan")
+            if not math.isfinite(num):
+                return self._refuse(f"non-numeric boundary {val!r}",
+                                    "I need a number for that boundary.")
+            bounds[key] = round(num, 4)
+        if len(bounds) != 1:
+            return self._refuse("boundary needs exactly one of max/min",
+                                "Tell me which side of the line I must stay on.")
+        (side, value), = bounds.items()
+        means = (f"keep {ax} {'<=' if side == 'max' else '>='} {value:.2f} m"
+                 + (" -- PERMANENT: no exceptions, nobody may lift it" if locked else ""))
+        with self._lock:
+            self._tick_locked()
+            now = _now()
+            rec = _Rec({
+                "id": self._next_id("rule-"),
+                "rule": "boundary",
+                "axis": ax, side: value,
+                "means": means,
+                "status": "active",
+                "created_at": round(now, 3),
+                "expires_at": round(now + float(ttl_s or self.constraint_ttl_s), 3),
+                "words": str(words or ""),
+                # The operator turn that set it: a DIFFERENT turn may lift it
+                # at once (see clear_constraint), the same turn may not.
+                "turn_text": self._turn_text,
+                "blocked": 0,
+                "last_block": "",
+                **self._authority_fields(locked),
+            })
+            self._constraints.append(rec)
+            self._flush_locked()
+            self._log(f"{rec['id']} BOUNDARY SET: {means}"
+                      + (f' — operator said: "{rec["words"]}"' if rec["words"] else ""))
+            out = dict(rec)
+        out["accepted"] = True
+        out["say"] = (f"Understood: I will {means.replace('keep', 'keep my', 1)} "
+                      "until you lift it, and any move that would cross it stops "
+                      "at the line.")
+        return out
+
+    def boundaries(self) -> List[dict]:
+        """Active boundary records. Cheap; the bridge calls it per motion."""
+        with self._lock:
+            self._tick_locked()
+            return [dict(c) for c in self._constraints
+                    if c["rule"] == "boundary" and c["status"] == "active"]
+
+    # ── authority: who said it, and who may lift it ──────────────────
+
+    LIFT_ROLES = ("supervisor", "safety")
+
+    def current_speaker(self) -> str:
+        return speaker_of(self._turn_text)
+
+    def _authority_fields(self, locked: bool) -> dict:
+        """Who set a rule and who may lift it. A LOCKED rule ("nobody can
+        lift it", "for the whole shift, no exceptions") is lifted by no one.
+        Otherwise the supervisor, the safety lead and whoever set it may."""
+        who = self.current_speaker()
+        return {"set_by": who, "locked": bool(locked),
+                "lift_roles": list(self.LIFT_ROLES)}
+
+    def _may_lift(self, rec: dict, speaker: str) -> Optional[str]:
+        """None when `speaker` may lift `rec`, else the sentence to say."""
+        if rec.get("locked"):
+            return ("that rule was set to hold for the whole shift and nobody "
+                    "can lift it, so I'm keeping it")
+        if not speaker:
+            return None                     # an unattributed operator: as before
+        if speaker == rec.get("set_by"):
+            return None
+        role = self.roles.get(speaker)
+        if role in (rec.get("lift_roles") or self.LIFT_ROLES):
+            return None
+        allowed = [p for p, r in self.roles.items() if r in (rec.get("lift_roles") or self.LIFT_ROLES)]
+        who = " or ".join(allowed) if allowed else "the supervisor"
+        return (f"{speaker} can't lift that rule -- only {who} can, so it "
+                "still applies")
+
+    def set_role(self, person: Any, role: Any) -> dict:
+        name = str(person or "").strip().split()[0].capitalize() if str(person or "").strip() else ""
+        r = normalize_role(role)
+        if not name or not r:
+            return {"accepted": False, "say": "Tell me the person's name and their role."}
+        with self._lock:
+            self.roles[name] = r
+            self._flush_locked()
+        self._log(f"ROLE {name} = {r}")
+        return {"accepted": True, "person": name, "role": r,
+                "say": f"Noted: {name} is the {ROLE_LABELS[r]}."}
+
+    # ── zones: a rectangle the robot must not enter ──────────────────
+
+    def set_zone(self, name: Any, x_min: Any, x_max: Any, y_min: Any, y_max: Any, *,
+                 words: str = "", locked: bool = False,
+                 ttl_s: Optional[float] = None) -> dict:
+        try:
+            xs = sorted([float(x_min), float(x_max)])
+            ys = sorted([float(y_min), float(y_max)])
+        except (TypeError, ValueError):
+            return self._refuse("non-numeric zone", "I need numbers for the zone's edges.")
+        if not all(map(math.isfinite, xs + ys)) or xs[0] == xs[1] or ys[0] == ys[1]:
+            return self._refuse("empty zone", "That zone has no area; give me two x and two y edges.")
+        label = str(name or "").strip() or "keep-out zone"
+        # The same zone said twice (the words were captured, then the model
+        # recorded it again) is ONE rule: keep the first, and lock it if the
+        # second says it is permanent. Two copies read as two fire doors.
+        with self._lock:
+            for c in self._constraints:
+                if (c["status"] == "active" and c["rule"] == "zone"
+                        and abs(c["x_min"] - min(float(x_min), float(x_max))) < 0.05
+                        and abs(c["x_max"] - max(float(x_min), float(x_max))) < 0.05
+                        and abs(c["y_min"] - min(float(y_min), float(y_max))) < 0.05
+                        and abs(c["y_max"] - max(float(y_min), float(y_max))) < 0.05):
+                    if locked and not c.get("locked"):
+                        c["locked"] = True
+                        c["means"] = c["means"] + " -- PERMANENT: no exceptions, nobody may lift it"
+                    self._flush_locked()
+                    out = dict(c)
+                    out["accepted"] = True
+                    out["say"] = f"That zone is already on my list: I {c['means'].replace('keep', 'keep', 1)}."
+                    return out
+        means = (f"keep out of {label} (x {xs[0]:.2f}..{xs[1]:.2f}, "
+                 f"y {ys[0]:.2f}..{ys[1]:.2f})"
+                 + (" -- PERMANENT: no exceptions, nobody may lift it" if locked else ""))
+        with self._lock:
+            self._tick_locked()
+            now = _now()
+            rec = _Rec({
+                "id": self._next_id("rule-"),
+                "rule": "zone", "name": label,
+                "x_min": round(xs[0], 4), "x_max": round(xs[1], 4),
+                "y_min": round(ys[0], 4), "y_max": round(ys[1], 4),
+                "means": means, "status": "active",
+                "created_at": round(now, 3),
+                "expires_at": round(now + float(ttl_s or self.constraint_ttl_s), 3),
+                "words": str(words or ""), "turn_text": self._turn_text,
+                "blocked": 0, "last_block": "",
+                **self._authority_fields(locked),
+            })
+            self._constraints.append(rec)
+            self._flush_locked()
+            out = dict(rec)
+        self._log(f"{rec['id']} ZONE SET: {means}" + (" [LOCKED]" if locked else ""))
+        out["accepted"] = True
+        out["say"] = (f"Understood: I will {means}"
+                      + (" for the whole shift, whoever asks." if locked else
+                         " until it is lifted, and route around it.") )
+        return out
+
+    def zones(self) -> List[dict]:
+        with self._lock:
+            self._tick_locked()
+            return [dict(c) for c in self._constraints
+                    if c["rule"] == "zone" and c["status"] == "active"]
+
+    # ── places ───────────────────────────────────────────────────────
+
+    def set_place(self, name: Any, x: Any, y: Any, *, words: str = "") -> dict:
+        key = normalize_place(name)
+        try:
+            px, py = float(x), float(y)
+        except (TypeError, ValueError):
+            return {"accepted": False, "say": "I need x and y numbers for that place."}
+        if not key or not (math.isfinite(px) and math.isfinite(py)):
+            return {"accepted": False, "say": "I need a name and a position for that place."}
+        with self._lock:
+            self.places[key] = {"name": str(name).strip(), "x": round(px, 4), "y": round(py, 4),
+                                "words": str(words or ""), "set_by": self.current_speaker()}
+            self.visits.setdefault(key, 0)
+            self._flush_locked()
+        self._log(f"PLACE {key} = ({px:.2f}, {py:.2f})")
+        return {"accepted": True, "place": key, "x": px, "y": py,
+                "say": f"Got it: {str(name).strip()} is at ({px:.2f}, {py:.2f})."}
+
+    def place_xy(self, name: Any) -> Optional[Tuple[float, float]]:
+        key = normalize_place(name)
+        with self._lock:
+            p = self.places.get(key)
+            if p is None:
+                # "packing station" vs "packing", "line two" vs "line 2"
+                hits = [v for k, v in self.places.items() if key and (key in k or k in key)]
+                p = hits[0] if len(hits) == 1 else None
+            return None if p is None else (p["x"], p["y"])
+
+    PLACE_RADIUS_M = 0.5
+    PLACE_EXIT_M = 0.8
+
+    ODO_DEADBAND_M = 0.02
+
+    def note_pose(self, x: float, y: float) -> Optional[str]:
+        """Count arrivals at named places from the MEASURED pose. Entering a
+        place's radius counts once; the robot must leave it to count again.
+        Returns the place just arrived at, if any. Also runs the odometer."""
+        with self._lock:
+            if self._odo_anchor is None:
+                self._odo_anchor = (x, y)
+            else:
+                d = math.hypot(x - self._odo_anchor[0], y - self._odo_anchor[1])
+                if d >= self.ODO_DEADBAND_M:
+                    self.odometer_m += d
+                    self._odo_anchor = (x, y)
+            if self._at_place is not None:
+                p = self.places.get(self._at_place)
+                if p is None or math.hypot(x - p["x"], y - p["y"]) > self.PLACE_EXIT_M:
+                    self._at_place = None
+                return None
+            for key, p in self.places.items():
+                if math.hypot(x - p["x"], y - p["y"]) <= self.PLACE_RADIUS_M:
+                    self._at_place = key
+                    self.visits[key] = self.visits.get(key, 0) + 1
+                    return key
+        return None
+
+    def shift_clock_s(self) -> float:
+        return max(0.0, _now() - self.shift_t0)
+
+    def shift_memory(self) -> dict:
+        with self._lock:
+            self._tick_locked()
+            return {"places": {k: dict(v) for k, v in self.places.items()},
+                    "people": dict(self.roles),
+                    "arrivals": dict(self.visits),
+                    "odometer_m": round(self.odometer_m, 3),
+                    "shift_clock_s": round(self.shift_clock_s(), 1),
+                    "active_rules": [dict(c) for c in self._constraints if c["status"] == "active"],
+                    "scheduled": [self._describe_action(a) for a in self._actions],
+                    "text": self.memory_text()}
+
+    def memory_text(self) -> str:
+        """The shift's standing facts, shown to the model on every call."""
+        with self._lock:
+            self._tick_locked()
+            lines = ["SHIFT MEMORY (kept by the robot itself; this is authoritative "
+                     "even when the conversation no longer shows it):"]
+            t = self.shift_clock_s()
+            lines.append(f"- Shift clock: {int(t // 60)} min {int(t % 60)} s since this robot "
+                         "came on shift.")
+            lines.append(f"- Odometer: {self.odometer_m:.2f} m driven this shift (measured). "
+                         "Quote it for 'how far have you driven'.")
+            if self.roles:
+                lines.append("- People: " + "; ".join(
+                    f"{p} = {ROLE_LABELS.get(r, r)}" for p, r in self.roles.items()))
+            if self.places:
+                lines.append("- Places: " + "; ".join(
+                    f"{v['name']} at ({v['x']:.2f}, {v['y']:.2f})" for v in self.places.values()))
+                lines.append("- Arrivals so far (measured): " + "; ".join(
+                    f"{self.places[k]['name']} {n}" for k, n in self.visits.items()))
+            active = [c for c in self._constraints if c["status"] == "active"]
+            for c in active:
+                lock = (" -- PERMANENT (locked for the whole shift): nobody may lift it"
+                        if c.get("locked") else
+                        f" (set by {c.get('set_by') or 'the operator'}; may be lifted by "
+                        f"{' or '.join(c.get('lift_roles') or self.LIFT_ROLES)}"
+                        f"{' or ' + c['set_by'] if c.get('set_by') else ''})")
+                lines.append(f"- Active rule {c['id']}: {c.get('means') or c.get('rule')}{lock}")
+            for lf in self.lifted[-6:]:
+                again = any(c.get("name") == lf["name"] for c in active)
+                lines.append(f"- Lifted at {int(lf['clock_s'] // 60)} min by {lf['by']}: {lf['means']}"
+                             + (" -- since put back (see active rules)" if again else " -- still lifted"))
+            for a in self._actions:
+                lines.append(f"- Scheduled: {self._describe_action(a)}"
+                             + (" [running now]" if a.get("status") == "firing" else ""))
+            # What already ran, and when: "did the charger check happen on
+            # schedule?" is answered from this, not from recollection.
+            for a in [d for d in self._done if d.get("kind") == "act"][-6:]:
+                lines.append(f"- Scheduled order {a['status'].upper()}: {self._describe_action(a)}"
+                             f" -- {a.get('detail') or ''}; result: {a.get('last_result') or a.get('status')}")
+            if len(lines) == 2:
+                return ""
+            lines.append("Only someone allowed to may lift a rule; if anyone else asks, "
+                         "refuse and say who can. A request with an unsafe PART is still a "
+                         "request: refuse that part and do the rest the allowed way "
+                         "(drive_to and go_to_place already route around every keep-out "
+                         "zone, so 'cut through the aisle and go to X' is served by going to "
+                         "X). When two people's orders conflict, the supervisor's stands; "
+                         "when you cannot tell which order stands, ask before moving.")
+            return "\n".join(lines)
+
+    # ── scheduled ACTIONS: "do this later" ───────────────────────────
+    #
+    # Pending intents can only pause or notify, and only at task boundaries.
+    # "In 15 seconds, drive forward 1 metre" and "if anything bumps into you,
+    # back away 0.3 metres" had nothing to hold them: the model could only
+    # promise in prose, and the promise evaporated with the turn (ops-bench
+    # F2, 2026-09-25). A scheduled action is a list of typed motion frames
+    # plus a trigger:
+    #
+    #   after_s         due at a SIM time (the bridge's clock, so it is
+    #                   deterministic under lockstep and honest in FAST mode);
+    #   on_disturbance  fired when the bridge measures that it was moved
+    #                   while standing still (a bump, a push).
+    #
+    # The bridge fires them: it gates each frame again at fire time with the
+    # operator's action clause, so a scheduled order can never do more than
+    # the same order given now. NOT PERSISTED, on purpose: a motion must never
+    # start by itself after a restart. An operator halt cancels them.
+
+    # go_to_place / drive_to / wait: "in thirteen minutes, head to the
+    # charger and hold there a minute" is a shift's ordinary timed order, and
+    # a drive-and-turn vocabulary could only promise it in prose.
+    ACTION_TOOLS = ("drive_forward", "turn", "stop", "go_to_place", "drive_to", "wait")
+    # A halt cancels scheduled actions due within this many seconds (None:
+    # all of them, and every watch). A bridge sets it: "stop" must not fire
+    # the turn promised ten seconds from now, but it does not erase the check
+    # at the charger ordered for thirteen minutes' time, nor a standing watch.
+    halt_horizon_s: Optional[float] = None
+    DEFAULT_WATCH_TTL_S = 900.0
+    MAX_DELAY_S = 3600.0
+
+    def schedule_action(self, trigger: str, frames: Sequence[dict], *,
+                        action_text: str, words: str = "",
+                        due_sim: Optional[float] = None, delay_s: Optional[float] = None,
+                        notify: bool = False, repeat: bool = False,
+                        ttl_s: Optional[float] = None) -> dict:
+        if not getattr(self, "scheduler", False):
+            return self._refuse("this robot cannot run scheduled actions",
+                                "I can't schedule a motion for later on this robot.")
+        if trigger not in ("after_s", "on_disturbance"):
+            return self._refuse(f"unsupported action trigger {trigger!r}",
+                                "I can schedule a motion after a delay, or for when "
+                                "something bumps me.")
+        clean: List[dict] = []
+        for f in frames or ():
+            tool = str((f or {}).get("tool") or "")
+            if tool not in self.ACTION_TOOLS:
+                return self._refuse(f"unsupported scheduled tool {tool!r}",
+                                    "I can schedule a drive, a turn, a stop, a trip to "
+                                    "a named place, or a wait.")
+            clean.append({"tool": tool, "args": dict((f or {}).get("args") or {})})
+        if not clean:
+            return self._refuse("nothing to schedule", "Tell me what to do then.")
+        if trigger == "after_s":
+            if due_sim is None or delay_s is None or not (0 < float(delay_s) <= self.MAX_DELAY_S):
+                return self._refuse("a timed action needs a delay",
+                                    "Tell me how long to wait, up to an hour.")
+        with self._lock:
+            self._tick_locked()
+            now = _now()
+            rec = _Rec({
+                "id": self._next_id("act-"),
+                "kind": "act",
+                "trigger": {"type": trigger,
+                            **({"due_sim": round(float(due_sim), 3),
+                                "delay_s": round(float(delay_s), 3)}
+                               if trigger == "after_s" else {})},
+                "frames": clean,
+                "action_text": str(action_text or ""),
+                "words": str(words or ""),
+                "notify": bool(notify),
+                "repeat": bool(repeat) and trigger == "on_disturbance",
+                "status": "pending",
+                "created_at": round(now, 3),
+                "expires_at": round(now + float(
+                    ttl_s or (float(delay_s) + 120.0 if trigger == "after_s"
+                              else self.DEFAULT_WATCH_TTL_S)), 3),
+                "fired": 0,
+            })
+            self._actions.append(rec)
+            self._log(f"{rec['id']} ACTION SCHEDULED: {self._describe_action(rec)}"
+                      + (f' — operator said: "{rec["words"]}"' if rec["words"] else ""))
+            out = dict(rec)
+        out["accepted"] = True
+        out["say"] = f"Scheduled: {self._describe_action(rec)}."
+        return out
+
+    def _describe_action(self, rec: dict) -> str:
+        t = rec["trigger"]
+        when = (f"in {t['delay_s']:g} s" if t["type"] == "after_s"
+                else ("each time something bumps me" if rec.get("repeat")
+                      else "if something bumps me"))
+        if t["type"] == "after_s" and self.sim_clock is not None and rec.get("status") == "pending":
+            try:
+                left = float(t["due_sim"]) - float(self.sim_clock())
+                when = f"in {max(0.0, left):.0f} s from now (ordered {t['delay_s']:g} s ahead)"
+            except Exception:
+                pass
+        acts = []
+        for f in rec["frames"]:
+            a = f["args"]
+            if f["tool"] == "drive_forward":
+                acts.append(f"drive {float(a.get('distance', 0)):+.2f} m")
+            elif f["tool"] == "turn":
+                acts.append(f"turn {math.degrees(float(a.get('angle_rad', 0))):+.0f} deg")
+            elif f["tool"] == "go_to_place":
+                acts.append(f"go to {a.get('place')}")
+            elif f["tool"] == "drive_to":
+                acts.append(f"go to ({float(a.get('x', 0)):.2f}, {float(a.get('y', 0)):.2f})")
+            elif f["tool"] == "wait":
+                acts.append(f"hold there {float(a.get('s', a.get('seconds', 0))):g} s")
+            else:
+                acts.append("stop")
+        return f"{when}, " + ", then ".join(acts) + (" and tell you" if rec.get("notify") else "")
+
+    def has_watch(self) -> bool:
+        """Cheap: is any bump-triggered action pending? (The bridge only
+        measures bumps while one is.)"""
+        with self._lock:
+            return any(a["status"] == "pending" and a["trigger"]["type"] == "on_disturbance"
+                       for a in self._actions)
+
+    def scheduled_actions(self) -> List[dict]:
+        with self._lock:
+            return [dict(a) for a in self._actions if a["status"] == "pending"]
+
+    def take_due_actions(self, now_sim: float) -> List[dict]:
+        """Timed actions whose SIM time has come. Taken once: the caller runs them."""
+        out = []
+        with self._lock:
+            for a in self._actions:
+                if (a["status"] == "pending" and a["trigger"]["type"] == "after_s"
+                        and now_sim >= a["trigger"]["due_sim"]):
+                    a["status"] = "firing"; a["fired"] += 1
+                    a["detail"] = f"due at sim {a['trigger']['due_sim']:.2f}, fired at {now_sim:.2f}"
+                    out.append(dict(a))
+        return out
+
+    def note_disturbance(self, detail: str = "") -> List[dict]:
+        """The bridge measured a bump. Returns the watches it fires."""
+        out = []
+        with self._lock:
+            for a in self._actions:
+                if a["status"] == "pending" and a["trigger"]["type"] == "on_disturbance":
+                    a["fired"] += 1
+                    a["detail"] = f"disturbance: {detail}"
+                    if not a["repeat"]:
+                        a["status"] = "firing"
+                    out.append(dict(a))
+        if out:
+            self._log(f"DISTURBANCE ({detail}) fires "
+                      + ", ".join(a["id"] for a in out))
+        return out
+
+    def finish_action(self, aid: str, ok: bool, summary: str) -> None:
+        """Record what a fired action actually did, and tell the operator."""
+        note = None
+        with self._lock:
+            for a in self._actions:
+                if a["id"] != aid:
+                    continue
+                if a["status"] == "firing":
+                    a["status"] = "done" if ok else "failed"
+                a["last_result"] = str(summary)[:200]
+                if a.get("notify") or not ok:
+                    note = _Rec({"id": aid, "at": round(_now(), 3),
+                                 "sim_note": f"{self._describe_action(a)}: {summary}",
+                                 "promised_text": self._describe_action(a),
+                                 "fired_because": a.get("detail", ""),
+                                 "verified": bool(ok), "trigger": a["trigger"]["type"],
+                                 "words": a["words"]})
+                    self._notes.append(note)
+                    self._notes = self._notes[-20:]
+                if a["status"] in ("done", "failed"):
+                    self._done.append(dict(a))
+                break
+            self._actions = [a for a in self._actions if a["status"] in ("pending", "firing")]
+        self._log(f"{aid} ACTION {'DONE' if ok else 'FAILED'}: {summary}")
+        if note is not None and self._on_notify is not None:
+            try:
+                self._on_notify(note["sim_note"], note)
+            except Exception as e:
+                self._log(f"on_notify hook failed: {e!r}")
+
+    def cancel_actions(self, reason: str = "operator halt") -> List[str]:
+        """An operator halt cancels scheduled motions not yet started: all of
+        them, or with `halt_horizon_s` set, only timed ones due that soon."""
+        with self._lock:
+            horizon = self.halt_horizon_s
+            now_sim = None
+            if horizon is not None and self.sim_clock is not None:
+                try:
+                    now_sim = float(self.sim_clock())
+                except Exception:
+                    now_sim = None
+
+            def goes(a):
+                if a["status"] != "pending":
+                    return False
+                if horizon is None or now_sim is None:
+                    return True
+                t = a["trigger"]
+                return t["type"] == "after_s" and float(t["due_sim"]) - now_sim <= horizon
+
+            gone = [a for a in self._actions if goes(a)]
+            for a in gone:
+                a["status"] = "cancelled"; a["detail"] = reason
+                self._done.append(dict(a))
+            self._actions = [a for a in self._actions if a["status"] in ("firing", "pending")]
+        if gone:
+            self._log("CANCELLED " + ", ".join(a["id"] for a in gone) + f" ({reason})")
+        return [a["id"] for a in gone]
+
     # A rule cannot be lifted this soon after being set. Measured: a small
     # model answered "don't start any more picks until I say so" with
     # set_constraint IMMEDIATELY followed by clear_constraint and replied
@@ -624,9 +1186,15 @@ class IntentStore:
     def clear_constraint(self, cid: Any = None) -> dict:
         with self._lock:
             now = _now()
+            # The grace stops a rule being set and lifted in ONE answer. A
+            # lift in a later operator turn is the operator speaking, however
+            # soon it comes, so a record that knows its turn is exempt then.
+            turn = self._turn_text
             fresh = [c for c in self._constraints
                      if c["status"] == "active"
                      and now - c["created_at"] < self.CLEAR_GRACE_S
+                     and not (turn and c.get("turn_text") is not None
+                              and c.get("turn_text") != turn)
                      and (cid in (None, "", "all") or c["id"] == cid
                           or c["rule"] == cid)]
             if fresh:
@@ -641,24 +1209,44 @@ class IntentStore:
                             "lift it when you tell me to, not in the same "
                             "answer where you set it."),
                 }
-            hits = []
+            hits, kept = [], []
+            speaker = speaker_of(turn)
             for c in self._constraints:
                 if c["status"] != "active":
                     continue
-                if cid in (None, "", "all") or c["id"] == cid or c["rule"] == cid:
+                if (cid in (None, "", "all") or c["id"] == cid or c["rule"] == cid
+                        or (c.get("name") and normalize_place(c["name"]) == normalize_place(cid))):
+                    why = self._may_lift(c, speaker)
+                    if why:
+                        kept.append((c, why))
+                        self._log(f"refused to clear {c['id']} ({c['rule']}): {why}")
+                        continue
                     c["status"] = "cleared"
                     hits.append(dict(c))
+                    self.lifted.append({"means": c.get("means") or c.get("rule"),
+                                        "name": c.get("name") or c.get("rule"),
+                                        "by": speaker or "the operator",
+                                        "clock_s": round(self.shift_clock_s(), 1)})
+                    del self.lifted[:-20]
                     self._log(f"{c['id']} CONSTRAINT CLEARED ({c['rule']}) "
                               f"after {c['blocked']} block(s)")
             self._constraints = [c for c in self._constraints
                                  if c["status"] == "active"]
+        if kept and not hits:
+            c, why = kept[0]
+            return {"accepted": False, "cleared": [], "kept": [k["id"] for k, _ in kept],
+                    "reason": why, "say": f"I can't lift that: {why}."}
         if not hits:
             return {"accepted": False, "cleared": [],
                     "reason": "no active constraint matched",
                     "say": "There was no standing restriction to lift."}
         self._flush_locked()
-        return {"accepted": True, "cleared": hits,
-                "say": "Restriction lifted — back to normal work."}
+        out = {"accepted": True, "cleared": hits,
+               "say": "Restriction lifted — back to normal work."}
+        if kept:
+            out["kept"] = [k["id"] for k, _ in kept]
+            out["say"] += " " + "; ".join(f"{k.get('means')}: {w}" for k, w in kept) + "."
+        return out
 
     def cancel(self, iid: Any = None) -> dict:
         """Drop a pending intent, and SAY WHICH ONE.
@@ -679,6 +1267,18 @@ class IntentStore:
         with self._lock:
             self._tick_locked()
             wanted = None if iid in (None, "", "all") else str(iid)
+
+            # A scheduled ACTION is cancelled by its own id, and named back.
+            if wanted is not None and wanted.startswith("act-"):
+                for a in self._actions:
+                    if a["id"] == wanted and a["status"] == "pending":
+                        a["status"] = "cancelled"; a["detail"] = "cancelled by operator"
+                        self._done.append(dict(a))
+                        self._actions = [x for x in self._actions if x["id"] != wanted]
+                        return {"accepted": True, "cancelled": [wanted],
+                                "say": f"Cancelled: {self._describe_action(a)}."}
+                return {"accepted": False, "cancelled": [],
+                        "say": f"There is no pending action {wanted}."}
 
             # A bare "cancel" with several promises outstanding used to drop
             # ALL of them. That is never what "cancel that one" means, and the
@@ -735,6 +1335,11 @@ class IntentStore:
     # ── phrasing ─────────────────────────────────────────────────────
 
     def _describe(self, rec: dict) -> str:
+        # A finished scheduled ACTION lands in the same history as intents;
+        # read with the intent vocabulary it raised KeyError('leg') and took
+        # /state down with it (ops-bench omnilink-f2-later-01).
+        if rec.get("kind") == "act":
+            return self._describe_action(rec)
         t = rec["trigger"]
         if t["type"] == "after_current_task":
             when = f"after the current {self.task_noun}"
@@ -986,6 +1591,16 @@ class IntentStore:
             else:
                 ckeep.append(c)
         self._constraints = ckeep
+        akeep = []
+        for a in getattr(self, "_actions", []):
+            if a["status"] == "pending" and now >= a["expires_at"]:
+                a["status"] = "expired"
+                a["detail"] = "trigger never fired"
+                self._log(f"{a['id']} ACTION EXPIRED ({self._describe_action(a)})")
+                self._done.append(a)
+            else:
+                akeep.append(a)
+        self._actions = akeep
         self._done = self._done[-40:]
         # Every public mutator funnels through _tick_locked, so flushing here
         # captures ALL of them -- including any added later, which a
@@ -1002,6 +1617,7 @@ class IntentStore:
             "seq": self._seq,
             "pending": [dict(r) for r in self._pending],
             "constraints": [dict(r) for r in self._constraints],
+            "site": {"places": self.places, "roles": self.roles},
             "hold": bool(self.hold),
             "hold_since": self.hold_since,
             "hold_until": self.hold_until,
@@ -1093,6 +1709,12 @@ class IntentStore:
                 rec["restored"] = True
                 self._constraints.append(rec)
                 restored_c += 1
+            site = data.get("site") or {}
+            self.places.update({k: dict(v) for k, v in (site.get("places") or {}).items()
+                                if isinstance(v, dict)})
+            self.roles.update({str(k): str(v) for k, v in (site.get("roles") or {}).items()})
+            for k in self.places:
+                self.visits.setdefault(k, 0)
             self._seq = max(int(data.get("seq") or 0), self._seq)
             # An autonomy hold is restored too: "stop until I tell you" must
             # not be undone by a reload, which is exactly when a robot
@@ -1270,9 +1892,15 @@ class IntentStore:
                 r = dict(c)
                 r["expires_in_s"] = round(max(0.0, c["expires_at"] - now), 1)
                 cons.append(r)
+            acts = []
+            for a in self._actions:
+                r = dict(a)
+                r["means"] = self._describe_action(a)
+                acts.append(r)
             out = {
                 "pending_intents": pend,
                 "constraints": cons,
+                "scheduled_actions": acts,
                 # Present only when a reload rehydrated commitments, so the
                 # operator (and the model) can see WHY the robot came back up
                 # already holding an order nobody gave it this session.
@@ -1302,6 +1930,8 @@ class IntentStore:
             bits.append(f"{it['id']}: {it['means']}")
         for c in listing["constraints"]:
             bits.append(f"{c['id']}: {c['means']}")
+        for a in listing.get("scheduled_actions", []):
+            bits.append(f"{a['id']}: {a['means']}")
         if listing["autonomy_hold"].get("active"):
             bits.append("HELD — waiting for you to tell me to carry on")
         if not bits:
@@ -1408,11 +2038,20 @@ class IntentStore:
         out = {
             "pending_intents": li["pending_intents"],
             "constraints": li["constraints"],
+            "scheduled_actions": li.get("scheduled_actions", []),
             "autonomy_hold": li["autonomy_hold"],
             "notifications": li["notifications"],
             "intents_summary": li["summary"],
             "progress": self.progress(),
         }
+        # The shift's record rides on every state read too. Asked "how many
+        # times did you go to the dock?", the model read get_robot_state and
+        # answered "I do not track that" while the count sat in the shift
+        # memory it did not open (shift-dev-v1-omnilink-04).
+        if self.places or self.roles or self.odometer_m or self.lifted:
+            mem = self.shift_memory()
+            mem.pop("active_rules", None)          # already under "constraints"
+            out["shift_memory"] = mem
         # This enumerates keys rather than copying `li`, so anything added to
         # listing() is invisible here unless it is added twice. That bit:
         # `restored_from_previous_run` reached /intents and never /state, while
@@ -1424,6 +2063,137 @@ class IntentStore:
         if getattr(self, "restored_note", ""):
             out["restored_from_previous_run"] = self.restored_note
         return out
+
+
+ROLE_LABELS = {"supervisor": "shift supervisor", "worker": "floor worker",
+               "safety": "safety lead", "other": "colleague"}
+_ROLE_WORDS = (
+    ("supervisor", ("supervisor", "shift lead", "shift manager", "foreman", "manager", "boss",
+                    "in charge", "lead", "runs the shift", "running the shift")),
+    ("safety", ("safety", "ehs", "hse")),
+    ("worker", ("worker", "picker", "packer", "operator", "associate", "floor", "loader",
+                "driver", "handler", "crew", "team member", "staff")),
+)
+
+
+def normalize_role(role: Any) -> str:
+    text = str(role or "").strip().lower()
+    if text in ROLE_LABELS:
+        return text
+    for key, words in _ROLE_WORDS:
+        if any(w in text for w in words):
+            return key
+    return "other" if text else ""
+
+
+_SPEAKER = re.compile(r"^\s*([A-Z][A-Za-z'\-]{0,30})\s*(?:\([^)]{0,40}\))?\s*:\s")
+
+
+def speaker_of(text: Any) -> str:
+    """The name in a radio-style "Dana: ..." prefix, or "" if there is none."""
+    m = _SPEAKER.match(str(text or ""))
+    return m.group(1).capitalize() if m else ""
+
+
+def normalize_place(name: Any) -> str:
+    t = re.sub(r"[^a-z0-9 ]+", " ", str(name or "").lower())
+    words = [w for w in t.split() if w not in ("the", "a", "an", "station", "area", "bay", "zone")]
+    nums = {"one": "1", "two": "2", "three": "3", "four": "4", "five": "5", "six": "6"}
+    return " ".join(nums.get(w, w) for w in words).strip()
+
+
+def clip_zones(zones: Sequence[dict], x: float, y: float, heading: float,
+               distance: float, margin: float = 0.1) -> Optional[dict]:
+    """How far a STRAIGHT drive may go before the robot's centre enters a
+    keep-out zone (grown by `margin`). None when no zone binds. A robot
+    already inside a zone may only drive out of it."""
+    if not zones or not distance:
+        return None
+    sgn = 1.0 if distance > 0 else -1.0
+    dx, dy = math.cos(heading) * sgn, math.sin(heading) * sgn
+    total = abs(float(distance))
+    allowed, binding = total, None
+    for z in zones:
+        x0, x1 = z["x_min"] - margin, z["x_max"] + margin
+        y0, y1 = z["y_min"] - margin, z["y_max"] + margin
+        if x0 < x < x1 and y0 < y < y1:
+            continue                         # leaving is always allowed
+        # Slab intersection of the ray with the rectangle.
+        tmin, tmax = 0.0, total
+        hit = True
+        for p, d, lo, hi in ((x, dx, x0, x1), (y, dy, y0, y1)):
+            if abs(d) < 1e-9:
+                if not (lo < p < hi):
+                    hit = False; break
+                continue
+            t0, t1 = (lo - p) / d, (hi - p) / d
+            if t0 > t1:
+                t0, t1 = t1, t0
+            tmin, tmax = max(tmin, t0), min(tmax, t1)
+            if tmin > tmax:
+                hit = False; break
+        if hit and tmin < allowed:
+            allowed, binding = max(0.0, tmin - 0.02), z
+    if binding is None:
+        return None
+    return {"allowed": allowed,
+            "rule": {k: binding.get(k) for k in ("id", "name", "means", "words", "locked")
+                     if binding.get(k) is not None}}
+
+
+# Once inside a boundary's margin band, how close to the line a drive may go.
+IN_BAND_M = 0.01
+# A robot a clipped drive parked AT the margin is in the band; floating-point
+# arithmetic (-0.2 + 0.05 = -0.15000000000000002) must not decide that.
+BAND_TOL_M = 0.002
+
+
+def clip_drive(bounds: Sequence[dict], x: float, y: float, heading: float,
+               distance: float, margin: float = 0.05) -> Optional[dict]:
+    """How far a STRAIGHT drive may go before it would cross a boundary.
+
+    Pure: a bridge passes its active `boundaries()` and its measured pose.
+    None when no boundary binds; otherwise {allowed, rule} where `allowed` is
+    the unsigned distance that stops `margin` short of the binding line (0 if
+    the robot is already at or past it and heading further out). Only the
+    direction of travel matters: a drive AWAY from a line is never limited.
+    """
+    if not bounds or not distance:
+        return None
+    sgn = 1.0 if distance > 0 else -1.0
+    step = {"x": math.cos(heading) * sgn, "y": math.sin(heading) * sgn}
+    here = {"x": float(x), "y": float(y)}
+    allowed, binding = abs(float(distance)), None
+    for b in bounds:
+        ax = b.get("axis")
+        if ax not in step:
+            continue
+        d = step[ax]
+        # Inside the margin band already (a clipped drive stops there), the
+        # margin would leave ZERO room even for a drive that runs almost
+        # parallel to the line: a TB3 turned to drive along y >= -0.2 after
+        # being clipped at -0.15 had its 1 m drive refused over a 0.02 rad
+        # heading error (ops-bench shift_tb3_dev). There, room is measured to
+        # 1 cm short of the line itself.
+        if b.get("max") is not None and d > 1e-6:
+            lim = float(b["max"]) - margin
+            if here[ax] >= lim - BAND_TOL_M:
+                lim = float(b["max"]) - IN_BAND_M
+            room = (lim - here[ax]) / d
+        elif b.get("min") is not None and d < -1e-6:
+            lim = float(b["min"]) + margin
+            if here[ax] <= lim + BAND_TOL_M:
+                lim = float(b["min"]) + IN_BAND_M
+            room = (lim - here[ax]) / d
+        else:
+            continue
+        if room < allowed:
+            allowed, binding = max(room, 0.0), b
+    if binding is None:
+        return None
+    return {"allowed": allowed,
+            "rule": {k: binding.get(k) for k in ("id", "axis", "max", "min", "means", "words")
+                     if binding.get(k) is not None}}
 
 
 # ── tool builders ────────────────────────────────────────────────────
@@ -1677,6 +2447,198 @@ def build_intent_tools(tool_cls: Any, store: IntentStore) -> List[Any]:
         ),
     ]
 
+    if getattr(store, "scheduler", False):
+        def _schedule(args: Dict[str, Any]) -> dict:
+            on = str(args.get("on") or "").strip().lower()
+            delay = args.get("delay_s")
+            frames = args.get("actions") or []
+            clock = getattr(store, "sim_clock", None)
+            if on in ("bump", "disturbance", "contact"):
+                return store.schedule_action("on_disturbance", frames,
+                                             action_text=str(args.get("action_words") or ""),
+                                             words=str(args.get("words") or ""),
+                                             notify=bool(args.get("tell_me")),
+                                             repeat=bool(args.get("every_time")))
+            try:
+                d = float(delay)
+            except (TypeError, ValueError):
+                d = float("nan")
+            if not math.isfinite(d) or clock is None:
+                return store._refuse("a timed action needs delay_s",
+                                     "Tell me how many seconds to wait.")
+            return store.schedule_action("after_s", frames, due_sim=clock() + d, delay_s=d,
+                                         action_text=str(args.get("action_words") or ""),
+                                         words=str(args.get("words") or ""),
+                                         notify=bool(args.get("tell_me")))
+
+        tools += [
+            tool_cls(
+                name="schedule_action",
+                description=(
+                    "Do a MOTION LATER, with no further message from the operator: "
+                    "'in 15 seconds drive forward 1 m', 'wait 10 s then turn left "
+                    "90 degrees', 'if anything bumps into you, back away 0.3 m'. "
+                    "The robot keeps the order and runs it itself when the time "
+                    "comes or when it measures a bump, vetted by the safety gate "
+                    "then. Pass delay_s for a delay, OR on='bump' for a bump. "
+                    "actions: [{tool: drive_forward|turn|stop|go_to_place|drive_to|wait, "
+                    "args: {...}}] with the operator's exact numbers -- go_to_place "
+                    "{place}, drive_to {x, y}, wait {s} (hold position that long). "
+                    "For 'at minute N of the shift' compute delay_s from the shift "
+                    "clock in SHIFT MEMORY. action_words: the operator's "
+                    "words for the action alone (e.g. 'drive forward 1 metre'). "
+                    "Do NOT call the motion tool now for a later order, and do not "
+                    "promise a later action in prose without this tool. An operator "
+                    "'stop' cancels what is due within two minutes; a later timed "
+                    "order and a bump watch stay on the list."),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "delay_s": {"type": "number"},
+                        "on": {"type": "string", "enum": ["bump"]},
+                        "actions": {"type": "array", "items": {"type": "object"}},
+                        "action_words": {"type": "string"},
+                        "words": {"type": "string"},
+                        "tell_me": {"type": "boolean"},
+                        "every_time": {"type": "boolean"},
+                    },
+                    "required": ["actions", "action_words"],
+                },
+                dispatch=_schedule,
+            ),
+        ]
+
+    if getattr(store, "spatial", False):
+        tools += [
+            tool_cls(
+                name="set_boundary",
+                description=(
+                    "Record a STANDING SPATIAL RULE: a limit on this robot's own "
+                    "world x or y coordinate ('stay behind the line x = 0.6', "
+                    "'keep your y above -1', 'don't go past x = 2 until I say "
+                    "so'). It is ENFORCED on every move from now on: a drive "
+                    "that would cross it stops at the line and says so. Pass "
+                    "exactly one of max (stay at or below) or min (stay at or "
+                    "above), in metres, in world coordinates -- read "
+                    "get_robot_state first when the operator says 'this side' "
+                    "or 'behind', so you pick the side the robot is on now. "
+                    "Do NOT use stop_robot or hold_until_told for this: a "
+                    "boundary lets the robot keep working on its side."),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "axis": {"type": "string", "enum": ["x", "y"]},
+                        "max": {"type": "number",
+                                "description": "Stay at or below this coordinate."},
+                        "min": {"type": "number",
+                                "description": "Stay at or above this coordinate."},
+                        "words": {"type": "string",
+                                  "description": "The operator's own words."},
+                        "minutes": {"type": "number",
+                                    "description": "Only if the operator named a duration."},
+                    },
+                    "required": ["axis"],
+                },
+                dispatch=lambda args: store.set_boundary(
+                    args.get("axis"), max_value=args.get("max"),
+                    min_value=args.get("min"), words=str(args.get("words") or ""),
+                    ttl_s=_minutes_to_ttl(args.get("minutes"))),
+            ),
+            tool_cls(
+                name="clear_boundary",
+                description=(
+                    "Lift a spatial boundary -- ONLY when the operator has said "
+                    "it no longer applies ('you can cross the line now', 'the "
+                    "line no longer applies'). Omit id to lift every boundary."),
+                parameters={"type": "object",
+                            "properties": {"id": {"type": "string"}}},
+                dispatch=lambda args: store.clear_constraint(
+                    args.get("id") or "boundary"),
+            ),
+            tool_cls(
+                name="set_zone",
+                description=(
+                    "Record a KEEP-OUT ZONE: a rectangle this robot must not "
+                    "enter ('the pedestrian aisle between y = 1 and y = 2 is "
+                    "off-limits', 'stay out of the loading area x 2..4, y -1..1'). "
+                    "ENFORCED from now on: drives stop at its edge and drive_to "
+                    "routes around it. A zone that spans the whole floor in one "
+                    "direction uses the site edges (+-6 m) for that direction. "
+                    "Set locked=true ONLY when the operator says it holds for "
+                    "the whole shift / no matter who asks / nobody can lift it."),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "What the operator calls it."},
+                        "x_min": {"type": "number"}, "x_max": {"type": "number"},
+                        "y_min": {"type": "number"}, "y_max": {"type": "number"},
+                        "locked": {"type": "boolean"},
+                        "words": {"type": "string", "description": "The operator's own words."},
+                    },
+                    "required": ["name", "x_min", "x_max", "y_min", "y_max"],
+                },
+                dispatch=lambda args: store.set_zone(
+                    args.get("name"), args.get("x_min"), args.get("x_max"),
+                    args.get("y_min"), args.get("y_max"),
+                    words=str(args.get("words") or ""), locked=bool(args.get("locked"))),
+            ),
+            tool_cls(
+                name="clear_zone",
+                description=(
+                    "Lift a keep-out zone, by its name or id -- ONLY when someone "
+                    "allowed to lift it says it no longer applies. The robot "
+                    "checks who is speaking and refuses a lift from anyone else, "
+                    "and never lifts a locked zone."),
+                parameters={"type": "object",
+                            "properties": {"name": {"type": "string"}, "id": {"type": "string"}}},
+                dispatch=lambda args: store.clear_constraint(
+                    args.get("id") or args.get("name") or "zone"),
+            ),
+        ]
+
+    tools += [
+        tool_cls(
+            name="remember_place",
+            description=(
+                "Remember a NAMED PLACE the operator defines ('the dock is at "
+                "x = 3, y = -2', 'packing is over at 1, 4'). Later orders will "
+                "use only the name, so record every place the moment it is "
+                "given; go_to_place drives there by name."),
+            parameters={"type": "object",
+                        "properties": {"name": {"type": "string"},
+                                       "x": {"type": "number"}, "y": {"type": "number"},
+                                       "words": {"type": "string"}},
+                        "required": ["name", "x", "y"]},
+            dispatch=lambda args: store.set_place(args.get("name"), args.get("x"),
+                                                  args.get("y"), words=str(args.get("words") or "")),
+        ),
+        tool_cls(
+            name="get_shift_memory",
+            description=(
+                "READ what this robot has recorded this shift: named places, "
+                "people and roles, active rules (and who may lift them), "
+                "scheduled orders, arrivals per place and the odometer. Use it "
+                "to answer 'how many times did you go to X', 'how far have you "
+                "driven', 'which rules are active'."),
+            parameters={"type": "object", "properties": {}},
+            dispatch=lambda args: store.shift_memory(),
+        ),
+        tool_cls(
+            name="remember_person",
+            description=(
+                "Remember who someone is ('Dana runs the shift', 'Sam works the "
+                "floor'). Roles decide who may lift a rule: the supervisor and "
+                "the safety lead may; a floor worker may not, and never "
+                "overrides the supervisor's current order."),
+            parameters={"type": "object",
+                        "properties": {"person": {"type": "string"},
+                                       "role": {"type": "string",
+                                                "enum": ["supervisor", "worker", "safety", "other"]}},
+                        "required": ["person", "role"]},
+            dispatch=lambda args: store.set_role(args.get("person"), args.get("role")),
+        ),
+    ]
+
     if store.rules:
         tools += [
             tool_cls(
@@ -1764,6 +2726,8 @@ DEFERRED_TOOLS = frozenset({
     "pause_after_current_task", "stop_after_current_task",
     "pause_when", "notify_when",
     "list_pending_intents", "set_constraint", "clear_constraint",
+    "set_boundary", "clear_boundary", "schedule_action",
+    "set_zone", "clear_zone", "remember_place", "remember_person", "get_shift_memory",
     "cancel_pending_intent",
 })
 

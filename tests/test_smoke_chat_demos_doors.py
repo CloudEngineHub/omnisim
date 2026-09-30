@@ -745,7 +745,11 @@ def test_the_port_and_robot_come_from_the_world_not_a_constant():
         pytest.skip("chat worlds not present")
     assert sweep.port_of(husky) == 8765
     assert sweep.robot_of(husky) == "husky"
-    mavic = next((p for p in sweep.WORLDS.glob("*mavic*.omniworld")), None)
+    # Hidden drafts (".draft_*") are skipped, exactly as the sweep's own
+    # discovery skips them: a local .draft_omnilink_mavic_arena on port 6190
+    # used to be picked here instead of the catalogued Mavic demo.
+    mavic = next((p for p in sorted(sweep.WORLDS.glob("*mavic*.omniworld"))
+                  if not p.name.startswith(".")), None)
     if mavic is not None:
         assert sweep.port_of(mavic) == 6090     # NOT the 8765 default
 

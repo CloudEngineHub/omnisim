@@ -123,6 +123,42 @@ _LAUNCH_DBG = _os.environ.get("OMNISIM_DEBUG_LAUNCH")
 # Probe 6 (mini-husky) drove 4.05 m / 5 s = 98%; probe 7 (real husky URDF
 # geometry) drove 4.04 m / 10 s = 97.8% with this exact config.
 
+
+def _mjwarp_cpu_fallback_reason(solver_pref, env_forces_mjwarp, cuda_device_count):
+    """Why a world's newtonSolver "mujoco_warp" must run on CPU mj_step, or None.
+
+    The GPU solver needs a CUDA device. Without one, warp does not refuse -- it
+    quietly JIT-compiles the mujoco_warp kernels for its CPU device, the model
+    finalizes on "cpu" and the first physics step lands minutes later, then
+    steps crawl. External report, 2026-08-29 (Windows 11, Intel Arc, no CUDA):
+    warehouse_husky, the quickstart's first demo and until then the only demo
+    world pinned to mujoco_warp, FAILED `run-headless --until-finalized` on a
+    healthy install -- finalised, zero steps inside the 10 s CPU budget -- and
+    reached step 960 only in a 200 s window.
+
+    The world file asks for the GPU path as a SPEED choice (the comments in it
+    say so: identical SolverMuJoCo setup, faster fast-forward on CUDA), so with
+    no CUDA device the reference CPU mj_step is the faithful substitute -- it
+    is what every unpinned world runs. This is the fallback the solver
+    construction comment has long described ("falls back to CPU mj_step ...")
+    but that never fired, because warp CAN init on a CUDA-less machine.
+
+    Only the WORLD FILE's preference is downgraded. OMNISIM_NEWTON_MJWARP=1 is
+    an explicit operator request (trainer parity) and is honoured as before,
+    CPU device or not. An unknown CUDA count (None: the query itself failed)
+    changes nothing.
+    """
+    if solver_pref != "mujoco_warp" or env_forces_mjwarp:
+        return None
+    if cuda_device_count is None or cuda_device_count > 0:
+        return None
+    return ("newtonSolver \"mujoco_warp\" needs a CUDA device and warp reports none "
+            "(cuda device count 0): running the reference CPU mj_step instead -- the "
+            "same SolverMuJoCo setup, without the GPU fast-forward. Set "
+            "OMNISIM_NEWTON_MJWARP=1 to force mujoco_warp onto the CPU device anyway "
+            "(slow: warp compiles its kernels for the CPU before the first step).")
+
+
 def _fast_find_shape_contact_pairs(builder, model, *, allow_filter_blocks, orig, static_bodies=()):
     """Vectorised stand-in for newton's ModelBuilder._find_shape_contact_pairs.
 
@@ -3431,7 +3467,18 @@ class World:
                             target_ke=0.0, target_kd=0.0,
                             limit_lower=0.0, limit_upper=0.0,
                             effort_limit=0.0, velocity_limit=0.0,
-                            initial_q=0.0):
+                            initial_q=0.0,
+                            child_rot_x=0.0, child_rot_y=0.0,
+                            child_rot_z=0.0, child_rot_w=1.0):
+        # child_rot (2026-09-27): the child's authored rotation relative to its
+        # joint parent (R_child^T * R_parent), the same quaternion
+        # add_joint_revolute takes. Before this a slider's child_xform had NO
+        # rotation, so a finger authored at 90 deg to its gripper base was
+        # registered at the base's orientation (1.5708 rad off on a minimal
+        # probe) while its slide readback stayed correct. The arguments come
+        # AFTER initial_q, unlike the revolute, so that an engine binary that
+        # predates them (18 positional arguments) still lands initial_q in
+        # initial_q and gets the identity default -- its old behaviour.
         # Linear/slider joint (e.g. parallel-gripper fingers). Queues into the
         # SAME pending list as revolutes so it joins the one articulation in
         # finalize()'s BFS (a finger's parent body is the gripper base, which
@@ -3446,6 +3493,10 @@ class World:
             axis=(float(ax), float(ay), float(az)),
             p_anchor=(float(parent_anchor_x), float(parent_anchor_y), float(parent_anchor_z)),
             c_anchor=(float(child_anchor_x), float(child_anchor_y), float(child_anchor_z)),
+            # Consumed by _add_revolute_to_builder's child_xform, shared with
+            # the revolute path.
+            c_rot=(float(child_rot_x), float(child_rot_y),
+                   float(child_rot_z), float(child_rot_w)),
             target_ke=float(target_ke),
             target_kd=float(target_kd),
             limit_lower=float(limit_lower),
@@ -6077,9 +6128,29 @@ class World:
                 # dynamics under XPBD (0-DOF fixed) or MuJoCo (welded root).
                 self.builder.body_mass[root] = 1.0
                 self.builder.body_inv_mass[root] = 1.0
-                self.builder.body_inertia[root] = wp.mat33(
-                    (0.1, 0.0, 0.0), (0.0, 0.1, 0.0), (0.0, 0.0, 0.1)
-                )
+                # Since 2026-09-30 the engine attaches the root's own colliders
+                # (OMNISIM_NEWTON_STATIC_BASE_COLLIDERS, OmSolid.cpp), so a fixed
+                # base can now carry SEVERAL shapes (a URDF base with four hulls).
+                # Same eig3 hazard as the standalone compound statics below: an
+                # isotropic diag(0.1) on a multi-shape welded body lets newton's
+                # SolverMuJoCo pick an arbitrary rotated body_iquat, and mj_step
+                # then drops box-box contacts on one body-local half of the base.
+                # >= 2 shapes -> the strictly-distinct descending diagonal; a
+                # shapeless or single-shape root keeps the isotropic value, so
+                # the =0 revert (no shapes) is byte-identical. Inert either way:
+                # the root is welded and never integrates.
+                _n_root_shapes = 0
+                for _sb in self.builder.shape_body:
+                    if _sb == root:
+                        _n_root_shapes += 1
+                if _n_root_shapes >= 2:
+                    self.builder.body_inertia[root] = wp.mat33(
+                        (0.11, 0.0, 0.0), (0.0, 0.10, 0.0), (0.0, 0.0, 0.09)
+                    )
+                else:
+                    self.builder.body_inertia[root] = wp.mat33(
+                        (0.1, 0.0, 0.0), (0.0, 0.1, 0.0), (0.0, 0.0, 0.1)
+                    )
                 # parent_xform pins the weld at the root's SPAWN world pose
                 # (parent=-1 => the joint frame is in world coords), exactly like
                 # the standalone static-collider weld below. WITHOUT it the fixed
@@ -6361,6 +6432,23 @@ class World:
         # use_mujoco_cpu, evaluated early (finalize precedes it).
         import os as _devos  # NOT _os: this function rebinds _os later, which
                              # would make it a local and NameError here.
+        # NO CUDA DEVICE -> the world's "mujoco_warp" pin runs on CPU mj_step
+        # (see _mjwarp_cpu_fallback_reason). Decided HERE, before the device
+        # pin and the solver construction read _solver_pref, so both see the
+        # same answer and the model is pinned to the CPU like any mj_step world.
+        self._mjwarp_cpu_fallback = None
+        if getattr(self, "_solver_pref", None) == "mujoco_warp":
+            try:
+                _ncuda = int(wp.get_cuda_device_count())
+            except Exception:
+                _ncuda = None
+            _fb = _mjwarp_cpu_fallback_reason(
+                self._solver_pref, bool(_devos.environ.get("OMNISIM_NEWTON_MJWARP")), _ncuda)
+            if _fb:
+                self._mjwarp_cpu_fallback = _fb
+                self._solver_pref = "mujoco"
+                self._newton_log("[OmNewtonBackend] WARNING: " + _fb)
+        # OMNISIM_NEWTON_MODEL_DEVICE: "cpu" / "cuda" / "auto" overrides the model-device pin described above.
         _dev_env = (_devos.environ.get("OMNISIM_NEWTON_MODEL_DEVICE") or "").strip().lower()
         _wants_warp = (bool(_devos.environ.get("OMNISIM_NEWTON_MJWARP"))
                        or getattr(self, "_solver_pref", None) == "mujoco_warp")
@@ -6795,7 +6883,9 @@ class World:
                 # unpinned world since the 2026-08-07 flip -- the old code
                 # attributed every non-pinned selection to FORCE_MUJOCO=1,
                 # which after the flip would claim an env var nobody set.
-                if _pref in ("mujoco", "mujoco_warp"):
+                if getattr(self, "_mjwarp_cpu_fallback", None):
+                    _why = "no CUDA device: WorldInfo.newtonSolver mujoco_warp fell back"
+                elif _pref in ("mujoco", "mujoco_warp"):
                     _why = "WorldInfo.newtonSolver"
                 elif _os.environ.get("OMNISIM_NEWTON_FORCE_MUJOCO", "").strip().lower() not in ("", "0", "false", "off", "no"):
                     _why = "FORCE_MUJOCO=1"

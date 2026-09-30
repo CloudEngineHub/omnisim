@@ -807,3 +807,117 @@ def test_runtime_mutation_code_is_not_a_request_error_code():
     so it must not leak into the 4xx request-error enum."""
     import omnisim_harness as h
     assert "RUNTIME_MUTATION_NOT_IN_SOLVER" not in h.known_request_error_codes()
+
+
+# ---------------------------------------------------------------------------
+# Settle steps poll the event producers (2026-09-30)
+# ---------------------------------------------------------------------------
+#
+# `POST /robot/<def>/joints/set` (and set_pose, spawn, delete, restore) produce
+# their motion inside `settle_steps`, which run through `_advance`. Until
+# 2026-09-30 `_advance` stepped the engine and polled NOTHING, so a joints/set
+# ramp that drove an arm into a table showed the pair in `/sim/contacts` and no
+# `contact.began` on `/sim/events` (christy_5dof ROOT_CONTACT_BUG.md, section 4).
+
+
+class _PollRecorder:
+    def __init__(self, name, log, boom=False):
+        self.name, self.log, self.boom = name, log, boom
+
+    def poll(self, *args):
+        self.log.append((self.name, args[-1] if self.name == "grip" else args[0]))
+        if self.boom:
+            raise RuntimeError(f"{self.name} exploded")
+
+    def current_pairs(self):
+        return set()
+
+
+class _StepSup:
+    def __init__(self):
+        self.steps = 0
+
+    def step(self, ms):
+        self.steps += 1
+        return 0
+
+
+def _advance_ns():
+    import contextlib
+    import types
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from conftest import exec_supervisor_slice
+
+    class _CmdErr(Exception):
+        pass
+
+    observe_stub = types.SimpleNamespace(build_robot_subtree_index=lambda sup: {})
+    return exec_supervisor_slice(
+        "def _advance(", "class PauseLease:",
+        Supervisor=object, CommandError=_CmdErr, sys=sys, observe=observe_stub,
+        pause_lifted=lambda sup, lease: contextlib.nullcontext(False))
+
+
+def test_advance_polls_every_producer_on_every_settle_step():
+    ns = _advance_ns()
+    log: list = []
+    producers = {
+        "damage": _PollRecorder("damage", log),
+        "contact_tracker": _PollRecorder("contact", log),
+        "joint_limit_tracker": _PollRecorder("joint", log),
+        "grip_tracker": _PollRecorder("grip", log),
+    }
+    sup = _StepSup()
+    t = ns["_advance"](sup, 4, 100.0, 3, None, producers=producers)
+    assert t == 112.0 and sup.steps == 3
+    # One poll per producer per step, stamped with the time AFTER that step.
+    for name in ("damage", "contact", "joint", "grip"):
+        assert [ts for n, ts in log if n == name] == [104, 108, 112]
+
+
+def test_advance_in_light_mode_skips_the_silenced_trackers():
+    """--light leaves contact / joint-limit / grip trackers as None; only
+    damage (which survives --light) is polled."""
+    ns = _advance_ns()
+    log: list = []
+    producers = {"damage": _PollRecorder("damage", log), "contact_tracker": None,
+                 "joint_limit_tracker": None, "grip_tracker": None}
+    ns["_advance"](_StepSup(), 4, 0.0, 2, None, producers=producers)
+    assert log == [("damage", 4), ("damage", 8)]
+
+
+def test_advance_without_producers_polls_nothing():
+    """`reset` passes none: its trackers are re-armed by the main loop."""
+    ns = _advance_ns()
+    sup = _StepSup()
+    assert ns["_advance"](sup, 8, 0.0, 2, None) == 16.0
+    assert sup.steps == 2
+
+
+def test_one_crashing_producer_starves_neither_the_others_nor_the_step():
+    ns = _advance_ns()
+    log: list = []
+    producers = {"damage": _PollRecorder("damage", log, boom=True),
+                 "contact_tracker": _PollRecorder("contact", log),
+                 "joint_limit_tracker": _PollRecorder("joint", log, boom=True),
+                 "grip_tracker": None}
+    sup = _StepSup()
+    ns["_advance"](sup, 4, 0.0, 2, None, producers=producers)
+    assert sup.steps == 2
+    assert [n for n, _ in log] == ["damage", "contact", "joint"] * 2
+
+
+def test_sim_step_and_every_mutation_settle_share_the_producer_list():
+    """Source pin: `/sim/step` polls through the same helper (so a producer
+    added to one is added to both), joint_limit_tracker reaches dispatch, and
+    every `_advance` call except reset's passes the producers."""
+    src = (SUPERVISOR_DIR / "harness_supervisor.py").read_text(encoding="utf-8")
+    step = src[src.index('    if cmd == "step":'):src.index('    if cmd == "reset":')]
+    assert "poll_step_producers(supervisor, local_sim_ms, **_producers)" in step
+    assert "joint_limit_tracker=joint_limit_tracker)" in src
+    calls = [ln for ln in src.splitlines() if "_advance(supervisor, basic_step_ms" in ln]
+    assert len(calls) == 7
+    for i, ln in enumerate(src.splitlines()):
+        if "_advance(supervisor, basic_step_ms" in ln and "0.0, settle" not in ln:
+            nxt = src.splitlines()[i + 1]
+            assert "producers=_producers" in ln + nxt, ln

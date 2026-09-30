@@ -44,9 +44,11 @@ WorldInfo {
   # contact slips correctly. "mujoco_warp" runs that solver on the GPU (vs the
   # CPU "mujoco"): identical physics, but in FAST mode it reaches ~3.6x here
   # (vs ~2x on CPU) because the CUDA-graph step replay makes sub-steps cheap.
-  # REQUIRES a CUDA GPU + warp (assumed for all OmniSim users -- same as the RL
-  # worlds): without one, SolverMuJoCo construction fails and Newton falls back
-  # to XPBD, which cannot hold the skid-steer pivot, so the husky jams. NOTE:
+  # Wants a CUDA GPU. With no CUDA device the runtime runs this pin on the CPU
+  # mj_step instead (same SolverMuJoCo setup, no GPU fast-forward; the sidecar
+  # solver label says "no CUDA device ... fell back") -- until 2026-09-29 warp
+  # ran mujoco_warp on its CPU device, where the first step took longer than
+  # the run-headless --until-finalized budget. NOTE:
   # newtonSubsteps (below) MUST be even or the CUDA-graph replay is disabled and
   # the step runs SLOWER than the CPU solver.
   newtonSolver "mujoco_warp"

@@ -512,6 +512,55 @@ def read_joint_positions(supervisor, entries: list[dict]) -> list[float | None]:
         return [_sf_float(e.get("params"), "position") for e in entries]
 
 
+# Tolerance for "at a limit" in the joint snapshot's `hit_limit`. The
+# joint.limit_hit tracker (event_bus.JointLimitTracker.HIT_TOL) uses the same
+# value to ENTER the band.
+JOINT_LIMIT_TOL = 1e-3
+
+
+def effective_joint_limits(stop_lower: float | None, stop_upper: float | None,
+                           motor_lower: float | None,
+                           motor_upper: float | None
+                           ) -> tuple[float | None, float | None, str | None]:
+    """(lower, upper, source) of the range the physics actually enforces.
+
+    Mirrors the Newton registration rule, which is the only place a joint's
+    range reaches the solver (OmBasicJoint::flushPendingNewtonRegistrations
+    for hinge/slider, OmBasicJoint::newtonAxisSpec for Hinge2/Ball axes):
+
+      1. the Motor's minPosition/maxPosition when they DIFFER -> "motor";
+      2. else the JointParameters minStop/maxStop when they DIFFER -> "stops";
+      3. else no limit is registered at all -> (None, None, None).
+
+    Rule 1 wins outright: when a motor declares a range, the stops are NOT
+    passed to the solver (they still clamp a supervisor setJointPosition(),
+    OmJointParameters::clampPosition, but nothing holds the joint to them).
+    Equal values -- 0/0 above all, the "not set" default of both fields --
+    mean "no limit from this source", exactly as the engine reads them.
+    """
+    if motor_lower is not None and motor_upper is not None \
+            and motor_lower != motor_upper:
+        return motor_lower, motor_upper, "motor"
+    if stop_lower is not None and stop_upper is not None \
+            and stop_lower != stop_upper:
+        return stop_lower, stop_upper, "stops"
+    return None, None, None
+
+
+def limit_side(position: float | None, lower: float | None,
+               upper: float | None, tol: float = JOINT_LIMIT_TOL) -> str | None:
+    """"lower" / "upper" when `position` is within `tol` of that limit, else
+    None -- also None when the position was not measured or the joint is
+    unconstrained (either limit None)."""
+    if position is None or lower is None or upper is None:
+        return None
+    if position <= lower + tol:
+        return "lower"
+    if position >= upper - tol:
+        return "upper"
+    return None
+
+
 def joint_snapshot(joint_node, prev_position: float | None,
                    dt_s: float) -> dict:
     """Build a single joint dict.
@@ -521,39 +570,52 @@ def joint_snapshot(joint_node, prev_position: float | None,
     against `prev_position`; if no previous sample exists or dt is 0,
     velocity is None.
 
-    Limits come from `JointParameters.minStop` / `maxStop`. A joint hits
-    a limit when `position - tol <= minStop` or `position + tol >= maxStop`
-    (only meaningful when stops are set; if both stops are 0 the joint is
-    unconstrained and `hit_limit` is None).
+    Limits: both raw sources are reported -- `stop_lower`/`stop_upper`
+    (JointParameters.minStop/maxStop) and `motor_lower`/`motor_upper`
+    (the joint's Motor minPosition/maxPosition; None when the joint has no
+    motor) -- and `lower`/`upper` are the EFFECTIVE range the physics
+    enforces, chosen by `effective_joint_limits` with `limit_source` saying
+    which one it is ("motor" | "stops" | None = unconstrained, in which case
+    `lower`/`upper` are None). Until 2026-09-25 `lower`/`upper` were the raw
+    stops, so a joint limited only by its motor (every full-range URDF
+    revolute: motor +/-6.283, stops unset) read `lower: 0, upper: 0` and its
+    `hit_limit` could never fire.
+
+    A joint hits a limit when `position <= lower + tol` or
+    `position >= upper - tol` (tol = JOINT_LIMIT_TOL); `hit_limit` is None
+    for an unconstrained joint. Multi-axis joints (Hinge2Joint, BallJoint)
+    report axis 1 only.
     """
     type_name = joint_node.getTypeName()
     params = _joint_parameters(joint_node)
+    motor = _joint_motor(joint_node)
     position = _sf_float(params, "position")
     min_stop = _sf_float(params, "minStop")
     max_stop = _sf_float(params, "maxStop")
+    motor_min = _sf_float(motor, "minPosition")
+    motor_max = _sf_float(motor, "maxPosition")
     name = joint_display_name(joint_node)
 
     velocity = None
     if position is not None and prev_position is not None and dt_s > 0:
         velocity = (position - prev_position) / dt_s
 
-    hit_limit: str | None = None
-    if position is not None and min_stop is not None and max_stop is not None \
-            and not (min_stop == 0.0 and max_stop == 0.0):
-        tol = 1e-3
-        if position <= min_stop + tol:
-            hit_limit = "lower"
-        elif position >= max_stop - tol:
-            hit_limit = "upper"
+    lower, upper, source = effective_joint_limits(
+        min_stop, max_stop, motor_min, motor_max)
 
     return {
         "name": name,
         "type": type_name,
         "position": position,
         "velocity": velocity,
-        "lower": min_stop,
-        "upper": max_stop,
-        "hit_limit": hit_limit,
+        "lower": lower,
+        "upper": upper,
+        "limit_source": source,
+        "stop_lower": min_stop,
+        "stop_upper": max_stop,
+        "motor_lower": motor_min,
+        "motor_upper": motor_max,
+        "hit_limit": limit_side(position, lower, upper),
     }
 
 
@@ -734,7 +796,8 @@ def _bind_cache_owner(supervisor) -> None:
 
 
 def cached_joints(supervisor) -> list[tuple]:
-    """[(joint_node, joint_id, jointParameters_node)] for every joint, cached.
+    """[(joint_node, joint_id, jointParameters_node, motor_node)] for every
+    joint, cached (motor_node None when the joint has no Motor device).
 
     JointLimitTracker.poll ran the SAME root walk this module caches for solids
     -- and called `_walk` directly, so 3b952b61d's cache did not cover it. On a
@@ -743,11 +806,12 @@ def cached_joints(supervisor) -> list[tuple]:
     drags the recursion through the whole robot subtree, one `getTypeName()`
     round-trip per node, every basic step.
 
-    Cached here: the walk, the joint id, and the jointParameters node handle --
-    all immutable for the life of the node.
-    NOT cached: `position`, obviously, and also `minStop`/`maxStop`, which a
-    supervisor could legitimately retune at runtime. Those stay live reads, so
-    this cannot make the tracker emit a limit event against a stale limit.
+    Cached here: the walk, the joint id, and the jointParameters and Motor
+    node handles -- all immutable for the life of the node.
+    NOT cached: `position`, obviously, and also `minStop`/`maxStop` and the
+    motor's `minPosition`/`maxPosition`, which a supervisor could legitimately
+    retune at runtime. Those stay live reads, so this cannot make the tracker
+    emit a limit event against a stale limit.
     """
     global _JOINT_CACHE
     _bind_cache_owner(supervisor)
@@ -762,7 +826,7 @@ def cached_joints(supervisor) -> list[tuple]:
             jid = j.getId()
         except Exception:
             continue
-        out.append((j, jid, _joint_parameters(j)))
+        out.append((j, jid, _joint_parameters(j), _joint_motor(j)))
     _JOINT_CACHE = out
     return out
 

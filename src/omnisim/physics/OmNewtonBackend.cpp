@@ -2264,12 +2264,18 @@ int OmNewtonBackend::addJointPrismatic(int parentIdx, int childIdx,
                                        double targetKe, double targetKd,
                                        double limitLower, double limitUpper,
                                        double effortLimit, double velocityLimit,
+                                       double childRotX, double childRotY,
+                                       double childRotZ, double childRotW,
                                        double initialPosition) {
   if (!mAvailable || mRuntime == nullptr || mRuntime->world == nullptr || !mRuntime->openForBuild)
     return -1;
   PyGILState_STATE gstate = PyGILState_Ensure();
+  // The child rotation goes AFTER initial_q on the Python side (unlike
+  // add_joint_revolute) so a runtime/binary mismatch cannot shift initial_q
+  // into the quaternion. Needs the 2026-09-27 runtime (bundle re-staged); an
+  // older add_joint_prismatic raises a TypeError here, reported below.
   PyObject *r = PyObject_CallMethod(mRuntime->world, "add_joint_prismatic",
-                                     "(iidddddddddddddddd)",
+                                     "(iidddddddddddddddddddd)",
                                      parentIdx, childIdx,
                                      ax, ay, az,
                                      pX, pY, pZ,
@@ -2277,7 +2283,8 @@ int OmNewtonBackend::addJointPrismatic(int parentIdx, int childIdx,
                                      targetKe, targetKd,
                                      limitLower, limitUpper,
                                      effortLimit, velocityLimit,
-                                     initialPosition);
+                                     initialPosition,
+                                     childRotX, childRotY, childRotZ, childRotW);
   if (r == nullptr) {
     const int err = reportPyError("add_joint_prismatic");
     PyGILState_Release(gstate);
@@ -3706,6 +3713,7 @@ int OmNewtonBackend::addJointPrismatic(int, int, double, double, double,
                                        double, double,
                                        double, double,
                                        double, double,
+                                       double, double, double, double,
                                        double) { return -1; }
 int OmNewtonBackend::setJointTargetVelocity(int, double) { return -1; }
 int OmNewtonBackend::setJointTargetPosition(int, double) { return -1; }

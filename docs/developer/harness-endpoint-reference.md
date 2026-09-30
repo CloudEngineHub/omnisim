@@ -193,7 +193,7 @@ Enumerate every Robot in the scene with pose and joint count.
 
 **Route:** `GET /robot/<def>/joints`
 
-Per-joint snapshot: position, velocity (differenced), limits, `hit_limit`.
+Per-joint snapshot: position, velocity (differenced), limits, `hit_limit`. ⚠️ **`lower` / `upper` are the EFFECTIVE limits since 2026-09-25**, chosen by the Newton registration rule (`OmBasicJoint.cpp`): the Motor's `minPosition`/`maxPosition` when they differ, else the joint's `minStop`/`maxStop` when they differ, else none — `limit_source` is `"motor"` / `"stops"` / `null` (unconstrained; `lower`/`upper` are then `null`). The raw sources ride along as `stop_lower`/`stop_upper` and `motor_lower`/`motor_upper` (`null` with no motor). `hit_limit` (tolerance `1e-3`) and the `joint.limit_hit` event use the effective limits. Until then both read the stops only, so a full-range URDF revolute (motor ±6.283, stops unset) reported `lower: 0, upper: 0` and never a hit; branch on `limit_source == null`, not on `0`/`0`, for "unconstrained". PROTOCOL.md §7.14.
 
 ## GET /robot/<def>/devices
 

@@ -296,6 +296,9 @@ def model_for_engine(engine: str) -> str:
 # doesn't run out of turns mid-chain or lose its earlier context. The relay still
 # clamps via single-flight semantics, so these only bound the worst case.
 MAX_TOOL_TURNS = int(os.environ.get("OMNILINK_MAX_TURNS", "16"))
+# What a turn cancelled by an operator halt answers, instead of nothing.
+CANCELLED_REPLY = ("Stopped. I cancelled the rest of that request because you "
+                   "told me to stop; tell me what to do next.")
 HISTORY_LIMIT = int(os.environ.get("OMNILINK_HISTORY_LIMIT", "40"))
 
 # How much we STORE, as opposed to how much we SEND to the model.
@@ -375,6 +378,21 @@ REQUEST_TIMEOUT = int(os.environ.get("OMNILINK_TIMEOUT", "120"))
 # (auth / BYOK / bad request) are never retried — they won't self-heal.
 CHAT_RETRIES = int(os.environ.get("OMNILINK_RETRIES", "2"))
 RETRY_BACKOFF_S = float(os.environ.get("OMNILINK_RETRY_BACKOFF", "1.5"))
+# A 429 that says when to come back is honoured, up to this many seconds.
+# The platform cools a rate-limited credential for ~10 s and answers every
+# request inside that window with 429 + Retry-After; the fixed 1.5 s / 3 s
+# backoff spent both retries inside the window and turned one burst of
+# upstream 429s into a failed turn (measured 2026-09-25, gemini-3.5-flash).
+RETRY_HINT_CAP_S = float(os.environ.get("OMNILINK_RETRY_HINT_CAP", "15"))
+
+
+def retry_wait_s(attempt: int, retry_after_s: Optional[float]) -> float:
+    """Seconds to wait before retry `attempt` (0-based): the server's hint
+    when it gave one (capped), otherwise the linear backoff."""
+    backoff = RETRY_BACKOFF_S * (attempt + 1)
+    if retry_after_s is not None and retry_after_s > 0:
+        return min(max(float(retry_after_s), backoff), RETRY_HINT_CAP_S)
+    return backoff
 
 # ── Latency tracing (opt-in, zero cost when unset) ───────────────────
 #
@@ -1067,6 +1085,10 @@ class OmniLinkRelay:
         self.surface = surface
         self.agent_name = agent_name
         self.main_task = main_task
+        # Optional zero-arg callable returning standing facts (places, people,
+        # rules, counts) appended to the system instruction on EVERY call, so
+        # they survive the history window.
+        self.memory_provider: Optional[Callable[[], str]] = None
         # The bridge, if it handed itself over. EVERY read of it is a
         # `getattr(..., default)` on a cached scalar -- `sim_time`, `held`,
         # `fault`, `world`, `events` -- and never a call into the controller
@@ -1289,6 +1311,9 @@ class OmniLinkRelay:
         # Single-flight dispatcher thread: serialises chats so the agent
         # doesn't see two overlapping conversations on the same robot.
         self._queue: Queue = Queue(maxsize=32)
+        # The turn the worker is running right now, so an operator halt can
+        # cancel it (cancel_inflight). None between turns.
+        self._active: Optional[DispatchHandle] = None
         self._memory_write_lock = threading.Lock()
         # The journal revision this process has got ONTO THE PLATFORM. 0 is
         # "nothing", which is the honest starting point even when the boot
@@ -1918,6 +1943,50 @@ class OmniLinkRelay:
             on_event("error", {"text": "relay queue is full; try again after the current prompt finishes"})
         return handle
 
+    def turn_active(self) -> bool:
+        """True while a model turn is running (its robot may be between steps)."""
+        return self._active is not None
+
+    def cancel_inflight(self) -> Dict[str, Any]:
+        """An operator HALT: cancel the running turn and every queued one.
+
+        A stop that ends the current motion is not enough on its own. The
+        relay's turn is a loop of model rounds and tool calls, and until now
+        nothing told it the operator had said stop, so it went on to issue
+        the next step of its plan -- the turn after the halted drive, the
+        second leg -- as if nothing had happened (ops-bench F3, 2026-09-25).
+        Cancellation is checked before every model round and every tool call,
+        so no NEW action starts once this returns; a tool already inside the
+        execution gate finishes (the halt itself ends its motion).
+        """
+        if threading.current_thread() is self._worker:
+            # The model's OWN stop_robot, inside its own turn ("stop, then go
+            # back to the start"): the rest of that turn is the operator's
+            # order, not something to cancel.
+            return {"cancelled_turn": False, "own_turn": True, "dropped_queued": 0}
+        active = self._active
+        in_flight = active.cancel() if active is not None else False
+        dropped = 0
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except Empty:
+                break
+            if item is None or item[0] is None:
+                # A close() sentinel is not ours to drop: put it back.
+                self._queue.put_nowait(item)
+                break
+            _text, on_event, handle = item
+            handle.cancel()
+            dropped += 1
+            try:
+                on_event("agent", {"text": CANCELLED_REPLY})
+                on_event("status", {"state": "idle"})
+            except Exception:
+                pass
+        return {"cancelled_turn": active is not None, "tool_in_flight": in_flight,
+                "dropped_queued": dropped}
+
     #: What `via` this relay reports. PROTOCOL §5.7.1 puts the stage that
     #: ANSWERED at the top level of the 200 body, and the sweep reads it from
     #: exactly there -- it will not infer it from `actions[]`, from latency or
@@ -2090,6 +2159,7 @@ class OmniLinkRelay:
             if item is None or item[0] is None:
                 return
             text, on_event, handle = item
+            self._active = handle
             try:
                 self._dispatch_one(text, on_event, handle)
             except Exception as e:
@@ -2097,6 +2167,18 @@ class OmniLinkRelay:
                 traceback.print_exc()
                 try:
                     on_event("error", {"text": err})
+                except Exception:
+                    pass
+            finally:
+                self._active = None
+            if handle.is_cancelled():
+                # _dispatch_one returns SILENTLY on cancellation, at any of
+                # its checkpoints, so its waiter used to sit out the whole
+                # dispatch_sync timeout (150 s on /prompt) after the robot had
+                # already been halted. Always release it, and say why.
+                try:
+                    on_event("agent", {"text": CANCELLED_REPLY})
+                    on_event("status", {"state": "idle"})
                 except Exception:
                     pass
 
@@ -2575,6 +2657,24 @@ class OmniLinkRelay:
     # ── /api/chat via OmniLinkClient ──────────────────────────────
 
     def _post_chat(self, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """One model round, traced as it happens under OMNILINK_TRACE.
+
+        A "round_start" line is written before the call and a "round" line,
+        with its token usage, as soon as it returns -- not only in the
+        turn's summary line, which a turn that is still running (or a bridge
+        that is stopped) never writes. The grounding re-ask calls this too,
+        and was in no turn summary at all.
+        """
+        rid = uuid.uuid4().hex
+        if TRACE_PATH:
+            _trace({"kind": "round_start", "round_id": rid})
+        data = self._post_chat_once(messages)
+        if TRACE_PATH:
+            _trace({"kind": "round", "round_id": rid,
+                    **(getattr(self, "_last_round_trace", None) or {})})
+        return data
+
+    def _post_chat_once(self, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Single chat round-trip through the OmniLink Python client.
 
         Identical to what a real-world OmniLink agent would do — we
@@ -2590,8 +2690,14 @@ class OmniLinkRelay:
         # the server processed a request but the response was lost, a retry
         # must not create a second billable/model turn with different tools.
         request_id = str(uuid.uuid4())
+        memory = ""
+        if self.memory_provider is not None:
+            try:
+                memory = str(self.memory_provider() or "")
+            except Exception:
+                memory = ""
         system_instruction = {
-            "mainTask": self.main_task,
+            "mainTask": self.main_task + (("\n\n" + memory) if memory else ""),
             "availableTools": self._tool_names,
             "availableToolDetails": self._tool_defs,
             "allowToolUse": True,
@@ -2646,6 +2752,10 @@ class OmniLinkRelay:
                         rt["cached_tokens"] = um.get("cachedContentTokenCount")
                         rt["output_tokens"] = um.get("candidatesTokenCount")
                         rt["thoughts_tokens"] = um.get("thoughtsTokenCount")
+                        # Which model answered: the platform may fall back
+                        # to another engine after a failure.
+                        _raw = data.get("raw") or {}
+                        rt["model_returned"] = _raw.get("modelVersion") or _raw.get("model")
                         rt["n_tool_calls"] = len(data.get("toolCalls") or [])
                         dbg_msgs = ((data.get("debug") or {}).get("messages") or {})
                         rt["merged_count"] = dbg_msgs.get("mergedCount")
@@ -2664,7 +2774,9 @@ class OmniLinkRelay:
                              "ms": round((time.perf_counter() - _t0) * 1000.0, 1)})
                     print(f"[omnilink_relay] transient {last_err}, retry "
                           f"{attempt + 1}/{CHAT_RETRIES}")
-                    time.sleep(RETRY_BACKOFF_S * (attempt + 1))
+                    time.sleep(retry_wait_s(
+                        attempt, getattr(e, "retry_after_sec", None)
+                        if e.status_code == 429 else None))
                     continue
                 # ⚠️ A 402 is NOT always a missing provider key. Until
                 # 2026-09-23 this branch treated EVERY 402 as BYOK_REQUIRED

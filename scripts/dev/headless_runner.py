@@ -262,6 +262,32 @@ def step_wait_budget_s(device: str | None, warp_in_log: bool = False,
         return STEP_WAIT_GPU_S
     return STEP_WAIT_CPU_S
 
+
+def first_step_wait_summary(completion_at: float, loop_ended_at: float,
+                            step_deadline: float | None) -> str:
+    """One OBSERVED line for the never-stepped verdict: how long the run really
+    waited for a first step after finalize, next to the budget it was given.
+
+    Until 2026-09-29 this line printed ``step_deadline - completion_at`` as the
+    time waited -- which is the BUDGET, i.e. the --step-wait-timeout argument
+    echoed back. An external tester passed --step-wait-timeout 420 and read
+    "ended 11.5s after finalize, having waited 420.0s" (report of 2026-08-29).
+    The wait is the measured interval from finalize to the moment the
+    observation loop stopped; the budget is quoted as a budget.
+    """
+    waited = max(0.0, loop_ended_at - completion_at)
+    if step_deadline is None:
+        return (f"the run ended {waited:.1f}s after finalize; no first-step wait "
+                f"was armed")
+    budget = max(0.0, step_deadline - completion_at)
+    line = (f"the run waited {waited:.1f}s after finalize for a first step, against "
+            f"a {budget:g}s budget")
+    short = step_deadline - loop_ended_at
+    if short > 0.5:
+        line += (f" -- it stopped {short:.1f}s BEFORE the budget ran out (the lines "
+                 f"above say why)")
+    return line
+
 # These are controller-launch failures, not ordinary world warnings.  A world can
 # still parse, finalise and step after a Python controller dies, which made the old
 # runner print PASS for demos whose policy process never existed.
@@ -1661,6 +1687,9 @@ def run_once(args) -> int:
         # so finalize and the first step are seen within ~0.1 s of landing, not up to 0.5 s.
         time.sleep(0.1 if until_finalized_mode else 0.5)
 
+    # When the observation loop stopped -- the end of any first-step wait. Taken
+    # BEFORE the engine is terminated so the reported wait excludes teardown.
+    loop_ended_at = time.time()
     if proc.poll() is None:
         proc.terminate()
         try:
@@ -1781,9 +1810,8 @@ def run_once(args) -> int:
         print("[headless]     * ZERO '[OmNewtonBackend] step N' lines: the sim clock "
               "never left t=0")
         if completion_at is not None:
-            waited = (step_deadline - completion_at) if step_deadline is not None else 0.0
-            print(f"[headless]     * the run ended {time.time() - completion_at:.1f}s after "
-                  f"finalize, having waited {waited:.1f}s for a first step")
+            print("[headless]     * " + first_step_wait_summary(
+                completion_at, loop_ended_at, step_deadline))
         else:
             print(f"[headless]     * the run ran {time.time() - start:.1f}s in total")
         print("[headless]   A run that never advanced one step is NOT a PASS; "

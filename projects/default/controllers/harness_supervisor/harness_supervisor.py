@@ -87,7 +87,9 @@ damage_reset      -> {ok: true}                       heals all parts to pristin
 damage_inject     -> {state, hp, hp_max, ...}                          args: {part: str, hp_delta?: float, state?: str}
                      test/debug hook to set a part's state directly without the contact pipeline
 robots_list       -> {robots: [{def, name, model, controller, type, position, orientation, num_joints}]}
-robot_joints      -> {robot, joints: [{name, type, position, velocity, lower, upper, hit_limit}]}   args: {def: str}
+robot_joints      -> {robot, joints: [{name, type, position, velocity, lower, upper, limit_source,
+                     stop_lower, stop_upper, motor_lower, motor_upper, hit_limit}]}   args: {def: str}
+                     lower/upper = EFFECTIVE limits (observe.effective_joint_limits)
 robot_devices     -> {robot, devices: [{name, type}]}                  args: {def: str}
 set_joint_positions -> {robot, joints: {name: {requested, commanded, clamped,
                      position_before, achieved, error, moved,
@@ -928,13 +930,22 @@ def compare_fingerprints(before: dict, after: dict) -> dict:
 
 
 def _advance(supervisor: Supervisor, basic_step_ms: int, sim_time_ms: float,
-             steps: int, lease: "PauseLease | None" = None) -> float:
+             steps: int, lease: "PauseLease | None" = None,
+             producers: dict | None = None) -> float:
     """Step `steps` basic steps, returning the new sim time. Used by the
     mutation verbs so a queued field write actually lands before read-back.
 
     Lifts a held pause for the settle (see `pause_lifted`): every mutation verb
     reaches the engine through here, so doing it once covers all of them and
     none of the seven call sites has to remember.
+
+    `producers` (the kwargs of `poll_step_producers`) makes each settle step
+    poll the event producers exactly as `/sim/step` does, so the motion a verb
+    causes reaches `/sim/events`. A break armed on one of those events is
+    scanned by the main loop right after the verb returns (the per-served-frame
+    scan), so it holds at the END of the settle, not mid-settle: a verb's
+    settle is not interrupted part-way through its own field write. `reset`
+    passes none -- its trackers are re-armed by the main loop afterwards.
     """
     t = float(sim_time_ms)
     with pause_lifted(supervisor, lease):
@@ -942,7 +953,54 @@ def _advance(supervisor: Supervisor, basic_step_ms: int, sim_time_ms: float,
             if supervisor.step(basic_step_ms) == -1:
                 raise CommandError("simulator step returned -1 (terminating)")
             t += basic_step_ms
+            if producers:
+                poll_step_producers(supervisor, t, **producers)
     return t
+
+
+def poll_step_producers(supervisor: Supervisor, sim_time_ms: float, *,
+                        damage=None, contact_tracker=None,
+                        joint_limit_tracker=None, grip_tracker=None) -> None:
+    """Run the per-step event producers once, at `sim_time_ms`.
+
+    The ONE list of what a step inside an RPC polls, shared by `/sim/step` and
+    by `_advance` (the mutation verbs' settle). Until 2026-09-30 only
+    `/sim/step` polled, so a motion produced by `POST /robot/<def>/joints/set`
+    (or set_pose, spawn, delete, restore) inside its `settle_steps` fired NO
+    `contact.*`, `grip.*` or `joint.limit_hit` event even when `/sim/contacts`
+    reported the contact -- an empty event log looked like evidence of no
+    contact. `/sim/step` never polled `joint_limit_tracker` at all (the main
+    loop polled it once per iteration, so a limit touched and left inside one
+    batch was invisible).
+
+    Light mode is honoured by construction: a tracker the session disabled is
+    None and is skipped. Each producer is guarded so one crash neither kills
+    the step nor starves the others; the crash goes to stderr.
+    """
+    if damage is not None:
+        try:
+            damage.poll(int(sim_time_ms))
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(f"[harness_supervisor] damage.poll crashed: {exc}\n")
+    if contact_tracker is not None:
+        try:
+            contact_tracker.poll(sim_time_ms)
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(f"[harness_supervisor] contact_tracker.poll crashed: {exc}\n")
+    if joint_limit_tracker is not None:
+        try:
+            joint_limit_tracker.poll(sim_time_ms)
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(f"[harness_supervisor] joint_limit_tracker.poll crashed: {exc}\n")
+    if grip_tracker is not None and contact_tracker is not None:
+        try:
+            grip_tracker.poll(
+                contact_tracker.current_pairs(),
+                observe.build_robot_subtree_index(supervisor),
+                sim_time_ms,
+            )
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(f"[harness_supervisor] grip_tracker.poll crashed: {exc}\n")
 
 
 class PauseLease:
@@ -1163,7 +1221,13 @@ def dispatch(supervisor: Supervisor, basic_step_ms: int, sim_time_ms: float,
              grip_tracker: GripTracker | None = None,
              joint_velocity_cache: dict | None = None,
              pause_lease: "PauseLease | None" = None,
-             breaks: BreakRegistry | None = None):
+             breaks: BreakRegistry | None = None,
+             joint_limit_tracker: JointLimitTracker | None = None):
+    # What a step taken INSIDE this rpc polls (`/sim/step` and every mutation
+    # verb's settle, via `_advance`). A tracker disabled by --light is None.
+    _producers = {"damage": damage, "contact_tracker": contact_tracker,
+                  "joint_limit_tracker": joint_limit_tracker,
+                  "grip_tracker": grip_tracker}
     if cmd == "ping":
         return {}
     if cmd == "pause":
@@ -1386,22 +1450,7 @@ def dispatch(supervisor: Supervisor, basic_step_ms: int, sim_time_ms: float,
                     raise CommandError("simulator step returned -1 (terminating)")
                 local_sim_ms += basic_step_ms
                 steps_executed += 1
-                if damage is not None:
-                    damage.poll(int(local_sim_ms))
-                if contact_tracker is not None:
-                    try:
-                        contact_tracker.poll(local_sim_ms)
-                    except Exception:
-                        pass
-                if grip_tracker is not None and contact_tracker is not None:
-                    try:
-                        grip_tracker.poll(
-                            contact_tracker.current_pairs(),
-                            observe.build_robot_subtree_index(supervisor),
-                            local_sim_ms,
-                        )
-                    except Exception:
-                        pass
+                poll_step_producers(supervisor, local_sim_ms, **_producers)
                 # BREAK CHECK, per STEP. The main loop's two scans are not
                 # enough here for two reasons: the producers above run inside
                 # THIS loop (so their events are not on the bus until it ends),
@@ -1560,7 +1609,8 @@ def dispatch(supervisor: Supervisor, basic_step_ms: int, sim_time_ms: float,
         before = pose_fingerprint(supervisor)
         root.loadState(name)
         settle = int(args.get("settle_steps", 1))
-        sim_after = _advance(supervisor, basic_step_ms, sim_time_ms, settle, pause_lease)
+        sim_after = _advance(supervisor, basic_step_ms, sim_time_ms, settle, pause_lease,
+                             producers=_producers)
         after = pose_fingerprint(supervisor)
         target = snap.get("poses")
         return {
@@ -1730,7 +1780,8 @@ def dispatch(supervisor: Supervisor, basic_step_ms: int, sim_time_ms: float,
         # its next step, so a clone read back with settle_steps=0 still reports
         # the source's pose.
         settle = int(args.get("settle_steps", 1 if applied else 0))
-        sim_after = _advance(supervisor, basic_step_ms, sim_time_ms, settle, pause_lease)
+        sim_after = _advance(supervisor, basic_step_ms, sim_time_ms, settle, pause_lease,
+                             producers=_producers)
         summary = node_summary(node) if node is not None else {}
         verification = {
             "node_resolved": node is not None,
@@ -1784,7 +1835,8 @@ def dispatch(supervisor: Supervisor, basic_step_ms: int, sim_time_ms: float,
             removed.append({"def": def_name, "id": summary.get("id"),
                             "type": summary.get("type")})
         settle = int(args.get("settle_steps", 0))
-        sim_after = _advance(supervisor, basic_step_ms, sim_time_ms, settle, pause_lease)
+        sim_after = _advance(supervisor, basic_step_ms, sim_time_ms, settle, pause_lease,
+                             producers=_producers)
         still = [r["def"] for r in removed
                  if find_node_by_def(supervisor, r["def"]) is not None]
         return {
@@ -1836,7 +1888,8 @@ def dispatch(supervisor: Supervisor, basic_step_ms: int, sim_time_ms: float,
             except Exception as exc:  # noqa: BLE001
                 raise CommandError(f"resetPhysics failed: {exc}")
         settle = int(args.get("settle_steps", 1))
-        sim_after = _advance(supervisor, basic_step_ms, sim_time_ms, settle, pause_lease)
+        sim_after = _advance(supervisor, basic_step_ms, sim_time_ms, settle, pause_lease,
+                             producers=_producers)
         after = _pose_of(node)
         verification: dict = {"settled_steps": settle,
                               "reset_physics": reset_physics}
@@ -1954,7 +2007,8 @@ def dispatch(supervisor: Supervisor, basic_step_ms: int, sim_time_ms: float,
                       if rollback_errors else "; prior changes rolled back")
             raise CommandError(f"scene_set_poses failed: {exc}{suffix}")
 
-        sim_after = _advance(supervisor, basic_step_ms, sim_time_ms, settle, pause_lease)
+        sim_after = _advance(supervisor, basic_step_ms, sim_time_ms, settle, pause_lease,
+                             producers=_producers)
         results: list[dict] = []
         for item in prepared:
             results.append({
@@ -2368,7 +2422,8 @@ def dispatch(supervisor: Supervisor, basic_step_ms: int, sim_time_ms: float,
             except Exception as exc:  # noqa: BLE001
                 raise CommandError(
                     f"setJointPosition failed for joint {plan['name']!r}: {exc}")
-        sim_after = _advance(supervisor, basic_step_ms, sim_time_ms, settle, pause_lease)
+        sim_after = _advance(supervisor, basic_step_ms, sim_time_ms, settle, pause_lease,
+                             producers=_producers)
         achieved_list = observe.read_joint_positions(
             supervisor, [p["entry"] for p in plans])
         results: dict[str, dict] = {}
@@ -3252,7 +3307,8 @@ def main() -> int:
                                       grip_tracker=grip_tracker,
                                       joint_velocity_cache=joint_velocity_cache,
                                       pause_lease=pause_lease,
-                                      breaks=breaks)
+                                      breaks=breaks,
+                                      joint_limit_tracker=joint_limit_tracker)
                     # Any command that advanced sim time inside its own loop
                     # (step, and the mutation / snapshot verbs that settle a
                     # queued field write) reports `advanced_to_ms`; pull the

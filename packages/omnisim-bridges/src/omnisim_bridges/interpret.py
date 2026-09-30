@@ -902,7 +902,7 @@ RULES: List[Rule] = [
        [MOBILE], "drive_to_pair"),
 
     _R("drive_forward",
-       r"\b(?P<verb>" + _DRIVE_VERBS + r")\s*(?:up|off)?\s*" + _SELF_OBJECT +
+       r"\b(?P<verb>" + _DRIVE_VERBS + r")\s*(?:up|off|away)?\s*" + _SELF_OBJECT +
        r"(?:(?P<pre>(?:" + _FWD_WORDS + "|" + _BWD_WORDS + r")\b)\s+)?"
        r"(?:by\s+|for\s+)?" + _ADVERB + r"(?P<n>" + _NUM + r")(?![\d.])\s*"
        r"(?P<unit>" + _LEN_UNIT + r")"
@@ -918,7 +918,7 @@ RULES: List[Rule] = [
     # No number means no distance, never a 1 m default: `_parse_clause`
     # turns a drive with no distance into "How far should I back up?".
     _R("drive_forward",
-       r"\b(?:reverse|back up|back off|drive back|go back|move back)\b"
+       r"\b(?:reverse|back up|back off|back away|drive back|go back|move back)\b"
        r"(?:\s+(?:by\s+)?(" + _NUM + r")\s*(" + _LEN_UNIT + r"))?",
        lambda m: {"distance": -_metres(m.group(1), m.group(2))
                   if m.group(1) else None},
@@ -1142,10 +1142,19 @@ RULES: List[Rule] = [
     # ---- universal ---------------------------------------------------
     # "stop what you're doing" must consume the whole clause, or the gate
     # rejects a plain stop order for being only four characters long.
+    # The halt phrasings an operator shouts are exactly the ones that must not
+    # wait for a model: "Stop turning!", "Emergency stop!", "Abort!" and "stop
+    # the robot" used to explain too little of their clause and went to the
+    # relay, behind whatever motion was running (ops-bench F3, 2026-09-25).
+    # Objects stay a closed list: "stop at the door" names a place, not a
+    # halt, and must still reach the model.
     _R("stop",
-       r"\b(?:stop|halt|freeze|brake|pause|cease|stand down)"
+       r"\b(?:emergency\s+stop|e-?stop|all\s+stop|full\s+stop)\b|"
+       r"\b(?:stop|halt|freeze|brake|pause|cease|stand down|abort)"
        r"(?:\s+(?:what\s+you(?:'re|\s+are)\s+doing|everything|all\s+work|"
-       r"moving|driving|there|here))?\b|"
+       r"moving|driving|turning|rotating|spinning|reversing|backing\s+up|"
+       r"the\s+robot|the\s+motion|it|there|here|"
+       r"(?:right\s+)?now|immediately))?\b|"
        r"\bhold\s+(?:still|position|there|on|fire)\b|"
        r"\bwait\b",
        lambda m: {}, [ANY], "stop"),
@@ -1535,6 +1544,292 @@ class UnknownSurface(ValueError):
     """`surface` was not one of SURFACES. See interpret()'s docstring."""
 
 
+# ── standing spatial rules ("keep your x at or below 0.4 until I say so") ──
+#
+# A coordinate limit the robot must respect on every move, set in one turn and
+# lifted in a later one. Read only when EXACT: an axis, a comparison and a
+# number, or a named line ("stay behind the line x = 0.6", whose side is the
+# side the robot is on NOW, resolved from the measured pose in route.execute).
+# Anything else in the sentence that is not filler sends the whole sentence to
+# the model; a hypothetical or a question is never a rule.
+
+_B_AXIS = r"(?:your\s+|the\s+|my\s+|its\s+)?(?P<axis>[xy])(?:[\s-]*(?:coordinate|position|value))?"
+_B_UPPER = (r"below|under|lower\s+than|less\s+than|at\s+most|no\s+more\s+than|"
+            r"no\s+higher\s+than|<=|<")
+_B_LOWER = (r"above|over|higher\s+than|more\s+than|greater\s+than|at\s+least|"
+            r"no\s+less\s+than|no\s+lower\s+than|>=|>")
+_B_NUMBER = r"(?P<num>" + _NUM + r")(?:\s*(?:m|metres?|meters?)\b)?"
+# "keep / hold / stay with your x at or below 0.4"
+_B_KEEP = re.compile(
+    r"\b(?:keep|hold|stay|remain)\b[^.;!?]*?\b" + _B_AXIS
+    + r"\s+(?:at\s+or\s+)?(?P<cmp>" + _B_UPPER + "|" + _B_LOWER + r")\s*(?:=\s*)?"
+    + _B_NUMBER, re.IGNORECASE)
+# "do not let your x go above 0.5", "never let y drop below -1"
+_B_NEVER = re.compile(
+    r"\b(?:do\s*not|don'?t|never|must\s+not|mustn'?t|should\s+not|shouldn'?t)\s+"
+    r"(?:let\s+)?" + _B_AXIS + r"\s+(?:(?:go|get|rise|climb|drop|fall|move|be)\s+)?"
+    r"(?P<cmp>above|over|past|beyond|higher\s+than|more\s+than|greater\s+than|"
+    r"exceed(?:ing)?|below|under|lower\s+than|less\s+than)\s*(?:=\s*)?" + _B_NUMBER,
+    re.IGNORECASE)
+# "your x must not go above 0.6", "x may never exceed 2"
+_B_MUST_NOT = re.compile(
+    r"\b" + _B_AXIS + r"\s+(?:must|should|may|can)\s*(?:not|never|n'?t)\s+"
+    r"(?:(?:go|get|rise|climb|drop|fall|move|be)\s+)?"
+    r"(?P<cmp>above|over|past|beyond|higher\s+than|more\s+than|greater\s+than|"
+    r"exceed|below|under|lower\s+than|less\s+than)\s*(?:=\s*)?" + _B_NUMBER,
+    re.IGNORECASE)
+# "stay behind / on this side of the line x = 0.6": side from the pose
+_B_LINE_STAY = re.compile(
+    r"\b(?:stay|keep|remain)\s+(?:behind|on\s+(?:this|your|my|the\s+near)\s+side\s+of|"
+    r"short\s+of|before)\s+(?:the\s+)?(?:line\s+)?(?:at\s+)?(?P<axis>[xy])\s*(?:=|is)\s*"
+    + _B_NUMBER, re.IGNORECASE)
+# "don't go past x = 2", "never cross the line y = -0.5"
+_B_LINE_NEVER = re.compile(
+    r"\b(?:do\s*not|don'?t|never|must\s+not|mustn'?t)\s+(?:go|drive|move|get|pass|"
+    r"cross|travel)\s+(?:past|beyond|over|across\s+)?\s*(?:the\s+)?(?:line\s+)?"
+    r"(?:at\s+)?(?P<axis>[xy])\s*(?:=|is)\s*" + _B_NUMBER, re.IGNORECASE)
+_B_LIFT = re.compile(
+    r"\b(?:(?:the|that|this)\s+)?(?:line|boundary|limit|(?:safety\s+)?rule|restriction)"
+    r"\s+(?:no\s+longer\s+applies|does(?:\s+not|n'?t)\s+apply(?:\s+any\s*more)?|"
+    r"is\s+(?:lifted|removed|gone|cancelled|canceled|off|over))\b|"
+    r"\b(?:lift|remove|cancel|drop|clear)\s+(?:the|that|this|your)\s+"
+    r"(?:line|boundary|limit|(?:safety\s+)?rule|restriction)\b|"
+    r"\byou(?:'re|\s+are)\s+(?:now\s+)?(?:clear|free|allowed)\s+to\s+"
+    r"(?:(?:go|drive|move)\s+(?:past|beyond|over|across)|cross)\s+(?:the|that)\s+(?:line|boundary)\b|"
+    r"\byou\s+(?:can|may)\s+(?:now\s+)?"
+    r"(?:(?:go|drive|move)\s+(?:past|beyond|over|across)|cross)\s+(?:the|that)\s+(?:line|boundary)\b",
+    re.IGNORECASE)
+_B_UNTIL = re.compile(
+    r"\buntil\s+(?:i|we)\s+(?:lift|remove|cancel|clear|drop)\s+(?:it|the\s+\w+)\b",
+    re.IGNORECASE)
+_B_HYPOTHETICAL = re.compile(
+    r"\b(?:if|would|could|suppose|supposing|imagine|hypothetically|what\s+if|ever|"
+    r"whether)\b", re.IGNORECASE)
+# What may surround a rule in its own clause without meaning anything more.
+_B_FILLER = re.compile(
+    r"\b(?:until\s+(?:i|we)\s+(?:say\s+(?:so|otherwise)|tell\s+you(?:\s+otherwise)?|"
+    r"lift\s+(?:it|the\s+(?:rule|line|restriction))|say\s+you\s+can)|until\s+further\s+notice|"
+    r"(?:a\s+)?new\s+(?:safety\s+)?rule|safety\s+rule|from\s+now\s+on|for\s+now|please|"
+    r"ok(?:ay)?|right|now|the\s+line|and|so|"
+    # a greeting or a heading before the rule adds nothing to it
+    r"(?:good\s+)?(?:morning|afternoon|evening)|hi|hello|hey|"
+    r"(?:rule|rules)\s+for\s+(?:today|this\s+shift|the\s+shift|now))\b", re.IGNORECASE)
+_B_MOTION = re.compile(
+    r"\d|\b(?:drive|go|move|turn|rotate|reverse|back\s+up|spin|head|travel|advance|"
+    r"forward|forwards|backward|backwards|ahead)\b", re.IGNORECASE)
+# A restatement of a rule just given ("your x must not go above THAT").
+_B_RESTATE = re.compile(
+    r"\b(?:above|over|past|beyond|below|under|exceed|cross)\b[^.;!?]*\b(?:that|it|this|the\s+line)\b",
+    re.IGNORECASE)
+# A full stop splits unless it is a decimal point ("0.60"); ; : ! always split.
+_B_CLAUSES = re.compile(r"[;:!]|(?<!\d)\.|\.(?!\d)|,?\s+(?:and\s+)?then\s+", re.IGNORECASE)
+
+
+def _b_side(cmp: str) -> str:
+    c = re.sub(r"\s+", " ", cmp.lower())
+    upper = {"below", "under", "lower than", "less than", "at most", "no more than",
+             "no higher than", "<=", "<"}
+    # Negated forms ("do not go ABOVE 0.5") cap from above, so their word
+    # names the forbidden side: above/over/past/... -> max.
+    return "max" if c in upper else "min"
+
+
+def _spatial_rule(raw: str, surface: str) -> Optional[Interpretation]:
+    if "?" in raw:
+        return None
+    low = raw.lower()
+    if not (_B_LIFT.search(low) or re.search(r"\b[xy]\b", low)):
+        return None
+    if _B_HYPOTHETICAL.search(low):
+        return None
+    frames: List[Frame] = []
+    unread = False
+    for clause in (c.strip(" ,") for c in _B_CLAUSES.split(raw)):
+        if not clause:
+            continue
+        hit = None
+        for pat, kind in ((_B_LINE_STAY, "line"), (_B_LINE_NEVER, "line"),
+                          (_B_KEEP, "keep"), (_B_NEVER, "never"), (_B_MUST_NOT, "never")):
+            m = pat.search(clause)
+            if m:
+                hit = (m, kind); break
+        if hit is not None:
+            m, kind = hit
+            if kind == "line":
+                side = "current"
+            elif kind == "keep":
+                side = _b_side(m.group("cmp"))
+            else:   # the named comparison is the FORBIDDEN side
+                side = "min" if _b_side(m.group("cmp")) == "max" else "max"
+            frames.append(Frame("boundary", {"axis": m.group("axis").lower(),
+                                             "value": float(m.group("num")),
+                                             "side": side},
+                                m.span(), clause, "set_boundary"))
+            rest = clause[:m.start()] + clause[m.end():]
+            if _B_MOTION.search(_B_FILLER.sub(" ", rest)):
+                unread = True
+            continue
+        # "... until I lift the rule" ENDS a rule; it is not a lift.
+        unfilled = _B_UNTIL.sub(" ", clause)
+        m_lift = _B_LIFT.search(unfilled)
+        if m_lift:
+            frames.append(Frame("clear_boundary", {}, m_lift.span(), clause, "lift_boundary"))
+            rest = unfilled[:m_lift.start()] + unfilled[m_lift.end():]
+            if _B_MOTION.search(_B_FILLER.sub(" ", rest)):
+                unread = True
+            continue
+        core = _B_FILLER.sub(" ", clause).strip(" ,")
+        if not core or (_B_RESTATE.search(clause) and not re.search(r"\d", clause)):
+            continue                     # filler, or a restatement of the rule
+        sub = _interpret(clause, surface, spatial=False)
+        if sub.intent == COMMAND and sub.frames and sub.confidence >= 0.8:
+            frames.extend(sub.frames)
+        else:
+            unread = True
+    if not any(f.tool in ("boundary", "clear_boundary") for f in frames):
+        return None
+    if unread:
+        return Interpretation(
+            CONVERSATION, confidence=0.5, residue=raw,
+            reason="a spatial rule together with something I cannot read exactly")
+    return Interpretation(COMMAND, frames=frames, confidence=0.9,
+                          reason="a standing spatial rule" if any(
+                              f.tool == "boundary" for f in frames)
+                          else "lifts a spatial rule")
+
+
+# ── orders for LATER ("in 15 seconds drive 1 m", "if anything bumps you, ...") ──
+#
+# A delay or a bump is not a condition to evaluate now; it is a trigger the
+# robot must keep, and act on with no further message (ops-bench F2,
+# 2026-09-25). Read only when every clause is exact: a delay in seconds or
+# minutes, or a bump trigger, and an action clause the ordinary parser reads
+# as a drive, turn or stop. Anything else in the sentence sends the whole of
+# it to the model, and the old DEFERRED reading still applies below.
+
+_L_UNIT = r"(?P<u>seconds?|secs?|s|minutes?|mins?)\b"
+_L_DELAY = r"(?P<n>" + _NUM + r")\s*" + _L_UNIT
+# "in 15 seconds, X" / "after 10 s X" / "10 seconds after you arrive, X" /
+# "10 seconds later, X" / "wait 10 seconds and X"
+_L_HEAD = re.compile(
+    r"^\s*(?:(?:in|after|wait(?:\s+for)?|pause(?:\s+for)?)\s+" + _L_DELAY
+    + r"(?:\s+from\s+now)?|" + _L_DELAY.replace("?P<n>", "?P<n2>").replace("?P<u>", "?P<u2>")
+    + r"\s+(?:later|after\s+(?:that|you\s+(?:arrive|get\s+there|finish|are\s+done|stop)))"
+    + r")\s*(?:,|:|and\s+then|then|and)?\s*(?P<rest>.*)$", re.IGNORECASE)
+# "X in 15 seconds"
+_L_TAIL = re.compile(r"^(?P<rest>.+?)\s+(?:in|after)\s+" + _L_DELAY
+                     + r"(?:\s+from\s+now)?\s*$", re.IGNORECASE)
+_L_WATCH = re.compile(
+    r"^\s*(?P<head>if|when|whenever|every\s+time|each\s+time|should)\s+(?:"
+    r"(?:anything|something|anyone|someone|a\s+\w+|an\s+\w+|the\s+\w+)\s+"
+    r"(?:bumps?|hits?|knocks?|pushes|shoves|touches|runs\s+into)\s+(?:into\s+|against\s+)?you"
+    r"|you\s+(?:get|are)\s+(?:bumped|hit|pushed|knocked|shoved|nudged)"
+    r"|you\s+(?:feel|detect|sense)\s+(?:a\s+)?(?:bump|hit|push|knock|nudge|collision))\b"
+    r"\s*(?:,|:|then)?\s*(?P<rest>.*)$", re.IGNORECASE)
+_L_TELL = re.compile(r"(?:,?\s*(?:and|then)\s+)?(?:tell|let)\s+me(?:\s+(?:know|about\s+it))?\s*$",
+                     re.IGNORECASE)
+_L_FILLER = re.compile(
+    r"^(?:and\s+)?(?:(?:stay|remain|wait|keep|hold)\s+(?:where\s+you\s+are|still|put|here|"
+    r"in\s+place)(?:\s+(?:until|till)\s+then)?|(?:don'?t|do\s+not)\s+move\s+(?:until|before|till)"
+    r"\s+then|(?:until|till)\s+then|(?:and\s+)?(?:tell|let)\s+me(?:\s+know)?|please|thanks?)$",
+    re.IGNORECASE)
+# "until then" / "till then" end a filler clause; they are not a sequence.
+_L_SPLIT = re.compile(r"(?<!\d)\.|\.(?!\d)|[;!]|(?<!until)(?<!till),?\s+(?:and\s+)?then\b,?\s*",
+                      re.IGNORECASE)
+_L_ACTIONS = ("drive_forward", "turn", "stop")
+
+
+def _l_seconds(n: str, unit: str) -> float:
+    return float(n) * (60.0 if unit.lower().startswith("m") else 1.0)
+
+
+def _l_action(text: str, surface: str) -> Optional[List[Frame]]:
+    """The action clause as frames, or None if it is not exactly a drive/turn/stop."""
+    text = text.strip(" ,.")
+    if not text:
+        return None
+    sub = _interpret(text, surface, spatial=False)
+    if (sub.intent != COMMAND or sub.confidence < 0.8 or not sub.frames
+            or any(f.tool not in _L_ACTIONS for f in sub.frames)
+            or any(v is None for f in sub.frames for v in f.args.values())):
+        return None
+    return list(sub.frames)
+
+
+def _later_order(raw: str, surface: str) -> Optional[Interpretation]:
+    if "?" in raw or re.search(r"\b(?:could|would)\s+you\b|\bif\s+i\b", raw, re.IGNORECASE):
+        return None
+    decline = Interpretation(CONVERSATION, confidence=0.5, residue=raw,
+                             reason="an order for later with a part I cannot read exactly")
+
+    # A watched order: one trigger, one action (+ "and tell me").
+    w = _L_WATCH.match(raw.strip().rstrip(".!"))
+    if w:
+        rest = w.group("rest")
+        notify = bool(_L_TELL.search(rest))
+        rest = _L_TELL.sub("", rest)
+        frames = _l_action(rest, surface)
+        if frames is None:
+            return decline
+        repeat = w.group("head").lower().startswith(("whenever", "every", "each"))
+        return Interpretation(COMMAND, confidence=0.9, reason="an order for when I am bumped",
+                              frames=[Frame("watch", {"on": "disturbance",
+                                                      "frames": [{"tool": f.tool, "args": dict(f.args)} for f in frames],
+                                                      "notify": notify, "repeat": repeat,
+                                                      "text": rest.strip(" ,.")},
+                                            (0, len(raw)), raw, "watch")])
+
+    frames: List[Frame] = []
+    pending_delay: Optional[float] = None
+    scheduled = 0
+    for clause in (c.strip(" ,") for c in _L_SPLIT.split(raw)):
+        if not clause or _L_FILLER.match(clause):
+            continue
+        h = _L_HEAD.match(clause)
+        t = None if h else _L_TAIL.match(clause)
+        if h or t:
+            m = h or t
+            n = m.group("n") or (m.groupdict().get("n2"))
+            u = m.group("u") or (m.groupdict().get("u2"))
+            delay = _l_seconds(n, u)
+            rest = _L_TELL.sub("", m.group("rest") or "")
+            if not rest.strip(" ,."):
+                pending_delay = delay          # "wait 10 seconds" on its own
+                continue
+            act = _l_action(rest, surface)
+            if act is None or scheduled:
+                return decline
+            frames.append(Frame("schedule", {"delay_s": delay,
+                                             "frames": [{"tool": f.tool, "args": dict(f.args)} for f in act],
+                                             "text": rest.strip(" ,.")},
+                                (0, len(clause)), clause, "schedule"))
+            scheduled += 1
+            continue
+        act = _l_action(clause, surface)
+        if act is None:
+            return decline if scheduled or pending_delay is not None else None
+        if pending_delay is not None:
+            if scheduled:
+                return decline
+            frames.append(Frame("schedule", {"delay_s": pending_delay,
+                                             "frames": [{"tool": f.tool, "args": dict(f.args)} for f in act],
+                                             "text": clause.strip(" ,.")},
+                                (0, len(clause)), clause, "schedule"))
+            scheduled += 1
+            pending_delay = None
+        elif scheduled:
+            return decline                     # an immediate step AFTER a later one
+        else:
+            frames.extend(act)
+    if not scheduled:
+        return None
+    if pending_delay is not None:
+        return decline
+    return Interpretation(COMMAND, confidence=0.9, frames=frames,
+                          reason="an order for later" if len(frames) == 1
+                          else "an order now and one for later")
+
+
 def interpret(text: str, surface: str = MOBILE) -> Interpretation:
     """Parse one operator utterance. Never raises ON THE TEXT; declines instead.
 
@@ -1571,9 +1866,25 @@ def interpret(text: str, surface: str = MOBILE) -> Interpretation:
     return result
 
 
-def _interpret(text: str, surface: str = MOBILE) -> Interpretation:
-    """The parse itself. Wrapped so every return path carries its text."""
-    raw = _normalise(text)
+# A radio-style "Dana: ..." / "Sam (packing): ..." prefix names the speaker.
+# Who spoke matters to the rule store (it decides who may lift a rule), not
+# to what was said: the parser reads the words after it. Without this every
+# prefixed order went to the model (ops-bench dev_zone_route_husky).
+_SPEAKER_PREFIX = re.compile(r"^\s*[A-Z][A-Za-z'\-]{0,30}\s*(?:\([^)]{0,40}\))?\s*:\s+")
+
+
+def _strip_speaker(text: str) -> str:
+    return _SPEAKER_PREFIX.sub("", str(text or ""), count=1)
+
+
+def _interpret(text: str, surface: str = MOBILE,
+               spatial: bool = True) -> Interpretation:
+    """The parse itself. Wrapped so every return path carries its text.
+
+    `spatial=False` skips the spatial-rule guard: _spatial_rule parses the
+    OTHER clauses of a rule sentence through here, and must not re-enter
+    itself on a clause it has already declined."""
+    raw = _normalise(_strip_speaker(text))
     if not raw:
         return Interpretation(EMPTY, reason="nothing was said")
 
@@ -1591,6 +1902,20 @@ def _interpret(text: str, surface: str = MOBILE) -> Interpretation:
         return Interpretation(CONVERSATION, confidence=0.9,
                               reason="a challenge to the robot's own account; "
                                      "only a model may answer it")
+
+    # -- A standing SPATIAL rule, or lifting one ----------------------
+    # Before the memory and prohibition guards, which would otherwise file
+    # "don't let your x go above 0.5" as an unenforceable memory or named
+    # constraint, and before the hold ("until I say so, keep x <= 0.4" was
+    # read as FREEZE until told -- ops-bench F1, 2026-09-25).
+    if spatial and surface in (MOBILE, ANY):
+        rule = _spatial_rule(raw, surface)
+        if rule is not None:
+            return rule
+        # -- An order for LATER: after a delay, or when I am bumped --------
+        later = _later_order(raw, surface)
+        if later is not None:
+            return later
 
     # -- Guard 3: something to remember ------------------------------
     if _MEMORY_CUE.search(low):

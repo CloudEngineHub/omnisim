@@ -26,7 +26,9 @@ Supported URDF features:
   - <inertia ixx ixy ixz iyy iyz izz> (full tensor, positive-definite check)
   - <joint> types: fixed, revolute, continuous, prismatic
   - <origin xyz="x y z" rpy="r p y"/>
-  - <material> with <color rgba="r g b a"/>
+  - <material> with <color rgba="r g b a"/> (alpha < 1 -> transparency),
+    <texture filename="..."/> (-> baseColorMap) and the OmniSim
+    <omnisim roughness=".." metalness=".."/> extension
   - <gazebo reference="LINK"><sensor> for imu/gps/camera/ray
   - <gazebo><plugin filename="..."> for legacy hector_gazebo IMU/GPS
 
@@ -64,6 +66,13 @@ class Origin:
 class Material:
     name: str = ""
     rgba: tuple[float, float, float, float] = (0.5, 0.5, 0.5, 1.0)
+    # Mirrors OmUrdfImporter.cpp: the non-standard <omnisim roughness metalness/>
+    # child (negative = unset -> 0.5 / 0), and the standard <texture filename/>
+    # resolved like a mesh path (emitted as baseColorMap; alpha < 1 as
+    # transparency; the material name as the appearance name).
+    roughness: float = -1.0
+    metalness: float = -1.0
+    texture_path: str = ""
 
 
 @dataclass
@@ -601,18 +610,35 @@ def parse_geometry(elem: ET.Element, urdf_dir: Path) -> Geometry | None:
     return None
 
 
-def parse_material(elem: ET.Element, materials: dict[str, Material]) -> Material:
+def parse_material(elem: ET.Element, materials: dict[str, Material],
+                   urdf_dir: Path | None = None) -> Material:
     name = elem.get("name", "")
+    m = Material(name=name)
+    pbr = elem.find("omnisim")
+    if pbr is not None:
+        for attr in ("roughness", "metalness"):
+            try:
+                setattr(m, attr, min(1.0, max(0.0, float(pbr.get(attr)))))
+            except (TypeError, ValueError):
+                pass
+    tex = elem.find("texture")
+    if tex is not None and tex.get("filename") and urdf_dir is not None:
+        m.texture_path = _resolve_mesh_path(tex.get("filename"), urdf_dir)
     color_elem = elem.find("color")
     if color_elem is not None:
-        rgba = _parse_floats(color_elem.get("rgba"), 4, (0.5, 0.5, 0.5, 1.0))
-        m = Material(name=name, rgba=rgba)
+        m.rgba = _parse_floats(color_elem.get("rgba"), 4, (0.5, 0.5, 0.5, 1.0))
+        if name:
+            materials[name] = m
+        return m
+    if m.texture_path:
+        # A texture with no colour is a complete definition too.
+        m.rgba = (1.0, 1.0, 1.0, 1.0)
         if name:
             materials[name] = m
         return m
     if name and name in materials:
         return materials[name]
-    return Material(name=name)
+    return m
 
 
 def parse_visual(elem: ET.Element, materials: dict[str, Material], urdf_dir: Path) -> Visual:
@@ -623,7 +649,7 @@ def parse_visual(elem: ET.Element, materials: dict[str, Material], urdf_dir: Pat
         visual.geometry = parse_geometry(geom_elem, urdf_dir)
     mat_elem = elem.find("material")
     if mat_elem is not None:
-        visual.material = parse_material(mat_elem, materials)
+        visual.material = parse_material(mat_elem, materials, urdf_dir)
     return visual
 
 
@@ -852,7 +878,7 @@ def parse_urdf(path: Path) -> UrdfRobot:
 
     # Top-level materials
     for m in root.findall("material"):
-        parse_material(m, robot.materials)
+        parse_material(m, robot.materials, urdf_dir)
 
     for link_elem in root.findall("link"):
         link = parse_link(link_elem, robot.materials, urdf_dir)
@@ -999,11 +1025,18 @@ def emit_visual(visual: Visual, indent: str) -> str:
 
     out.append(f"{inner_indent}Shape {{\n")
     if visual.material is not None:
-        r, g, b, _ = visual.material.rgba
+        mat = visual.material
+        r, g, b, a = mat.rgba
         out.append(f"{inner_indent}  appearance PBRAppearance {{\n")
         out.append(f"{inner_indent}    baseColor {r} {g} {b}\n")
-        out.append(f"{inner_indent}    roughness 0.5\n")
-        out.append(f"{inner_indent}    metalness 0\n")
+        out.append(f"{inner_indent}    roughness {mat.roughness if mat.roughness >= 0 else 0.5}\n")
+        out.append(f"{inner_indent}    metalness {mat.metalness if mat.metalness >= 0 else 0}\n")
+        if a < 1.0:
+            out.append(f"{inner_indent}    transparency {1.0 - min(1.0, max(0.0, a))}\n")
+        if mat.texture_path:
+            out.append(f'{inner_indent}    baseColorMap ImageTexture {{ url [ "{mat.texture_path}" ] }}\n')
+        if mat.name:
+            out.append(f'{inner_indent}    name "{mat.name}"\n')
         out.append(f"{inner_indent}  }}\n")
     out.append(emit_geometry(visual.geometry, inner_indent + "  "))
     out.append(f"{inner_indent}}}\n")

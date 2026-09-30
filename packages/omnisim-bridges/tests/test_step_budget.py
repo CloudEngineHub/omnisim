@@ -253,7 +253,48 @@ def test_the_arm_keeps_measurable_as_an_alias_beside_stalled() -> None:
         "stall's; a client reading it for a real arm now sees nothing")
 
 
-@pytest.mark.parametrize("name", ["quadruped", "drone"])
+class _FakeQuadDriver:
+    """Exactly what `_await_driver` reads off the locomotion driver."""
+
+    def __init__(self) -> None:
+        self.completed = None
+        self.seq = 1
+
+
+class _FakeQuad:
+    """The attributes the quadruped bridge's `_await_driver` reads."""
+
+    WAIT_MAX_S = 30.0
+
+    def __init__(self, dt_s: float = 0.008) -> None:
+        self.clock = SimClock(dt_s=dt_s)
+        self.lock = threading.RLock()
+        self.driver = _FakeQuadDriver()
+        self.last_tick_at = time.time()
+
+
+def test_the_quadruped_locomotion_wait_measures_in_steps_and_sees_a_stall() -> None:
+    # `--locomotion crawl|trot` gave the quadruped a BLOCKING completion wait
+    # (walk / turn / go_to report what they measured), so unlike the drone it
+    # can and does tell a stall from a timeout -- with the same verdicts as
+    # the mobile bridge's _await_completion.
+    fn = load_method(QUAD, "_await_driver", {"time": time})
+    q = _FakeQuad()
+    q.driver.completed = {"seq": 1, "verb": "walk", "commanded": 2.0,
+                          "achieved": 2.02, "settled": True}
+    out = fn(q, 1, 5.0)
+    assert out["achieved"] == 2.02 and out["timed_out"] is False
+    q = _FakeQuad()
+    q.last_tick_at = time.time() - 30.0
+    out = fn(q, 1, 5.0)
+    assert out.get("stalled") is True and out.get("timed_out") is False
+    q = _FakeQuad()
+    q.driver.seq = 2                      # a later order took over
+    out = fn(q, 1, 5.0)
+    assert out.get("superseded") is True and out["achieved"] is None
+
+
+@pytest.mark.parametrize("name", ["drone"])
 def test_the_bridges_that_cannot_see_a_stall_do_not_claim_one(name) -> None:
     # An absent field is honest. `stalled: false` from a bridge with no
     # completion wait would be a measurement nobody made -- the same defect

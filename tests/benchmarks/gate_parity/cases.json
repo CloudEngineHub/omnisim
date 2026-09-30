@@ -1164,6 +1164,83 @@
       ]
     },
     {
+      "utterance": "That line no longer applies. Drive forward 0.5 metres.",
+      "tool": "drive_forward",
+      "args": {
+        "distance": 0.5
+      },
+      "surface": null,
+      "registered": false,
+      "rules": []
+    },
+    {
+      "utterance": "The rule does not apply any more, drive forward 1 metre.",
+      "tool": "drive_forward",
+      "args": {
+        "distance": 1
+      },
+      "surface": null,
+      "registered": false,
+      "rules": []
+    },
+    {
+      "utterance": "You may no longer drive into the bay. Drive forward 1 metre.",
+      "tool": "drive_forward",
+      "args": {
+        "distance": 1
+      },
+      "surface": null,
+      "registered": false,
+      "rules": [
+        "prohibition"
+      ]
+    },
+    {
+      "utterance": "That line no longer applies, but don't drive forward 1 metre.",
+      "tool": "drive_forward",
+      "args": {
+        "distance": 1
+      },
+      "surface": null,
+      "registered": false,
+      "rules": [
+        "prohibition",
+        "self_negating"
+      ]
+    },
+    {
+      "utterance": "Reverse 0.25 metres without turning.",
+      "tool": "drive_forward",
+      "args": {
+        "distance": -0.25
+      },
+      "surface": null,
+      "registered": false,
+      "rules": []
+    },
+    {
+      "utterance": "Reverse 0.25 metres without turning.",
+      "tool": "turn",
+      "args": {
+        "angle_rad": 1.5708
+      },
+      "surface": null,
+      "registered": false,
+      "rules": [
+        "self_negating"
+      ]
+    },
+    {
+      "utterance": "Drive forward 0.5 metres. Do not repeat a successful movement.",
+      "tool": "drive_forward",
+      "args": {
+        "distance": 0.5
+      },
+      "surface": null,
+      "registered": false,
+      "rules": []
+    },
+    {
       "utterance": "drive forward 2 metres",
       "tool": "drive_forward",
       "args": {

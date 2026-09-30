@@ -406,8 +406,191 @@ def test_joint_snapshot_no_limit_when_stops_unset():
     })
     snap = observe.joint_snapshot(joint, prev_position=None, dt_s=0.0)
     assert snap["hit_limit"] is None
-    assert snap["lower"] == 0.0
-    assert snap["upper"] == 0.0
+    # Unconstrained is said explicitly, not as a 0..0 range (2026-09-25);
+    # the raw stops are still reported as authored.
+    assert snap["lower"] is None
+    assert snap["upper"] is None
+    assert snap["limit_source"] is None
+    assert snap["stop_lower"] == 0.0
+    assert snap["stop_upper"] == 0.0
+    assert snap["motor_lower"] is None
+    assert snap["motor_upper"] is None
+
+
+# ---------------------------------------------------------------------------
+# Effective joint limits (2026-09-25, reported by an external user): the
+# snapshot and the joint.limit_hit event used minStop/maxStop ONLY, so a
+# joint limited by its motor alone -- every full-range URDF revolute, motor
+# +/-6.283 with the stops unset -- read `lower: 0, upper: 0` and could never
+# report a limit hit. They now use the range the Newton registration hands
+# the solver (OmBasicJoint.cpp): motor minPosition/maxPosition when they
+# differ, else minStop/maxStop, else none.
+# ---------------------------------------------------------------------------
+
+
+class _Devices:
+    """A joint's `device` MF field holding the given device nodes."""
+    def __init__(self, *nodes):
+        self._nodes = list(nodes)
+
+    def getCount(self):
+        return len(self._nodes)
+
+    def getMFNode(self, i):
+        return self._nodes[i]
+
+
+def _limit_joint(position, min_stop=None, max_stop=None, motor_min=None,
+                 motor_max=None, motor=True, typename="HingeJoint"):
+    """A joint stub: JointParameters with optional stops, and optionally a
+    RotationalMotor (preceded by a PositionSensor, so the motor lookup has to
+    scan the device list rather than trust device[0])."""
+    pfields = {"position": position}
+    if min_stop is not None:
+        pfields["minStop"] = min_stop
+    if max_stop is not None:
+        pfields["maxStop"] = max_stop
+    params = _StubNode(pfields, typename="HingeJointParameters")
+    fields = {
+        "jointParameters": _StubField(params),
+        "endPoint": _StubField(_StubNode({"name": "link"})),
+    }
+    motor_node = None
+    if motor:
+        mfields = {"name": "j_motor"}
+        if motor_min is not None:
+            mfields["minPosition"] = motor_min
+        if motor_max is not None:
+            mfields["maxPosition"] = motor_max
+        motor_node = _StubNode(mfields, typename="RotationalMotor")
+        fields["device"] = _Devices(motor_node)
+    return _StubNode(fields, typename=typename), params, motor_node
+
+
+def test_full_range_motor_only_joint_reports_the_motor_range():
+    """Tao's case: URDF revolute at +/-6.283 -> motor limits, stops 0/0."""
+    import observe
+    joint, _, _ = _limit_joint(0.3, min_stop=0.0, max_stop=0.0,
+                               motor_min=-6.283, motor_max=6.283)
+    snap = observe.joint_snapshot(joint, prev_position=None, dt_s=0.0)
+    assert snap["lower"] == pytest.approx(-6.283)
+    assert snap["upper"] == pytest.approx(6.283)
+    assert snap["limit_source"] == "motor"
+    assert snap["stop_lower"] == 0.0 and snap["stop_upper"] == 0.0
+    assert snap["motor_lower"] == pytest.approx(-6.283)
+    assert snap["motor_upper"] == pytest.approx(6.283)
+    assert snap["hit_limit"] is None
+
+
+def test_hit_limit_fires_against_the_motor_limits():
+    import observe
+    joint, _, _ = _limit_joint(0.785, min_stop=0.0, max_stop=0.0,
+                               motor_min=-6.283, motor_max=0.785)
+    snap = observe.joint_snapshot(joint, prev_position=None, dt_s=0.0)
+    assert snap["limit_source"] == "motor"
+    assert snap["hit_limit"] == "upper"
+    joint, _, _ = _limit_joint(-6.2825, motor_min=-6.283, motor_max=0.785)
+    assert observe.joint_snapshot(joint, None, 0.0)["hit_limit"] == "lower"
+    # Outside the tolerance band: no hit.
+    joint, _, _ = _limit_joint(0.78, motor_min=-6.283, motor_max=0.785)
+    assert observe.joint_snapshot(joint, None, 0.0)["hit_limit"] is None
+
+
+def test_stops_only_joint_reports_the_stops():
+    import observe
+    # A motor that declares no range (0/0) and a joint with stops.
+    joint, _, _ = _limit_joint(-0.9, min_stop=-0.9, max_stop=0.9,
+                               motor_min=0.0, motor_max=0.0)
+    snap = observe.joint_snapshot(joint, prev_position=None, dt_s=0.0)
+    assert snap["lower"] == pytest.approx(-0.9)
+    assert snap["upper"] == pytest.approx(0.9)
+    assert snap["limit_source"] == "stops"
+    assert snap["motor_lower"] == 0.0 and snap["motor_upper"] == 0.0
+    assert snap["hit_limit"] == "lower"
+    # A passive joint (no motor at all): same, and the motor fields are null.
+    joint, _, _ = _limit_joint(0.2, min_stop=-0.5, max_stop=0.5, motor=False)
+    snap = observe.joint_snapshot(joint, prev_position=None, dt_s=0.0)
+    assert snap["limit_source"] == "stops"
+    assert snap["motor_lower"] is None and snap["motor_upper"] is None
+    assert snap["hit_limit"] is None
+
+
+def test_joint_with_neither_limit_is_unconstrained():
+    import observe
+    joint, _, _ = _limit_joint(12.0, min_stop=0.0, max_stop=0.0,
+                               motor_min=0.0, motor_max=0.0)
+    snap = observe.joint_snapshot(joint, prev_position=None, dt_s=0.0)
+    assert snap["limit_source"] is None
+    assert snap["lower"] is None and snap["upper"] is None
+    assert snap["hit_limit"] is None
+
+
+def test_motor_range_wins_over_stops_when_both_are_set():
+    """Newton registers the motor range and does not pass the stops to the
+    solver when the motor declares one, so the effective range is the
+    motor's even where the stops differ."""
+    import observe
+    joint, _, _ = _limit_joint(1.0, min_stop=-2.0, max_stop=2.0,
+                               motor_min=-1.0, motor_max=1.0)
+    snap = observe.joint_snapshot(joint, prev_position=None, dt_s=0.0)
+    assert snap["limit_source"] == "motor"
+    assert (snap["lower"], snap["upper"]) == (-1.0, 1.0)
+    assert (snap["stop_lower"], snap["stop_upper"]) == (-2.0, 2.0)
+    assert snap["hit_limit"] == "upper"
+
+
+def test_effective_joint_limits_rule_table():
+    import observe
+    eff = observe.effective_joint_limits
+    assert eff(0.0, 0.0, -6.283, 6.283) == (-6.283, 6.283, "motor")
+    assert eff(-1.0, 1.0, 0.0, 0.0) == (-1.0, 1.0, "stops")
+    assert eff(-1.0, 1.0, None, None) == (-1.0, 1.0, "stops")
+    assert eff(0.0, 0.0, 0.0, 0.0) == (None, None, None)
+    assert eff(None, None, None, None) == (None, None, None)
+    # Equal NON-zero values are "no limit" too: the engine tests `!=`.
+    assert eff(0.5, 0.5, 0.3, 0.3) == (None, None, None)
+
+
+def test_joint_limit_tracker_fires_on_a_motor_only_limit(monkeypatch):
+    """joint.limit_hit used minStop/maxStop only, so a joint limited by its
+    motor alone could never fire it."""
+    import observe
+    from event_bus import EventBus, JointLimitTracker
+    joint, params, motor = _limit_joint(0.0, min_stop=0.0, max_stop=0.0,
+                                        motor_min=-6.283, motor_max=0.785)
+    monkeypatch.setattr(observe, "cached_joints",
+                        lambda sup: [(joint, 7, params, motor)])
+    bus = EventBus()
+    tracker = JointLimitTracker(supervisor=None, bus=bus)
+    tracker.poll(0.0)
+    assert bus.since(0) == []
+    params._fields["position"] = 0.785
+    tracker.poll(8.0)
+    events = bus.since(0)
+    assert len(events) == 1
+    evt = events[0]
+    assert evt["type"] == "joint.limit_hit"
+    assert evt["joint"] == "j_motor"
+    assert evt["side"] == "upper"
+    assert evt["upper"] == pytest.approx(0.785)
+    assert evt["lower"] == pytest.approx(-6.283)
+    assert evt["limit_source"] == "motor"
+    # Hysteresis unchanged: staying in the band does not re-emit.
+    tracker.poll(16.0)
+    assert len(bus.since(0)) == 1
+
+
+def test_joint_limit_tracker_skips_an_unconstrained_joint(monkeypatch):
+    import observe
+    from event_bus import EventBus, JointLimitTracker
+    joint, params, motor = _limit_joint(0.0, min_stop=0.0, max_stop=0.0,
+                                        motor_min=0.0, motor_max=0.0)
+    monkeypatch.setattr(observe, "cached_joints",
+                        lambda sup: [(joint, 7, params, motor)])
+    bus = EventBus()
+    tracker = JointLimitTracker(supervisor=None, bus=bus)
+    tracker.poll(0.0)
+    assert bus.since(0) == []
 
 
 # ---------------------------------------------------------------------------

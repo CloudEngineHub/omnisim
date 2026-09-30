@@ -41,16 +41,18 @@ product from memory instead of from the code, so all four are checked:
   2. an automatic local-model or offline fallback,
   3. the retired keyword ladder ("intent router", "regex router"),
      described as a live code path,
-  4. the WITHDRAWN cost comparisons ("zero cost", "zero account",
-     "costs nothing", "free per task", "cheaper than ...").
+  4. a claim that the AI layer costs nothing ("zero cost", "zero account",
+     "costs nothing", "free per task").
 
 Family 4 was added on 2026-09-22 after the first sweep. The scanner covered
 keyless and ladder language but nothing about price, and
 `projects/samples/demos/worlds/flagship/WAREHOUSE_OMNILINK.md:112` proved the
 gap was real: one table row sold a keyless path *and* priced it, "Zero
-account, zero cost, runs on your GPU." The owner withdrew every cost
-comparison, so a customer-facing page may state what a plan requires and must
-not compare what it costs.
+account, zero cost, runs on your GPU." On 2026-09-27 the owner narrowed the
+rule: a MEASURED cost comparison ("45% lower model cost than a plain loop")
+is allowed again -- cost is a competitive advantage -- so "cheaper than" is no
+longer scanned. What stays forbidden is saying the AI experience is free:
+every plan needs an OmniKey and the user's own provider key.
 
 WHAT THIS TEST DOES NOT DO. A bare phrase list would be useless here,
 because the same words appear legitimately all over the tree:
@@ -164,15 +166,15 @@ FORBIDDEN: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("legacy ladder", re.compile(r"\blegacy\s+ladder", re.I)),
     ("intent router", re.compile(r"\bintent\s+router", re.I)),
     ("regex router", re.compile(r"\bregex\s+router", re.I)),
-    # Family 4: the WITHDRAWN cost comparisons. Two-word phrases for the
-    # same reason as the rest -- a benchmark row reading `$0.00` in a cost
-    # column, or the sentence "the Free plan", is a measurement or a plan
-    # name, not a comparison, and neither matches.
+    # Family 4: "the AI costs nothing". Two-word phrases for the same reason
+    # as the rest -- a benchmark row reading `$0.00` in a cost column, or the
+    # sentence "the Free plan", is a measurement or a plan name, and neither
+    # matches. A measured comparison ("cheaper than") is allowed since
+    # 2026-09-27 and deliberately not scanned.
     ("zero cost", re.compile(r"\b(?:zero|no)\s+cost\b", re.I)),
     ("costs nothing", re.compile(r"\bcosts?\s+(?:you\s+|us\s+|them\s+)?nothing\b", re.I)),
     ("free of charge",
      re.compile(r"\bfree\s+(?:forever|of\s+charge|to\s+run|per\s+\w+)\b", re.I)),
-    ("cheaper than", re.compile(r"\b(?:cheaper|costs?\s+less)\s+than\b", re.I)),
 )
 
 #: A match inside a unit carrying one of these is a retirement notice, a
@@ -336,7 +338,6 @@ VIOLATIONS = [
     "Literal single commands only, matched by regex. Zero setup, zero cost.",
     "Inference stays local and it costs you nothing.",
     "Running the demo this way is free forever.",
-    "Answering a turn locally is cheaper than a platform round-trip.",
 ]
 
 LEGITIMATE = [
@@ -359,6 +360,8 @@ LEGITIMATE = [
     "That row used to say zero cost; the comparison is withdrawn.",
     "This page must never claim the demo is free of charge.",
     "The deterministic parser answers the turn with no model round-trip.",
+    # A measured comparison is allowed again (owner, 2026-09-27).
+    "On 33 tasks it was 45% cheaper than a plain loop per successful task.",
 ]
 
 

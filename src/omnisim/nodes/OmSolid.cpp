@@ -2550,6 +2550,28 @@ static bool isUnfoldedContactDevice(const OmNode *n) {
   return isUnfoldedTouchSensor(n) || isUnfoldedVacuumGripper(n);
 }
 
+// The mass a Solid's Physics node resolves to: the declared `mass` when it is
+// positive, otherwise `density` integrated over the boundingObject -- which is
+// what OmSolid::mass() returns (createOdeMass composes it, same formula as the
+// ODE era). 0 without a Physics node.
+//
+// Reading physics()->mass() alone -- the raw FIELD -- gave -1 for every
+// density-defined body (`Physics { density 250 }`, or a bare `Physics {}`),
+// which counted as 0 and fell through to the 0.25 kg fallback in the
+// registration below: measured 2026-09-27, a 0.2 m box at density 250 (2 kg),
+// a r=0.2 m sphere at density 2000 (67 kg) and a 0.5 m default-density box
+// (125 kg) were ALL registered at 0.25 kg, so a heavy ball bounced off a stack
+// of light blocks. Only `mass`-declared bodies (every URDF link, every shipped
+// demo) were right.
+static double effectiveMass(const OmSolid *s) {
+  const OmPhysics *const p = s->physics();
+  if (p == nullptr)
+    return 0.0;
+  if (p->mass() > 0.0)
+    return p->mass();
+  return s->mass();
+}
+
 // P3.10d: walk a Solid's descendant tree summing masses of Solids that
 // would be filtered as fixed-children. Stops descending into any
 // HingeJoint subtree (those are real articulated bodies that get their
@@ -2560,10 +2582,8 @@ static bool isUnfoldedContactDevice(const OmNode *n) {
 // 2.6 kg wheels would fling the wrapper around like a kite.
 static double rolledUpMass(const OmNode *root) {
   double m = 0.0;
-  if (const OmSolid *rootSolid = dynamic_cast<const OmSolid *>(root)) {
-    if (rootSolid->physics() != nullptr && rootSolid->physics()->mass() > 0.0)
-      m += rootSolid->physics()->mass();
-  }
+  if (const OmSolid *rootSolid = dynamic_cast<const OmSolid *>(root))
+    m += effectiveMass(rootSolid);
   if (const OmGroup *g = dynamic_cast<const OmGroup *>(root)) {
     const OmMFNode &kids = g->children();
     for (int i = 0; i < kids.size(); ++i) {
@@ -2590,7 +2610,7 @@ static double rolledUpMass(const OmNode *root) {
 // Solids. Used by the composite-inertia rollup below.
 static void gatherFixedSolids(const OmNode *root, QList<const OmSolid *> &out) {
   if (const OmSolid *const s = dynamic_cast<const OmSolid *>(root)) {
-    if (s->physics() != nullptr && s->physics()->mass() > 0.0)
+    if (effectiveMass(s) > 0.0)
       out.append(s);
   }
   if (const OmGroup *const g = dynamic_cast<const OmGroup *>(root)) {
@@ -2628,7 +2648,7 @@ static bool rolledUpComInertia(const OmSolid *leader, double &outMass,
   // Per-body world-frame mass, COM and inertia-about-COM.
   auto worldInertia = [](const OmSolid *D, double &m, OmVector3 &cW, OmMatrix3 &IW) {
     const OmPhysics *const p = D->physics();
-    m = p->mass();
+    m = effectiveMass(D);
     const OmMatrix3 R = D->rotationMatrix();
     const OmVector3 pD = D->matrix().translation();
     OmVector3 cl(0.0, 0.0, 0.0);
@@ -3435,6 +3455,10 @@ void OmSolid::flushPendingNewtonRegistrations() {
   // bottom of this function. Without it the census re-fired on EVERY tick and
   // flooded the agent-facing controller.log stream on GET /sim/events.
   int registeredThisFlush = 0;
+  // staticBase roots that received their own colliders this flush, and how
+  // many boundingObjects (root + merged fixed children) went onto them.
+  int staticBaseRootsWithColliders = 0;
+  int staticBaseColliderSources = 0;
   // Inertia provenance, reported in the registration census below. BOTH defects
   // of 2026-09-10 (a URDF <inertia> that never arrived; a Robot root whose
   // inertia was geometry-independent) were invisible from the log: the runtime's
@@ -3700,6 +3724,77 @@ void OmSolid::flushPendingNewtonRegistrations() {
           s->mNewtonBodyIndex = bidx;
           s->mNewtonBodyIsStatic = true;
           ++registeredThisFlush;
+          // OMNISIM_NEWTON_STATIC_BASE_COLLIDERS: value-parsed, default ON; =0
+          // reverts to the shapeless staticBase root (a fixed robot base that
+          // collides with NOTHING). Until 2026-09-30 this branch registered
+          // the root body and `continue`d, so the root's boundingObject never
+          // reached the solver: the compiled MuJoCo model had ZERO geoms on
+          // the base, a URDF arm's own gripper passed 89 mm into its base
+          // plate with OMNISIM_NEWTON_SELF_COLLISION=1, and a part dropped on
+          // a bolted-down arm's base fell through it -- with /sim/contacts
+          // honestly empty and nothing in the log (repro: root_box.urdf,
+          // tests/test_newton_static_base_colliders.py). Attach the root's
+          // own boundingObject, plus the colliders of every joint-free
+          // fixed-child Solid that merges into it (URDF fixed-joint links
+          // under the base), at their pose relative to the root -- the same
+          // harvest the scene-static branch below does, but onto the ONE
+          // welded root body so the hinges keep their parent. A fixed child
+          // that registers a body of its own (a jointed, physics-bearing
+          // Solid; an un-folded contact device) keeps its own collider.
+          // The root is welded to the world (weld id 0), so root-vs-floor /
+          // root-vs-static pairs never generate contacts, and with
+          // OMNISIM_NEWTON_SELF_COLLISION unset the runtime's intra-robot
+          // filter covers the new root shapes like every other link.
+          if (newtonEnvFlag("OMNISIM_NEWTON_STATIC_BASE_COLLIDERS", true)) {
+            const OmQuaternion bqInv = bq.conjugated();
+            QVector<OmNode *> bwalk;
+            bwalk.append(s);
+            int attachedSources = 0;
+            while (!bwalk.isEmpty()) {
+              OmNode *const node = bwalk.takeLast();
+              OmSolid *const sol = dynamic_cast<OmSolid *>(node);
+              if (sol != nullptr && sol != s &&
+                  (sol->mNewtonBodyIndex >= 0 || isUnfoldedContactDevice(sol) ||
+                   (sol->physics() != nullptr && !sol->mJointChildren.isEmpty())))
+                continue;  // owns (or will own) its body and its collider
+              if (sol != nullptr && sol->mBoundingObject != nullptr &&
+                  sol->mBoundingObject->value() != nullptr) {
+                OmBaseNode *const bo = dynamic_cast<OmBaseNode *>(sol->mBoundingObject->value());
+                const double ke = newtonSoftKeForMaterial(sol->mContactMaterial);
+                const double mu = newtonFrictionForSolid(sol->mNewtonFriction);
+                const double muT = newtonFrictionForSolid(sol->mNewtonFrictionTorsional);
+                const double muR = newtonFrictionForSolid(sol->mNewtonFrictionRolling);
+                QString d;
+                if (sol == s) {
+                  d = attachNewtonShapeFromBoundingObject(newton, bidx, bo, ke, mu, muT, muR);
+                } else {
+                  // The child's collider frame expressed in the ROOT body's frame.
+                  OmNewtonShapeXform rel;
+                  rel.t = bqInv * (sol->matrix().translation() - bt);
+                  rel.q = bqInv * OmRotation(sol->rotationMatrix()).toQuaternion();
+                  rel.q.normalize();
+                  if (newtonCompoundCollidersOn())
+                    d = registerNewtonShapesRec(newton, bidx, bo, rel, ke, mu, muT, muR);
+                  if (d.isEmpty())
+                    d = attachNewtonShapeFromBoundingObject(newton, bidx, bo, ke, mu, muT, muR, &rel);
+                }
+                if (!d.isEmpty())
+                  ++attachedSources;
+              }
+              if (const OmGroup *const g = dynamic_cast<const OmGroup *>(node)) {
+                const OmMFNode &kids = g->children();
+                for (int i = 0; i < kids.size(); ++i) {
+                  OmNode *const kid = kids.item(i);
+                  if (kid != nullptr && dynamic_cast<OmBasicJoint *>(kid) == nullptr)
+                    bwalk.append(kid);
+                }
+              }
+            }
+            if (attachedSources > 0) {
+              ++staticBaseRootsWithColliders;
+              staticBaseColliderSources += attachedSources;
+            }
+          }
         }
         continue;
       }
@@ -4229,7 +4324,7 @@ void OmSolid::flushPendingNewtonRegistrations() {
       return;
     const OmVector3 t = ts->matrix().translation();
     const OmQuaternion q = OmRotation(ts->rotationMatrix()).toQuaternion();
-    double mass = ts->physics() != nullptr ? ts->physics()->mass() : 0.0;
+    double mass = effectiveMass(ts);
     if (mass <= 0.0)
       mass = rolledUpMass(ts);
     if (mass <= 0.0) {
@@ -4243,8 +4338,10 @@ void OmSolid::flushPendingNewtonRegistrations() {
       // bumper un-fold above stopped requiring physics, a bumper pad -- which is
       // the common case, and where 0.25 kg on each pad of a small robot would be
       // a physics change smuggled in behind a sensor fix.
-      // A DECLARED Physics node whose mass resolves <= 0 (density-derived) keeps
-      // the old 0.25 kg fallback: the author did ask for a body there.
+      // A DECLARED Physics node whose mass still resolves <= 0 (effectiveMass
+      // resolves density since 2026-09-27, so in practice one whose inertia was
+      // never composed) keeps the old 0.25 kg fallback: the author did ask for
+      // a body there.
       mass = (ts->physics() == nullptr || isUnfoldedVacuumGripper(ts)) ? 1.0e-4 : 0.25;
     }
     // Explicit inertia when the Physics node declares one; zeros otherwise
@@ -4361,6 +4458,10 @@ void OmSolid::flushPendingNewtonRegistrations() {
                           "(statics: %3)")
                       .arg(nDynamic).arg(nStatic).arg(staticNames.join(", ")).arg(registeredThisFlush)
                       .arg(nWorldStatic));
+    if (staticBaseRootsWithColliders > 0)
+      OmLog::info(QString("[OmNewtonBackend] staticBase root colliders: %1 boundingObject(s) attached to %2 "
+                          "fixed robot root(s); OMNISIM_NEWTON_STATIC_BASE_COLLIDERS=0 reverts")
+                      .arg(staticBaseColliderSources).arg(staticBaseRootsWithColliders));
 
     // Inertia provenance. `preset` is the one to read: those bodies have a
     // rotational inertia that no line of the world declares and no geometry

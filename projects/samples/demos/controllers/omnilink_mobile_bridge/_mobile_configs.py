@@ -200,6 +200,10 @@ HUSKY = {
     # 0.3 rad/s) and is flat at 0.53 above ~1.5; the yaw servo closes that
     # remainder, this number sets the ceiling.
     "yaw_rate_gain": 0.520,
+    # Footprint for route planning: 0.99 m x 0.67 m (husky.urdf base_link),
+    # so a 0.45 m clearance radius keeps the body off what it routes around.
+    "body_radius_m": 0.45,
+    "half_length_m": 0.50,
 }
 
 JACKAL = {

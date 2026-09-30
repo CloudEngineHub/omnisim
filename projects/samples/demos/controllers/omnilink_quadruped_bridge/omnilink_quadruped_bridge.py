@@ -32,6 +32,14 @@ this file is the motion and intent surface:
     stop        -- freeze the legs (and wheels) in current position
     home        -- alias for stand
 
+`--locomotion crawl|trot` (Lite3 / X30 only) replaces the config's walk with
+real legged locomotion from `_crawl_motion`: the Deep Robotics creep gait or
+its diagonal trot, on real contact physics with no supervisor pin, and four
+MEASURED verbs -- walk{distance}, turn{angle_rad}, go_to{place} and
+walk_to{x, y} -- that report {commanded, achieved, error, settled}. Places are
+named in the robot's customData: {"places": {"<name>": [x, y, yaw_deg,
+"<description>"], ...}}. Without the flag every robot behaves as before.
+
 Every robot starts with a settle: the motors are ramped from the pose the
 engine spawned them in to the stand pose over the config's `settle_s` (the
 Deep Robotics package notes why: projects/robots/deep_robotics/PROVENANCE.md).
@@ -73,6 +81,7 @@ from _omnilink_relay.http_security import (  # noqa: E402
     checked_origin,
     configured_token,
     error_envelope,
+    finite_number,
     nonempty_string,
     read_json,
     require_field,
@@ -91,6 +100,21 @@ except Exception:
 
 
 from _quadruped_configs import LEGS, QUADRUPED_CONFIGS  # noqa: E402
+
+# Real legged locomotion for the Deep Robotics Lite3 / X30 (`--locomotion`).
+# Optional: without the Deep Robotics package the flag degrades to the
+# config's walk and says so at start-up.
+try:
+    import _crawl_motion  # noqa: E402
+except Exception as _exc:  # pragma: no cover - missing package
+    _crawl_motion = None
+    _CRAWL_IMPORT_ERROR = repr(_exc)
+else:
+    _CRAWL_IMPORT_ERROR = ""
+
+# Bridge leg names -> the crawl model's.
+CRAWL_LEG = {"front_left": "FL", "front_right": "FR",
+             "rear_left": "RL", "rear_right": "RR"}
 
 # Walk parameters (wave gait + supervisor-driven body translation; see
 # omniquad_simple_pose for the longer rationale and physics caveats). The
@@ -121,12 +145,14 @@ def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument("--robot", default="omniquad", choices=sorted(QUADRUPED_CONFIGS))
     p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--locomotion", default="config", choices=("config", "crawl", "trot"))
     args, _ = p.parse_known_args()
     return args
 
 
 class QuadrupedBridge:
-    def __init__(self, robot: Supervisor, robot_id: str = "omniquad") -> None:
+    def __init__(self, robot: Supervisor, robot_id: str = "omniquad",
+                 locomotion: str = "config") -> None:
         self.robot = robot
         self.robot_id = robot_id
         self.cfg = QUADRUPED_CONFIGS[robot_id]
@@ -191,6 +217,26 @@ class QuadrupedBridge:
             except Exception:
                 self.rotation_field = None
 
+        # Called when an OPERATOR halts the robot (relay.cancel_inflight, so a
+        # model turn stops issuing the rest of its plan too).
+        self.on_operator_halt: List[Any] = []
+        # Operator halts, counted BEFORE the halt acts, so route.execute can
+        # see one arrive between the legs of a parsed plan and skip the rest.
+        self.halt_seq = 0
+
+        # -- Real legged locomotion (--locomotion crawl|trot) --------------
+        self.driver = None
+        self.locomotion = "config"
+        self.places: Dict[str, dict] = {}
+        self.walkway_nodes: Dict[str, Tuple[float, float]] = {}
+        self.walkway_edges: Dict[str, List[str]] = {}
+        self.site_bounds: Optional[Tuple[float, float, float, float]] = None
+        self.home_place: Optional[str] = None
+        self.last_q: Optional[Dict[str, Tuple[float, float, float]]] = None
+        self._last_pose: Optional[Tuple[float, float, float]] = None
+        if locomotion != "config":
+            self._setup_driver(locomotion)
+
         # Persistent floating-base anchor (x, y, z), captured lazily on the
         # first body-lock. The body is supervisor-pinned to this every tick so
         # the stiff-legged stance holds upright under any physics backend
@@ -246,7 +292,345 @@ class QuadrupedBridge:
             "walk": self.cfg["walk"],
             "walk_velocity_ms": self.cfg["walk_velocity_ms"],
             "body_lock": bool(self.cfg["body_lock"]),
+            "locomotion": self.locomotion,
+            "places": sorted(self.places),
         }
+
+    # ── Real legged locomotion ────────────────────────────────────
+
+    def _setup_driver(self, gait: str) -> None:
+        if _crawl_motion is None:
+            print("[omnilink_quadruped_bridge] --locomotion %s unavailable (%s); "
+                  "using the config's walk" % (gait, _CRAWL_IMPORT_ERROR), flush=True)
+            return
+        if self.robot_id not in _crawl_motion._dr.ROBOTS:
+            print("[omnilink_quadruped_bridge] --locomotion %s: no gait geometry "
+                  "for %r (only %s); using the config's walk"
+                  % (gait, self.robot_id, ", ".join(sorted(_crawl_motion._dr.ROBOTS))),
+                  flush=True)
+            return
+        terrain = None
+        try:
+            terrain = _crawl_motion._dr.TerrainMap.load(self.robot, "TERRAIN_GEOM", "TERRAIN")
+        except Exception:
+            terrain = None
+        self.driver = _crawl_motion.CrawlDriver(
+            self.robot_id, self.timestep / 1000.0, terrain=terrain, gait=gait)
+        self.locomotion = gait
+        self.places = self._read_places()
+        # The measured verbs exist only in this mode. Bound on the INSTANCE,
+        # so route._call reads their real signatures -- and a config-mode
+        # robot keeps its old act_walk(), whose missing `distance` the
+        # router reports as a dropped slot instead of pretending to honour it.
+        self.act_walk = self._act_walk_measured          # type: ignore[assignment]
+        self.act_turn = self._act_turn_measured          # type: ignore[attr-defined]
+        self.act_go_to = self._act_go_to                 # type: ignore[attr-defined]
+        self.act_walk_to = self._act_walk_to             # type: ignore[attr-defined]
+        # Halts, new orders and questions all get past the action lock in
+        # this mode (do_POST), so a parsed order may wait for its motion and
+        # be answered from what was MEASURED (route.execute; ops-bench P7).
+        self.replies_after_motion = True
+        print("[omnilink_quadruped_bridge] locomotion: %s on real contact physics "
+              "(stride %.2f m/s at %.1f Hz; terrain map: %s; %d named place(s))"
+              % (gait, self.driver.vx_max, self.driver.gait.freq,
+                 "yes" if terrain is not None else "none", len(self.places)), flush=True)
+
+    def _read_places(self) -> Dict[str, dict]:
+        """The site, from the robot's customData (JSON):
+
+            {"places":  {"<name>": [x, y, yaw_deg, "<description>", "<node>"], ...},
+             "walkway": {"nodes": {"<node>": [x, y], ...},
+                         "edges": [["<node>", "<node>"], ...]},
+             "bounds":  [x_min, x_max, y_min, y_max]}
+
+        A place's optional fifth entry names the walkway node it is reached
+        from; go_to then follows the walkway there instead of cutting
+        straight across the site. Nothing here senses obstacles: the walkway
+        is the map of where walking is clear."""
+        try:
+            raw = self.robot.getCustomData() or ""
+            data = json.loads(raw) if raw.strip() else {}
+        except Exception as exc:
+            print("[omnilink_quadruped_bridge] customData is not JSON (%r); no places" % (exc,),
+                  flush=True)
+            return {}
+        walk = data.get("walkway") or {}
+        for n, xy in (walk.get("nodes") or {}).items():
+            try:
+                self.walkway_nodes[str(n)] = (float(xy[0]), float(xy[1]))
+            except Exception:
+                continue
+        for e in walk.get("edges") or []:
+            try:
+                a, b = str(e[0]), str(e[1])
+            except Exception:
+                continue
+            if a in self.walkway_nodes and b in self.walkway_nodes:
+                self.walkway_edges.setdefault(a, []).append(b)
+                self.walkway_edges.setdefault(b, []).append(a)
+        home = data.get("home")
+        if isinstance(home, str) and home:
+            self.home_place = home
+        try:
+            b = data.get("bounds")
+            if b:
+                self.site_bounds = (float(b[0]), float(b[1]), float(b[2]), float(b[3]))
+        except Exception:
+            self.site_bounds = None
+        out = {}
+        for name, spec in (data.get("places") or {}).items():
+            try:
+                x, y = float(spec[0]), float(spec[1])
+                yaw = None if len(spec) < 3 or spec[2] is None else math.radians(float(spec[2]))
+                desc = str(spec[3]) if len(spec) > 3 else ""
+                node = str(spec[4]) if len(spec) > 4 and spec[4] else None
+            except Exception:
+                continue
+            if node is not None and node not in self.walkway_nodes:
+                node = None
+            out[str(name)] = {"x": x, "y": y, "yaw": yaw, "description": desc, "node": node}
+        return out
+
+    def _walkway_route(self, x0: float, y0: float, goal: Optional[str]) -> List[Tuple[float, float]]:
+        """Walkway points from (x0, y0) to node `goal` (shortest path on the
+        graph, entered at the node nearest the robot). [] without a graph."""
+        if goal is None or not self.walkway_nodes:
+            return []
+        nodes = self.walkway_nodes
+
+        def d(a, b):
+            return math.hypot(nodes[a][0] - nodes[b][0], nodes[a][1] - nodes[b][1])
+
+        start = min(nodes, key=lambda n: math.hypot(nodes[n][0] - x0, nodes[n][1] - y0))
+        dist = {start: 0.0}
+        prev: Dict[str, str] = {}
+        todo = set(nodes)
+        while todo:
+            u = min(todo, key=lambda n: dist.get(n, float("inf")))
+            todo.discard(u)
+            if u == goal or dist.get(u, float("inf")) == float("inf"):
+                break
+            for v in self.walkway_edges.get(u, []):
+                alt = dist[u] + d(u, v)
+                if alt < dist.get(v, float("inf")):
+                    dist[v], prev[v] = alt, u
+        if goal not in dist:
+            return []
+        path = [goal]
+        while path[-1] != start:
+            path.append(prev[path[-1]])
+        path.reverse()
+        # Already past the entry node on the first edge? Do not walk back to it.
+        if len(path) >= 2:
+            n0, n1 = nodes[path[0]], nodes[path[1]]
+            if math.hypot(n1[0] - x0, n1[1] - y0) < math.hypot(n1[0] - n0[0], n1[1] - n0[1]):
+                path = path[1:]
+        return [nodes[n] for n in path]
+
+    def _outside_site(self, x: float, y: float) -> bool:
+        b = self.site_bounds
+        return b is not None and not (b[0] <= x <= b[1] and b[2] <= y <= b[3])
+
+    def _find_place(self, place: str) -> Optional[str]:
+        """Exact name, else a case/space/dash-insensitive match, else a
+        unique substring. None when it does not name exactly one place."""
+        if place in self.places:
+            return place
+
+        def norm(t: str) -> str:
+            return re.sub(r"[^a-z0-9]", "", t.lower())
+
+        want = norm(place)
+        exact = [n for n in self.places if norm(n) == want]
+        if len(exact) == 1:
+            return exact[0]
+        sub = [n for n in self.places if want and (want in norm(n) or norm(n) in want)]
+        return sub[0] if len(sub) == 1 else None
+
+    def _stand_target(self, leg: str) -> Tuple[float, float, float]:
+        if self.driver is not None:
+            return tuple(self.driver.stand_q[CRAWL_LEG[leg]])
+        return self._pose(leg, "stand")
+
+    def _read_pose2d(self):
+        """SIM THREAD ONLY. (x, y, yaw, (up_x_body, up_y_body)) or None."""
+        if self.self_node is None:
+            return None
+        try:
+            pos = self.self_node.getPosition()
+            o = self.self_node.getOrientation()
+        except Exception:
+            return None
+        return float(pos[0]), float(pos[1]), math.atan2(o[3], o[0]), (o[6], o[7])
+
+    def _tick_driver(self, sim_t: float) -> None:
+        pose = self._read_pose2d()
+        if pose is None:
+            return
+        x, y, yaw, up = pose
+        self._last_pose = (x, y, yaw)
+        with self.lock:
+            q = self.driver.tick(sim_t, x, y, yaw, up_body=up)
+        self.last_q = {leg: tuple(q[CRAWL_LEG[leg]]) for leg in LEGS}
+        for leg in LEGS:
+            self._apply(leg, *self.last_q[leg])
+
+    def _tick_pose_blend(self, sim_t: float, p: Dict[str, Any]) -> None:
+        a = _smoothstep((sim_t - p["t0"]) / max(1e-6, p["dur"]))
+        q = {leg: tuple(f + (t - f) * a for f, t in zip(p["from"][leg], p["to"][leg]))
+             for leg in LEGS}
+        self.last_q = q
+        for leg in LEGS:
+            self._apply(leg, *q[leg])
+        if a >= 1.0 and p.get("then"):
+            with self.lock:
+                if self.motion[0] == "pose_blend":
+                    self.motion = (p["then"], {"t0": sim_t})
+
+    def _blend_to(self, target: Dict[str, Tuple[float, float, float]],
+                  then: Optional[str], dur: float = 1.2) -> None:
+        start = self.last_q or {leg: self._stand_target(leg) for leg in LEGS}
+        with self.lock:
+            self.motion = ("pose_blend", {"t0": self.sim_time, "dur": dur,
+                                          "from": dict(start), "to": dict(target),
+                                          "then": then})
+
+    def is_busy(self) -> bool:
+        with self.lock:
+            kind = self.motion[0]
+            if kind == "driver" and self.driver is not None:
+                return self.driver.busy() or self.driver.moving()
+            return kind not in ("stop", "stand", "sit", "driver")
+
+    # Longest a motion verb will wait, in sim seconds, whatever it asked.
+    WAIT_MAX_S = 600.0
+
+    def _await_driver(self, seq: int, budget_s: float) -> dict:
+        """Block until driver motion `seq` reports, measured in SIM steps
+        (the mobile bridge's _await_completion, same verdicts)."""
+        span = min(max(budget_s, 1.0), self.WAIT_MAX_S)
+        clock = getattr(self, "clock", None)
+        budget = clock.budget(span) if clock is not None else None
+        deadline = time.time() + span * 4.0
+        while True:
+            with self.lock:
+                done = self.driver.completed
+                latest = self.driver.seq
+            if done is not None and done.get("seq") == seq:
+                out = dict(done)
+                out.setdefault("timed_out", False)
+                return out
+            if latest > seq:
+                return {"seq": seq, "achieved": None, "error": None, "settled": False,
+                        "timed_out": False, "superseded": True,
+                        "note": ("a later command superseded this motion before it "
+                                 "reported; how far it got was not measured -- read "
+                                 "get_robot_state for the live pose")}
+            if budget is not None:
+                if budget.stalled(self.last_tick_at):
+                    return {"seq": seq, "achieved": None, "error": None, "settled": False,
+                            "timed_out": False, "stalled": True, **budget.result(),
+                            "note": "the simulation stopped stepping while this motion "
+                                    "was in flight; nothing could be measured"}
+                if budget.expired():
+                    break
+            elif time.time() > deadline:
+                break
+            time.sleep(0.05)
+        return {"seq": seq, "achieved": None, "error": None, "settled": False,
+                "timed_out": True, **(budget.result() if budget is not None else {}),
+                "note": "wait budget expired before the motion reported; the robot "
+                        "may still be moving -- poll get_robot_state"}
+
+    def _start_driver_verb(self, start) -> int:
+        """Start a driver verb from ANY posture. A sitting, waving or frozen
+        robot is blended back to the gait's standing pose first; the driver
+        holds the verb until the blend hands control back to it."""
+        with self.lock:
+            kind = self.motion[0]
+            self.driver.sim_time = self.sim_time
+            seq = start()
+        if kind != "driver":
+            self._blend_to({leg: self._stand_target(leg) for leg in LEGS},
+                           then="driver", dur=1.0)
+        return seq
+
+    def _accepted(self, seq: int, commanded, unit: str, eta_s: float) -> dict:
+        return {"accepted": True, "seq": seq, "commanded": commanded, "unit": unit,
+                "eta_s": round(eta_s, 1),
+                "note": "NOT complete -- this returns on acceptance. Pass wait=true, "
+                        "or poll get_robot_state until last_motion.seq matches, for "
+                        "the achieved value."}
+
+    def _act_walk_measured(self, distance: Optional[float] = None,
+                           wait: bool = False) -> dict:
+        if distance is None:
+            # No default distance (the owner's rule for every drive, 2026-09-23).
+            return {"accepted": False, "refused": "distance_required",
+                    "error": "no distance was given -- say how far, e.g. "
+                             "'walk forward 2 metres'"}
+        d = float(distance)
+        if not math.isfinite(d) or abs(d) < 0.02:
+            return {"accepted": False, "refused": "distance_too_small",
+                    "error": f"{d} m is not a walk this gait can measure (min 0.02 m)"}
+        seq = self._start_driver_verb(lambda: self.driver.walk(d))
+        eta = abs(d) / 0.3 + 3.0
+        if wait:
+            return {"accepted": True, "commanded": d, "unit": "m",
+                    **self._await_driver(seq, eta * 3.0 + 20.0)}
+        return self._accepted(seq, d, "m", eta)
+
+    def _act_turn_measured(self, angle_rad: float, wait: bool = False) -> dict:
+        a = float(angle_rad)
+        if not math.isfinite(a):
+            return {"accepted": False, "refused": "bad_angle",
+                    "error": "angle is not a number"}
+        seq = self._start_driver_verb(lambda: self.driver.turn(a))
+        eta = abs(a) / 0.25 + 3.0
+        if wait:
+            return {"accepted": True, "commanded": a, "unit": "rad",
+                    **self._await_driver(seq, eta * 3.0 + 20.0)}
+        return self._accepted(seq, a, "rad", eta)
+
+    def _act_walk_to(self, x: float, y: float, yaw_deg: Optional[float] = None,
+                     wait: bool = True, label: Optional[str] = None,
+                     via: Optional[List[Tuple[float, float]]] = None) -> dict:
+        """Walk to (x, y) on the site, optionally ending facing yaw_deg.
+        ALWAYS BLOCKING: its value is the pose it reports reaching."""
+        if not wait:
+            return {"accepted": False, "refused": "wait_false_unsupported",
+                    "message": "walk_to is always blocking -- it reports the pose "
+                               "it actually reached"}
+        if self._outside_site(float(x), float(y)):
+            b = self.site_bounds
+            return {"accepted": False, "refused": "outside_site_bounds",
+                    "error": (f"({float(x):+.2f}, {float(y):+.2f}) is outside the site: "
+                              f"x in [{b[0]}, {b[1]}], y in [{b[2]}, {b[3]}] metres")}
+        pose = self._last_pose
+        yaw = None if yaw_deg is None else math.radians(float(yaw_deg))
+        via = list(via or [])
+        seq = self._start_driver_verb(
+            lambda: self.driver.walk_to(float(x), float(y), yaw, label=label, via=via))
+        pts = ([pose[:2]] if pose else []) + via + [(float(x), float(y))]
+        dist = sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(pts, pts[1:])) or 10.0
+        res = self._await_driver(seq, dist / 0.2 * 3.0 + 60.0)
+        return {"accepted": True, **res}
+
+    def _act_go_to(self, place: str, wait: bool = True) -> dict:
+        name = self._find_place(str(place or ""))
+        if name is None:
+            return {"accepted": False, "refused": "unknown_place",
+                    "error": f"no place called {place!r} on this site",
+                    "known_places": sorted(self.places)}
+        spec = self.places[name]
+        yaw_deg = None if spec["yaw"] is None else math.degrees(spec["yaw"])
+        pose = self._last_pose or (0.0, 0.0, 0.0)
+        via = self._walkway_route(pose[0], pose[1], spec.get("node"))
+        res = self._act_walk_to(spec["x"], spec["y"], yaw_deg, wait=True, label=name, via=via)
+        res["place"] = name
+        if spec.get("description"):
+            res["place_description"] = spec["description"]
+        return res
 
     # ── D4: the joint-limit feed ──────────────────────────────────
 
@@ -427,15 +811,24 @@ class QuadrupedBridge:
                 with self.lock:
                     self.motion = ("crouch", {"t0": sim_t})
         elif kind == "crouch":
-            # Smoothstep from the settle-from pose into the stand over settle_s.
+            # Smoothstep from the settle-from pose into the stand over settle_s
+            # (the gait's own standing pose when --locomotion drives the legs).
             a = _smoothstep((sim_t - p["t0"]) / max(1e-6, float(self.cfg["settle_s"])))
+            q = {}
             for leg in LEGS:
-                target = self._pose(leg, "stand")
+                target = self._stand_target(leg)
                 start = tuple(self.settle_from[(leg, j)] for j in ("hip_x", "hip_y", "knee"))
-                self._apply(leg, *(s + (t - s) * a for s, t in zip(start, target)))
+                q[leg] = tuple(s + (t - s) * a for s, t in zip(start, target))
+                self._apply(leg, *q[leg])
+            self.last_q = q
             if a >= 1.0:
                 with self.lock:
-                    self.motion = ("stand", {"t0": sim_t})
+                    self.motion = ("driver" if self.driver is not None else "stand",
+                                   {"t0": sim_t})
+        elif kind == "driver":
+            self._tick_driver(sim_t)
+        elif kind == "pose_blend":
+            self._tick_pose_blend(sim_t, p)
         elif kind == "stand":
             sway = 0.04 * math.sin(2 * math.pi * (sim_t - p["t0"]) / 3.0)
             self._set_all("stand", hip_y_delta=sway)
@@ -444,10 +837,21 @@ class QuadrupedBridge:
         elif kind == "wave":
             t = sim_t - p["t0"]
             sway = 0.10 * math.sin(2 * math.pi * 0.8 * t)
-            self._set_all("stand", hip_y_delta=sway, hip_x_extra=sway * 0.5)
+            if self.driver is not None:
+                # Around the gait's standing pose, so the wave neither starts
+                # nor ends with a jump to the config's slightly different one.
+                q = {}
+                for leg in LEGS:
+                    hx, hy, kn = self._stand_target(leg)
+                    q[leg] = (hx + sway * 0.5, hy + self.cfg["hip_sweep_dir"][leg] * sway, kn)
+                    self._apply(leg, *q[leg])
+                self.last_q = q
+            else:
+                self._set_all("stand", hip_y_delta=sway, hip_x_extra=sway * 0.5)
             if t > p["duration_s"]:
                 with self.lock:
-                    self.motion = ("stand", {"t0": sim_t})
+                    self.motion = ("driver" if self.driver is not None else "stand",
+                                   {"t0": sim_t})
         elif kind == "walk":
             if self.cfg["walk"] == "wheels":
                 self._tick_drive(sim_t, p)
@@ -524,7 +928,74 @@ class QuadrupedBridge:
 
     # ── Actions ──────────────────────────────────────────────────
 
-    def act_stop(self) -> dict:
+    def _halt_driver(self, budget_s: float = 5.0) -> Optional[dict]:
+        """Fade the gait out and wait (sim steps) until the robot stands.
+        None when the legs were not walking."""
+        with self.lock:
+            walking = (self.motion[0] == "driver" and self.driver is not None
+                       and (self.driver.busy() or self.driver.moving()))
+            if not walking:
+                return None
+            self.driver.sim_time = self.sim_time
+            seq = self.driver.halt()
+        return self._await_driver(seq, budget_s)
+
+    def working(self, relay: Any = None) -> bool:
+        """Is the robot moving, or a model turn still running for it?"""
+        if self.is_busy():
+            return True
+        return bool(relay is not None and getattr(relay, "turn_active", None)
+                    and relay.turn_active())
+
+    def act_stop(self, wait: bool = True, operator: bool = True) -> dict:
+        """`operator` False when a MODEL calls stop_robot as a tool: that
+        must not cancel the model's own turn."""
+        if self.driver is not None:
+            # A walking robot cannot freeze mid-stride: two feet in the air
+            # is not a pose it can hold. Stop = fade the gait into the
+            # standing pose (always statically stable) and MEASURE that it
+            # came to rest.
+            if getattr(self, "hold", None) is not None:
+                self.hold.request_release("stop_robot")
+            if operator:
+                self.halt_seq += 1
+            for cb in (list(self.on_operator_halt) if operator else []):
+                try:
+                    cb()
+                except Exception:
+                    pass
+            if not wait:
+                # The robot window's Stop runs on the SIM THREAD, which is
+                # what has to advance the fade: waiting here would deadlock.
+                with self.lock:
+                    if self.driver.busy() or self.driver.moving():
+                        self.driver.sim_time = self.sim_time
+                        self.driver.halt()
+                    elif self.motion[0] in ("wave", "pose_blend"):
+                        self.motion = ("stop", {})
+                return {"halted_at": time.time(), "stationary": None,
+                        "measured": {"reason": "stop issued; the gait fades into "
+                                               "the standing pose over 1.5 s"}}
+            res = self._halt_driver()
+            if res is None:
+                with self.lock:
+                    if self.motion[0] in ("wave", "pose_blend"):
+                        self.motion = ("stop", {})
+                    # Not walking -- but still say what the body is doing, as
+                    # measured: the driver differences the pose every tick.
+                    v = abs(self.driver.v_meas)
+                return {"halted_at": time.time(), "stationary": v < 0.02,
+                        "measured": {"speed_mps": v, "over_s": self.driver.RATE_WINDOW_S,
+                                     "note": "the legs were not walking"}}
+            with self.lock:
+                v = abs(self.driver.v_meas)
+            still = bool(res.get("settled")) and v < 0.02
+            return {"halted_at": time.time(), "stationary": still,
+                    "measured": {"speed_mps": v, "over_s": self.driver.RATE_WINDOW_S},
+                    "pose": res.get("pose")}
+        return self._act_stop_config()
+
+    def _act_stop_config(self) -> dict:
         # D6: STOP ALWAYS RUNS. Under lockstep the world is frozen between
         # commands; this asks the LOOP to lift the hold. A flag, not a call:
         # releasing touches simulationSetMode, and this runs on an HTTP
@@ -537,6 +1008,14 @@ class QuadrupedBridge:
         return {"halted_at": time.time()}
 
     def act_stand(self) -> dict:
+        if self.driver is not None:
+            self._halt_driver()
+            with self.lock:
+                kind = self.motion[0]
+            if kind != "driver":
+                self._blend_to({leg: self._stand_target(leg) for leg in LEGS},
+                               then="driver", dur=1.2)
+            return {"accepted": True, "pose": "stand"}
         with self.lock:
             # ⚠️ THE CACHED CLOCK, NOT `robot.getTime()`. This runs on an
             # HTTP worker, and the controller API is not thread-safe -- a
@@ -547,12 +1026,19 @@ class QuadrupedBridge:
         return {"accepted": True, "pose": "stand"}
 
     def act_sit(self) -> dict:
+        if self.driver is not None:
+            self._halt_driver()
+            self._blend_to({leg: self._pose(leg, "sit") for leg in LEGS},
+                           then="sit", dur=1.5)
+            return {"accepted": True, "pose": "sit"}
         with self.lock:
             self.motion = ("sit", {})
         self._set_wheels(0.0)
         return {"accepted": True, "pose": "sit"}
 
     def act_wave(self, duration_s: float = 6.0) -> dict:
+        if self.driver is not None:
+            self._halt_driver()
         with self.lock:
             self.motion = ("wave", {"t0": self.sim_time,
                                     "duration_s": duration_s})
@@ -564,7 +1050,12 @@ class QuadrupedBridge:
         return {"accepted": True, "pose": "walk", "walk": self.cfg["walk"],
                 "velocity_ms": self.cfg["walk_velocity_ms"]}
 
-    def act_reset_to_home(self) -> dict:
+    def act_reset_to_home(self, wait: bool = True) -> dict:
+        # With real legs, "go home" is a walk to the site's declared home
+        # place (customData "home"), measured like any go_to -- never a
+        # teleport, and never a stand that the reply calls "home".
+        if self.driver is not None and self.home_place in self.places:
+            return self._act_go_to(self.home_place)
         return self.act_stand()
 
     def get_state(self) -> dict:
@@ -612,7 +1103,33 @@ class QuadrupedBridge:
             "y": None if pos is None else pos[1],
             "z": None if pos is None else pos[2],
             "yaw": yaw,
+            **self._locomotion_state(),
         }
+
+    def _locomotion_state(self) -> dict:
+        if self.driver is None:
+            return {"locomotion": self.locomotion}
+        with self.lock:
+            last = dict(self.driver.completed) if self.driver.completed else None
+            return {"locomotion": self.locomotion,
+                    "busy": self.driver.busy() or self.driver.moving(),
+                    "speed_mps": round(self.driver.v_meas, 3),
+                    "yaw_rate_rps": round(self.driver.w_meas, 3),
+                    "last_motion": last,
+                    "nearest_place": self._nearest_place(),
+                    "places": {n: {"x": p["x"], "y": p["y"], "description": p["description"]}
+                               for n, p in self.places.items()}}
+
+    def _nearest_place(self) -> Optional[dict]:
+        """The named place closest to the robot's last pose, with the distance,
+        so "where are you?" can be answered in the site's own words."""
+        pose = self._last_pose
+        if pose is None or not self.places:
+            return None
+        name = min(self.places, key=lambda n: math.hypot(self.places[n]["x"] - pose[0],
+                                                        self.places[n]["y"] - pose[1]))
+        p = self.places[name]
+        return {"name": name, "distance_m": round(math.hypot(p["x"] - pose[0], p["y"] - pose[1]), 2)}
 
 
 # ── Intent ───────────────────────────────────────────────────────────
@@ -634,6 +1151,20 @@ except ImportError:
     _reply_payload = None
     _shared_short_circuit = None
     _shared_parser_window = None
+
+# Halt preemption and interrupt-first (the mobile bridge's ops-bench P1 / P8),
+# used in --locomotion mode: a walk takes tens of seconds, and a "stop" or a
+# change of plan must not queue behind it.
+try:
+    from omnisim_bridges.route import is_halt_order as _shared_is_halt_order
+    from omnisim_bridges.route import interrupts_motion as _shared_interrupts_motion
+    from omnisim_bridges.route import with_halt_note as shared_with_halt
+except ImportError:
+    _shared_is_halt_order = None
+    _shared_interrupts_motion = None
+
+    def shared_with_halt(halted, out):  # type: ignore[misc]
+        return out
 
     def _shared_stamp_via(payload, default="relay"):  # type: ignore[misc]
         return payload
@@ -772,7 +1303,27 @@ def make_handler(bridge: QuadrupedBridge, relay: Any = None):
                 request_id = validate_request_id(body.pop("id", None))
                 if path not in ("/state", "/get_robot_state", "/list_robots", "/capabilities"):
                     request_ids.claim(path, request_id)
-                if path == "/stop_robot":
+                # --locomotion only (the config-mode demos keep their exact
+                # behaviour): a HALT however phrased skips the lock the running
+                # walk holds, and a NEW instruction while the robot works stops
+                # the work first; a question is answered beside it.
+                halt = aside = False
+                self._halted_first = None
+                if bridge.driver is not None and path == "/prompt" and relay is not None:
+                    text = body.get("text")
+                    halt = bool(_shared_is_halt_order is not None
+                                and _shared_is_halt_order(text, "quadruped"))
+                    if not halt and _shared_interrupts_motion is not None and bridge.working(relay):
+                        if _shared_interrupts_motion(text, "quadruped"):
+                            res = bridge.act_stop()
+                            self._halted_first = {"pose": res.get("pose"),
+                                                  "stationary": res.get("stationary")}
+                        else:
+                            aside = True
+                bypass = (path == "/stop_robot" or halt or aside
+                          or (bridge.driver is not None and path == "/tool"
+                              and body.get("tool") == "stop_robot"))
+                if bypass:
                     self._route_post(body)
                 else:
                     with action_lock:
@@ -840,6 +1391,12 @@ def make_handler(bridge: QuadrupedBridge, relay: Any = None):
                 return self._json(200, bridge.act_reset_to_home())
             if p == "/prompt":
                 text = nonempty_string(require_field(body, "text"), "text")
+                # A walked inspection round outlasts the ordinary chat wait.
+                # Same bound as the mobile bridge: positive, at most 600 s.
+                prompt_timeout_s = finite_number(body.get("timeout_s", 90.0), "timeout_s")
+                if not 0 < prompt_timeout_s <= 600:
+                    raise RequestError(400, "bad_request",
+                                       "timeout_s must be greater than zero and at most 600")
                 if relay is not None:
                     # ── PARSER FIRST ──────────────────────────────────
                     # Reached only WITH a relay: the access check at the
@@ -851,15 +1408,18 @@ def make_handler(bridge: QuadrupedBridge, relay: Any = None):
                     _early = (_shared_short_circuit(bridge, text, "quadruped")
                               if _shared_short_circuit is not None else None)
                     if _early is not None:
-                        return self._json(200, _shared_stamp_via(
+                        return self._json(200, _shared_stamp_via(shared_with_halt(
+                            getattr(self, "_halted_first", None),
                             _reply_payload(_early.get("agent", ""),
                                            _early.get("tools") or [],
-                                           via="parser")))
+                                           via="parser"))))
                     # §5.7.2 / D3: `via` is REQUIRED on a 200 from /prompt.
                     # The parser stamps itself; anything reaching here was
                     # answered by the model relay.
                     return self._json(
-                        200, _shared_stamp_via(relay.dispatch_sync(text)))
+                        200, _shared_stamp_via(shared_with_halt(
+                            getattr(self, "_halted_first", None),
+                            relay.dispatch_sync(text, timeout_s=prompt_timeout_s))))
                 return self._json(503, connection_error())
             if p == "/tool":
                 # Platform-side tool callback. omnilink-agents.com web UI
@@ -895,9 +1455,82 @@ def start_http(bridge: QuadrupedBridge, port: int, relay: Any = None):
     print(f"[omnilink_quadruped_bridge] HTTP on http://127.0.0.1:{port}")
 
 
+def build_locomotion_tools(bridge: QuadrupedBridge) -> List[Any]:
+    """The measured tool set of `--locomotion crawl|trot`. Every motion tool
+    blocks until the robot has stopped and reports what it measured."""
+    places = sorted(bridge.places)
+    place_lines = "; ".join(
+        f"{n}" + (f" ({bridge.places[n]['description']})" if bridge.places[n]["description"] else "")
+        for n in places)
+    tools = [
+        Tool(name="walk", physical=True, surface="quadruped",
+             description=("Walk straight along the current heading by a signed distance in "
+                          "metres (negative = walk backwards), holding the line. Blocks until "
+                          "the robot has stopped; returns the MEASURED distance (achieved), "
+                          "the error and settled. Nothing senses obstacles on the way."),
+             parameters={"type": "object",
+                         "properties": {"distance": {"type": "number",
+                                                     "description": "metres, signed"}},
+                         "required": ["distance"]},
+             dispatch=lambda args: bridge.act_walk(distance=args.get("distance"), wait=True)),
+        Tool(name="turn", physical=True, surface="quadruped",
+             description=("Turn in place by a signed angle in RADIANS: positive = left "
+                          "(counter-clockwise), negative = right. Blocks until settled; "
+                          "returns the measured angle."),
+             parameters={"type": "object",
+                         "properties": {"angle_rad": {"type": "number"}},
+                         "required": ["angle_rad"]},
+             dispatch=lambda args: bridge.act_turn(angle_rad=args.get("angle_rad"), wait=True)),
+    ]
+    if places:
+        tools.append(Tool(
+            name="go_to", physical=True, surface="quadruped",
+            description=("Walk to a named place on this site, following the marked walkway, "
+                         "and stop facing what is there. Blocks until arrived; returns the "
+                         "measured final position and error. Places: " + place_lines),
+            parameters={"type": "object",
+                        "properties": {"place": {"type": "string", "enum": places}},
+                        "required": ["place"]},
+            dispatch=lambda args: bridge.act_go_to(place=args.get("place"))))
+    tools.append(Tool(
+        name="walk_to", physical=True, surface="quadruped",
+        description=("Walk in a straight line to site coordinates (x, y) in metres, optionally "
+                     "ending facing yaw_deg (0 = +x, 90 = +y). Prefer go_to for named places: "
+                     "a straight line is not checked for obstacles."),
+        parameters={"type": "object",
+                    "properties": {"x": {"type": "number"}, "y": {"type": "number"},
+                                   "yaw_deg": {"type": "number"}},
+                    "required": ["x", "y"]},
+        dispatch=lambda args: bridge.act_walk_to(args.get("x"), args.get("y"),
+                                                 args.get("yaw_deg"))))
+    return tools
+
+
 def build_quadruped_tools(bridge: QuadrupedBridge) -> List[Any]:
     if Tool is None:
         return []
+    if bridge.driver is not None:
+        return build_locomotion_tools(bridge) + [
+            Tool(name="stand", description="Stop walking and stand still.",
+                 parameters={"type": "object", "properties": {}},
+                 dispatch=lambda args: bridge.act_stand()),
+            Tool(name="sit", description="Stop and crouch down low.",
+                 parameters={"type": "object", "properties": {}},
+                 dispatch=lambda args: bridge.act_sit()),
+            Tool(name="wave", description="A ~6 s body sway -- a hello gesture.",
+                 parameters={"type": "object", "properties": {}},
+                 dispatch=lambda args: bridge.act_wave()),
+            Tool(name="stop_robot", description=(
+                    "Stop now: the gait fades into the standing pose and the reply says "
+                    "whether the robot was measured at rest."),
+                 parameters={"type": "object", "properties": {}},
+                 dispatch=lambda args: bridge.act_stop(operator=False)),
+            Tool(name="get_robot_state", description=(
+                    "Position (x, y), heading (yaw, rad), speed, whether it is moving, the "
+                    "last motion's measured result, and the named places."),
+                 parameters={"type": "object", "properties": {}},
+                 dispatch=lambda args: bridge.get_state()),
+        ]
     return [
         Tool(name="stand", description="Hold a standing stance with gentle sway.",
              parameters={"type": "object", "properties": {}},
@@ -931,12 +1564,33 @@ def setup_omnilink_relay(bridge: QuadrupedBridge, http_port: int = 8765) -> Opti
     try:
         agent_name = f"OmniSim-{bridge.robot_id}"
         tools = build_quadruped_tools(bridge)
-        main_task = (
-            f"You operate the {bridge.model} in OmniSim through the OmniLink bridge. "
-            f"Available actions: stand, sit, wave, walk ({bridge.cfg['walk']}, "
-            f"{bridge.cfg['walk_velocity_ms']:.2f} m/s), stop_robot. Translate operator "
-            "requests into one tool call. Keep responses short."
-        )
+        if bridge.driver is not None:
+            site = "; ".join(
+                f"{n}: {p['description'] or 'a place'}" for n, p in sorted(bridge.places.items()))
+            main_task = (
+                f"You operate a {bridge.model} four-legged robot in OmniSim through the "
+                "OmniLink bridge. It walks on its own legs with a "
+                f"{bridge.locomotion} gait at about 0.3 m/s and turns in place. "
+                + (f"Named places on this site: {site}. " if site else "")
+                + "Use go_to for a named place (it follows the walkway), walk for a "
+                "distance along the current heading, turn for an angle in radians "
+                "(positive = left). For an order with several steps, call the tools one "
+                "after another in the order given; each call blocks until the robot has "
+                "stopped and returns what was MEASURED. Report measured results, never the "
+                "numbers you asked for. If the operator's order is ambiguous or names a "
+                "place that is not on the list, ask instead of guessing. The robot has no "
+                "obstacle sensing: never walk it off the walkway on a guess. A question "
+                "(where are you, what can you do, what is at a place) is answered from "
+                "get_robot_state and the place list and never moves the robot. Keep "
+                "replies to one or two short sentences."
+            )
+        else:
+            main_task = (
+                f"You operate the {bridge.model} in OmniSim through the OmniLink bridge. "
+                f"Available actions: stand, sit, wave, walk ({bridge.cfg['walk']}, "
+                f"{bridge.cfg['walk_velocity_ms']:.2f} m/s), stop_robot. Translate operator "
+                "requests into one tool call. Keep responses short."
+            )
         relay = OmniLinkRelay(
             omni_key=get_omni_key(),
             agent_name=agent_name,
@@ -989,6 +1643,8 @@ def setup_omnilink_relay(bridge: QuadrupedBridge, http_port: int = 8765) -> Opti
                 event_sink=lambda k, p: _on_relay_event(bridge, k, p),
                 window_raiser=lambda: bridge.queue_window(
                     "system:the platform asked for your attention"))
+        if hasattr(relay, "cancel_inflight"):
+            bridge.on_operator_halt.append(relay.cancel_inflight)
         print(f"[omnilink_quadruped_bridge] OmniLink relay ON (agent='{agent_name}')")
         return relay
     except Exception as e:
@@ -1006,8 +1662,13 @@ def push_configure(bridge: QuadrupedBridge, relay: Any) -> None:
         "robot_class": "quadruped",
         "agent": agent_label,
         **chat_config(relay),
-        "suggestions": ["stand", "sit", "wave hello",
-                        "drive forward" if bridge.cfg["walk"] == "wheels" else "walk", "stop"],
+        "suggestions": (
+            ["walk forward 2 metres", "turn left 90 degrees"]
+            + ([f"go to {sorted(bridge.places)[0]}"] if bridge.places else [])
+            + ["sit", "stop"]
+            if bridge.driver is not None else
+            ["stand", "sit", "wave hello",
+             "drive forward" if bridge.cfg["walk"] == "wheels" else "walk", "stop"]),
     }
     bridge.queue_window("configure:" + json.dumps(cfg))
     bridge.queue_window("status:connected")
@@ -1061,7 +1722,7 @@ def handle_wwi(bridge: QuadrupedBridge, relay: Any, msg: str) -> None:
     if msg.startswith("configure"):
         push_configure(bridge, relay); return
     if msg.startswith("stop"):
-        bridge.act_stop()
+        bridge.act_stop(wait=False)
         bridge.queue_window("agent:Stop received.")
         bridge.queue_window("tool:stop_robot:ok:frozen")
         bridge.queue_window("status:idle"); return
@@ -1118,7 +1779,7 @@ def handle_wwi(bridge: QuadrupedBridge, relay: Any, msg: str) -> None:
 def main() -> int:
     args = _parse_args()
     robot = Supervisor()
-    bridge = QuadrupedBridge(robot, args.robot)
+    bridge = QuadrupedBridge(robot, args.robot, locomotion=args.locomotion)
     relay = setup_omnilink_relay(bridge, http_port=args.port)
     start_http(bridge, args.port, relay)
     # ⚠️ "local" used to be printed here when no relay attached, back when a
@@ -1144,8 +1805,7 @@ def main() -> int:
         # lease can be live: a step against a paused engine blocks, and
         # while it is blocked nobody can un-pause it.
         if hold is not None:
-            with bridge.lock:
-                _busy = bridge.motion[0] not in ("stop", "stand", "sit")
+            _busy = bridge.is_busy()
             hold.sync(robot, busy=_busy, sim_time=bridge.sim_time,
                       step=bridge.sim_step)
             if hold.step_or_hold(robot, timestep, sim_time=bridge.sim_time,

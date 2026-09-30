@@ -520,15 +520,22 @@ ifeq ($(OMNISIM_WITH_NEWTON),ON)
   #
   # PYTHON_HOME is the path to a CPython install with both Python.h
   # under include/ and pythonNNN.lib under libs/. On Windows we probe
-  # the python.org per-user install location for any 3.10+ version
-  # (newest wins); override via the environment for anything else.
+  # the python.org per-user install location: Python312 when it is there
+  # (the supported embed version), otherwise the newest 3.NN found;
+  # override via PYTHON_HOME= / PYTHON_LIB= for anything else.
   ifeq ($(OSTYPE),windows)
     ifeq ($(origin PYTHON_HOME),undefined)
       # python.org per-user installs land in %LOCALAPPDATA%\Programs\Python;
       # probe every env spelling of that root so the build works from cmd,
       # PowerShell and stripped-down CI shells alike.
       PY_ROOTS := $(subst \,/,$(LOCALAPPDATA))/Programs/Python $(subst \,/,$(USERPROFILE))/AppData/Local/Programs/Python C:/Users/$(USERNAME)/AppData/Local/Programs/Python
-      PYTHON_PROBE := $(lastword $(sort $(wildcard $(addsuffix /Python3[0-9][0-9]/include/Python.h,$(PY_ROOTS)))))
+      # 3.12 FIRST, newest only as the fallback. Until 2026-09-29 this took
+      # the newest outright, so a machine with 3.12 AND 3.14 installed side
+      # by side silently embedded 3.14 -- the version the quickstart calls
+      # wheel-fragile -- and nothing said so (external report, 2026-08-29).
+      # tests/test_makefile_python_probe.py runs these two lines under make.
+      PY_PROBE_ALL := $(sort $(wildcard $(addsuffix /Python3[0-9][0-9]/include/Python.h,$(PY_ROOTS))))
+      PYTHON_PROBE := $(firstword $(filter %/Python312/include/Python.h,$(PY_PROBE_ALL)) $(lastword $(PY_PROBE_ALL)))
       ifeq ($(PYTHON_PROBE),)
         # Fall back to the Windows py launcher (C:\Windows, so on PATH even
         # in stripped shells, and never shadowed by the MSYS2 python).
@@ -549,6 +556,10 @@ endif
       endif
       ifneq ($(PYTHON_PROBE),)
         PYTHON_HOME := $(patsubst %/include/Python.h,%,$(PYTHON_PROBE))
+        # Make the choice visible when it is not the supported version.
+        ifeq ($(filter %/Python312,$(PYTHON_HOME)),)
+          $(warning embedding CPython from $(PYTHON_HOME) -- not Python312, the supported version. Pass PYTHON_HOME=<Python312 dir> to pick it explicitly; `make linker-info` prints the choice)
+        endif
       else
         $(error OMNISIM_WITH_NEWTON=ON embeds CPython and needs its build headers. Install Python 3 from python.org (default per-user location), or pass PYTHON_HOME=<dir containing include/Python.h and libs/pythonNNN.lib> plus PYTHON_LIB=-lpythonNNN as make arguments. OMNISIM_WITH_NEWTON=OFF builds a renderer/controller shell with no working physics backend)
       endif
@@ -1120,6 +1131,7 @@ linker-info:
 	@echo "linker: $(OMNISIM_LINKER) -> $(OMNISIM_LINKER_RESOLVED)$(if $(filter auto,$(OMNISIM_LINKER)), (auto-selected; pin bfd/lld for cross-machine binary identity))"
 	@echo "precompiled header: $(OMNISIM_USE_PCH)"
 	@echo "ccache: $(if $(OM_CCACHE),$(OM_CCACHE),not used)$(if $(OM_CCACHE), (CCACHE_DIR=$(CCACHE_DIR)))"
+	@echo "embedded python: $(if $(PYTHON_HOME),$(PYTHON_HOME),none (OMNISIM_WITH_NEWTON=$(OMNISIM_WITH_NEWTON)))$(if $(filter environment command line,$(origin PYTHON_HOME)), (PYTHON_HOME given),)"
 
 ifneq ($(PCH_FILE),)
 $(PCH_WRAPPER): $(PCH_SOURCE)

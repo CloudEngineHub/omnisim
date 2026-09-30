@@ -636,7 +636,13 @@ public:
                         double targetKe = 0.0, double targetKd = 0.0,
                         double limitLower = 0.0, double limitUpper = 0.0,
                         double effortLimit = 0.0, double velocityLimit = 0.0,
+                        double childRotX = 0.0, double childRotY = 0.0,
+                        double childRotZ = 0.0, double childRotW = 1.0,
                         double initialPosition = 0.0);
+  // childRot* (2026-09-27): the same R_child^T * R_parent quaternion the
+  // revolute takes. A slider only translates, so the child's authored
+  // orientation relative to its parent must be kept in child_xform or the
+  // child is registered at the parent's orientation.
   // Hinge2 / universal joint -- 2-DoF rotation about two axes sharing one anchor (a caster's steer + roll,
   // or a car front wheel). Built natively as a Newton d6 joint with two FREE angular DoF (passive); the
   // capability gate admits it alongside Hinge/Slider (newton-ode-replacement-plan.md W2).

@@ -1062,7 +1062,12 @@ TOOLS = {
     ),
     "get_robot_joints": (
         t_get_robot_joints,
-        "Per-joint snapshot for one robot (position, velocity, limits, hit_limit).",
+        "Per-joint snapshot for one robot (position, velocity, limits, hit_limit). "
+        "`lower`/`upper` are the EFFECTIVE limits the physics enforces: the motor's "
+        "minPosition/maxPosition when they differ, else the joint's minStop/maxStop, "
+        "else null; `limit_source` is \"motor\" | \"stops\" | null (unconstrained). "
+        "The raw values are `stop_lower`/`stop_upper` and `motor_lower`/`motor_upper` "
+        "(null with no motor).",
         {"type": "object",
          "properties": {"def": {"type": "string", "description": "the robot's DEF name"}},
          "required": ["def"]},

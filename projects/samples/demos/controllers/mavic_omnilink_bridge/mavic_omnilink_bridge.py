@@ -342,6 +342,51 @@ _STILL_V_Z = 0.05
 _FLIGHT_WALL_CAP_S = 300.0
 
 
+def _appearances_named(root, name: str) -> list:
+    """Every PBRAppearance under `root` whose `name` field is `name`.
+
+    Walks the fields a robot tree is built from (children, endPoint,
+    appearance); run once at start-up, never per tick."""
+    found, stack = [], [root]
+    while stack:
+        node = stack.pop()
+        if node is None:
+            continue
+        if node.getTypeName() == "PBRAppearance":
+            f = node.getField("name")
+            if f is not None and f.getSFString() == name:
+                found.append(node)
+            continue
+        f = node.getField("children")
+        if f is not None:
+            stack.extend(f.getMFNode(i) for i in range(f.getCount()))
+        for sf in ("endPoint", "appearance"):
+            f = node.getField(sf)
+            if f is not None:
+                stack.append(f.getSFNode())
+    return found
+
+
+def _airframe_disclosure(airframe) -> dict:
+    """What /capabilities says about the flight model, so nothing downstream
+    (a client, a film's notes) can mistake a modelled effect for a measured
+    one. The Mavic declares no airframe: `declared` false, no effects."""
+    af = airframe or {}
+    effects = [label for key, label in (
+        ("motor_tau_s", "rotor_spin_up_lag"),
+        ("ground_effect_rotor_radius_m", "ground_effect"),
+        ("drag_coeff", "quadratic_drag"),
+        ("wind", "wind_and_turbulence")) if af.get(key)]
+    out = {"declared": bool(af), "modelled_effects": effects,
+           "control_overrides": sorted((af.get("control") or {}).keys())}
+    if af.get("wind"):
+        w = af["wind"]
+        out["wind"] = {"kind": "MODELLED: seeded Ornstein-Uhlenbeck gusts, not measured air",
+                       "mean_m_s": w.get("mean"), "gust_sigma_m_s": w.get("gust_sigma"),
+                       "tau_s": w.get("tau_s"), "seed": w.get("seed")}
+    return out
+
+
 def _flight_snapshot(state) -> dict:
     with state.lock:
         return {"x": state.x, "y": state.y, "z": state.z, "yaw": state.yaw,
@@ -570,6 +615,29 @@ MAX_PITCH_DISTURBANCE = -1.0   # negative = pitch nose down to fly forward
 
 # Approach-target precision (meters).
 WAYPOINT_REACH_TOL_M = 0.6
+# Landing (2026-09-25): heights ABOVE the measured resting height. Below
+# LAND_FLARE_M the setpoint drops to LAND_SINK_M under the ground, so the
+# descent slows to a touchdown; the motors cut once the aircraft is within
+# LAND_TOUCH_M of rest and nearly still, or LAND_FLARE_TIMEOUT_S sim seconds
+# into the flare.
+LAND_FLARE_M = 0.35
+LAND_SINK_M = 0.05
+LAND_TOUCH_M = 0.03
+LAND_TOUCH_VZ = 0.15
+LAND_FLARE_TIMEOUT_S = 3.0
+# Gains a world may override per airframe through customData
+# {"rotor_dynamics": {..., "control": {NAME: value}}} (2026-09-25). They were
+# tuned on the Mavic; another airframe (mass, inertia, arm length) needs its own.
+# Integrate the position error only this close to the target (default: the
+# whole hold radius, as before). A short move otherwise winds the integrator up
+# in transit and overshoots: the x500 passed a 2 m target by 12 cm.
+XY_I_RADIUS_M = POS_HOLD_RADIUS_M
+HEADING_HOLD = 0.0      # opt-in: see the flight loop
+PROP_DISC_MIN_T = 0.85  # rotor blur disc transparency at hover speed
+TUNABLE_GAINS = ("K_POS", "K_XY_V", "K_XY_I", "XY_I_CLAMP", "MAX_HOLD_TILT", "XY_I_RADIUS_M",
+                 "HEADING_HOLD", "MAX_YAW_DISTURBANCE",
+                 "K_VERTICAL_P", "K_VERT_D", "K_VERT_I", "K_ROLL_P", "K_PITCH_P",
+                 "K_ATT_D", "ATT_SCALE", "K_YAW_D")
 
 # Stall detection (public issue #14). A flight campaign measured two flights that
 # wedged against an obstacle and sat there for 212 s and 40 s while the bridge
@@ -872,6 +940,8 @@ class BridgeState:
         self.yaw = 0.0
         # Velocities — derived from successive poses each tick.
         self.last_pose_for_v = None  # (x, y, z, t)
+        self.rest_z: Optional[float] = None     # measured ground-rest altitude
+        self.flare_since: Optional[float] = None
         self.v_xy = 0.0
         self.v_z = 0.0
         # Commanded setpoints (consumed by the flight loop).
@@ -1325,6 +1395,9 @@ def make_handler(state: BridgeState):
                     "world_title": state.world_title,
                     "mission_brief": state.mission_brief,
                     "mission_complete": state.mission_complete,
+                    # The flight model, disclosed (2026-09-25): which effects
+                    # are MODELLED for this airframe, wind included.
+                    "airframe": _airframe_disclosure(getattr(state, "airframe", None)),
                     "ground_truth_def_names": list(state.gt_def_names),
                     # PROTOCOL.md 5.2.1. `ungated_paths` is the load-bearing
                     # half: it is what a client reads to decide whether IT
@@ -1983,7 +2056,43 @@ def main():
     airframe = airframe_from_custom_data(supervisor.getCustomData())
     if airframe:
         print(f"[mavic_omnilink_bridge] airframe from customData: {airframe}")
+        for name, value in (airframe.get("control") or {}).items():
+            if name in TUNABLE_GAINS:
+                globals()[name] = float(value)
+            else:
+                print(f"[mavic_omnilink_bridge] ignoring unknown control gain {name!r}")
     dynamics = RotorDynamics(self_node, airframe)
+    # Rotor blur discs (optional): a world may give its spinning props a
+    # translucent disc, found either as appearances DEF'd PROP_DISC_0..3 or --
+    # for a plain URDFRobot -- as every PBRAppearance named after the URDF
+    # material the airframe declares in `rotor_disc_material` (the importer
+    # carries a material's name onto its appearance). They are faded in with
+    # rotor speed -- invisible with the motors off, PROP_DISC_MIN_T transparent
+    # at hover -- because a camera sees a spinning prop as a blur, while the
+    # renderer draws a sharp blade at an arbitrary angle each frame.
+    prop_discs = []
+    for i in range(4):
+        node = supervisor.getFromDef(f"PROP_DISC_{i}")
+        field = node.getField("transparency") if node is not None else None
+        if field is not None:
+            prop_discs.append(field)
+    disc_material = (airframe or {}).get("rotor_disc_material")
+    if disc_material and not prop_discs:
+        prop_discs = [n.getField("transparency")
+                      for n in _appearances_named(self_node, str(disc_material))]
+        print(f"[mavic_omnilink_bridge] rotor discs: {len(prop_discs)} appearances "
+              f"named {disc_material!r}")
+    disc_state = {"t": None}
+
+    def _fade_prop_discs():
+        if not prop_discs:
+            return
+        frac = min(1.0, dynamics.rotor_speed() / K_VERTICAL_THRUST)
+        t_now = 1.0 - (1.0 - PROP_DISC_MIN_T) * frac
+        if disc_state["t"] is None or abs(t_now - disc_state["t"]) > 0.02:
+            for f in prop_discs:
+                f.setSFFloat(t_now)
+            disc_state["t"] = t_now
 
     # Gimbal pitch motor — drives the camera angle. Default to straight
     # down so /scan's world projection works out of the box.
@@ -2002,6 +2111,7 @@ def main():
     initial_rotation = list(rotation_field.getSFRotation()) if rotation_field else [0.0, 0.0, 1.0, 0.0]
 
     state = BridgeState()
+    state.airframe = airframe       # disclosed in /capabilities
     state.supervisor = supervisor   # type: ignore[attr-defined]
     state.tick_period_s = time_step / 1000.0
     state.camera_w = cam_w
@@ -2088,15 +2198,23 @@ def main():
         roll_acc = K_ATT_D * roll_rate
         pitch_acc = K_ATT_D * pitch_rate
 
-        # Update measured velocities from successive poses.
-        now = time.time()
+        # Update measured velocities from successive poses -- over SIM time,
+        # like the control law above. Until 2026-09-23 this used wall-clock
+        # dt, so the published v_xy / v_z read ~16x low whenever the world ran
+        # below real time (0.06x under 1080p capture): the aircraft reported
+        # itself still at 0.3-0.5 m/s, a waiting flight tool returned while
+        # it was still moving, and the land that followed pinned a touchdown
+        # point it overflew by 0.47 m. The land cut-off below (|v_z| < 0.3)
+        # read the same number. At real time the two clocks agree.
+        now = time.time()           # still stamps last_tick_at below
+        now_sim = state.sim_time
         prev = state.last_pose_for_v
         if prev is not None:
-            dt = now - prev[3]
-            if dt > 1e-3:
+            dt = now_sim - prev[3]
+            if dt > 1e-6:
                 state.v_xy = math.hypot(x_pos - prev[0], y_pos - prev[1]) / dt
                 state.v_z = (altitude - prev[2]) / dt
-        state.last_pose_for_v = (x_pos, y_pos, altitude, now)
+        state.last_pose_for_v = (x_pos, y_pos, altitude, now_sim)
 
         with state.lock:
             state.x = x_pos
@@ -2122,6 +2240,19 @@ def main():
             target_altitude = state.target_altitude
             target_yaw = state.target_yaw
             mode = state.mode
+        # Heading hold (opt-in per airframe, HEADING_HOLD): latch the heading a
+        # flight starts with, so wind or turbulence cannot walk it away. Without
+        # it only yaw RATE is damped; with seeded turbulence the x500 wandered to
+        # 106 deg in one hop and "forward" flew it sideways.
+        if HEADING_HOLD:
+            if mode in ("takeoff", "hover", "goto", "land") and target_yaw is None:
+                with state.lock:
+                    state.target_yaw = yaw
+                target_yaw = yaw
+            elif mode in ("idle", "landed") and target_yaw is not None:
+                with state.lock:
+                    state.target_yaw = None
+                target_yaw = None
 
         # Mode-specific setpoint computation.
         roll_disturbance = 0.0
@@ -2175,7 +2306,7 @@ def main():
                 e_fwd = dx * cy + dy * sy
                 e_right = dx * sy - dy * cy
                 # +pitch_input lifts the FRONT pair -> nose up -> backward.
-                if dist_xy < POS_HOLD_RADIUS_M:
+                if dist_xy < XY_I_RADIUS_M:
                     state.xy_i_fwd = clamp(state.xy_i_fwd + K_XY_I * e_fwd * state.tick_period_s,
                                            -XY_I_CLAMP, XY_I_CLAMP)
                     state.xy_i_right = clamp(state.xy_i_right + K_XY_I * e_right * state.tick_period_s,
@@ -2205,13 +2336,32 @@ def main():
                 yaw_disturbance = MAX_YAW_DISTURBANCE * ye / (2.0 * math.pi)
 
         if mode == "land":
-            # Bring vertical setpoint smoothly to ground; below 0.4 m -> idle motors.
-            if altitude < 0.4 and abs(state.v_z) < 0.3:
+            # Touch down, then idle the motors. Until 2026-09-25 the motors
+            # cut at a FIXED altitude < 0.4 m: the Mavic rests at ~0.04 m, so
+            # it fell the last ~0.35 m, and a PX4 x500 on 0.23 m skids fell
+            # ~0.17 m -- a visible drop, not a landing. Now the height is
+            # measured above the aircraft's own resting height (rest_z, read
+            # while it sat idle), the final approach aims just below the
+            # ground so the descent slows to a touchdown, and the motors cut
+            # once it rests on the ground (or after LAND_FLARE_TIMEOUT_S).
+            rest = state.rest_z if state.rest_z is not None else 0.0
+            h = altitude - rest
+            if h < LAND_FLARE_M:
+                if state.flare_since is None:
+                    state.flare_since = state.sim_time
+                with state.lock:
+                    state.target_altitude = rest - LAND_SINK_M
+            touched = h < LAND_TOUCH_M and abs(state.v_z) < LAND_TOUCH_VZ
+            timed_out = (state.flare_since is not None
+                         and state.sim_time - state.flare_since > LAND_FLARE_TIMEOUT_S)
+            if touched or timed_out:
                 with state.lock:
                     state.mode = "landed"
                     state.target_altitude = 0.0
+                state.flare_since = None
                 for m in motors:
                     m.setVelocity(0.0)
+                dynamics.idle()
                 return
 
         # Stabiliser PID (verbatim from mavic2pro.py — don't rebalance).
@@ -2243,6 +2393,12 @@ def main():
         if mode == "idle" or mode == "landed":
             for m in motors:
                 m.setVelocity(0.0)
+            dynamics.idle()
+            # Resting on the ground with the motors off: this altitude IS the
+            # airframe's ground height (skids, belly box), which the landing
+            # flare measures from.
+            if abs(state.v_z) < 0.02:
+                state.rest_z = altitude
             return
 
         front_left.setVelocity(front_left_input)
@@ -2253,7 +2409,8 @@ def main():
         # Replace the Propeller-node lift/torque the legacy PROTO did
         # automatically. Pass raw signed inputs — RotorDynamics squares
         # for thrust and uses pair asymmetry for yaw torque.
-        dynamics.step(front_left_input, front_right_input, rear_left_input, rear_right_input)
+        dynamics.step(front_left_input, front_right_input, rear_left_input, rear_right_input,
+                      dt=time_step / 1000.0)
 
         # Gimbal: walk the commanded position toward the target at
         # GIMBAL_RATE_RAD_S (issue #14 -- a step command ejects the parked
@@ -2293,6 +2450,7 @@ def main():
                 state.v_z = 0.0
 
         _flight_step()
+        _fade_prop_discs()
 
         # Drain wwi inbox (robot-window messages from the chat side panel).
         while True:

@@ -631,5 +631,54 @@ class TestUrdfImport(unittest.TestCase):
         self.assertTrue(any("cannot decode" in w for w in report["warnings"]))
 
 
+    # -- materials: texture, transparency, appearance name (2026-09-25) ----
+    # Mirrors OmUrdfImporter.cpp. Both importers used to drop <texture> and
+    # colour alpha, so a carbon-fibre frame or a see-through rotor disc needed
+    # a hand-patched robot instead of plain URDF.
+
+    def _material_robot(self, material_xml: str) -> str:
+        path = self.write_urdf(
+            f"""\
+            <?xml version="1.0"?>
+            <robot name="mat">
+              {material_xml}
+              <link name="base">
+                <visual>
+                  <geometry><cylinder radius="0.1" length="0.002"/></geometry>
+                  <material name="disc"/>
+                </visual>
+                <inertial><mass value="1.0"/></inertial>
+              </link>
+            </robot>
+            """
+        )
+        (path.parent / "cf.png").write_bytes(b"png")
+        return self.urdf_import.emit_robot(self.urdf_import.parse_urdf(path))
+
+    def test_texture_alpha_and_name_reach_the_appearance(self):
+        vrml = self._material_robot(
+            '<material name="disc"><color rgba="0.1 0.2 0.3 0.15"/>'
+            '<texture filename="cf.png"/><omnisim roughness="0.3" metalness="0.8"/></material>')
+        self.assertIn("baseColor 0.1 0.2 0.3", vrml)
+        self.assertIn("transparency 0.85", vrml)
+        self.assertRegex(vrml, r'baseColorMap ImageTexture \{ url \[ ".*/cf\.png" \] \}')
+        self.assertIn('name "disc"', vrml)
+        self.assertIn("roughness 0.3", vrml)
+        self.assertIn("metalness 0.8", vrml)
+
+    def test_a_texture_only_material_is_white_and_textured(self):
+        vrml = self._material_robot('<material name="disc"><texture filename="cf.png"/></material>')
+        self.assertIn("baseColor 1.0 1.0 1.0", vrml)
+        self.assertIn("cf.png", vrml)
+        self.assertNotIn("transparency", vrml)
+
+    def test_an_opaque_untextured_material_gains_only_its_name(self):
+        vrml = self._material_robot('<material name="disc"><color rgba="0.5 0.5 0.5 1"/></material>')
+        self.assertNotIn("transparency", vrml)
+        self.assertNotIn("baseColorMap", vrml)
+        self.assertIn("roughness 0.5", vrml)
+        self.assertIn('name "disc"', vrml)
+
+
 if __name__ == "__main__":
     unittest.main()

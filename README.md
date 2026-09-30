@@ -72,6 +72,51 @@ are itemised in [what OmniSim is worse at](#what-omnisim-is-worse-at).
 
 ---
 
+## How OmniLink compares in OmniSim
+
+**In the original study, OmniLink kept the most commitments among seven configurations** in a
+blind 30-minute warehouse shift: **89.9%**, versus **47.9–78.8%** for the other
+configurations. Every agent used Gemini 3.5 Flash on the same simulated Husky,
+with 33 scored checks and three repeats each.
+
+[![Warehouse-shift commitments kept: seven original Gemini configurations and Codex with GPT-6.1 Sol, high reasoning, tested later. Three repeats each; higher is better.](docs/media/benchmarks/omnilink-shift-comparison.svg)](https://www.omnilink-agents.com/benchmarks/operations-shift/index.html)
+
+A later retrospective run of **Codex with GPT-6.1 Sol, high reasoning, scored 76.8%**
+on the same shift across three repeats, with one check flagged unsafe in
+one of three episodes. It used the same full robot tools and instructions, but a
+different model and later build; three simulators ran together rather than seven.
+Each Codex session was isolated from the test script and previous results.
+This is a system comparison, not a fresh blind or model-controlled test.
+[Codex conditions and evidence](https://www.omnilink-agents.com/benchmarks/operations-shift/index.html#codex-extension).
+
+**OmniLink also had the lowest estimated model cost in the original study:**
+**$0.90 per scored shift**, 32–59% below the six original comparison configurations.
+**Codex's actual cost is unavailable and is excluded from the cost ranking.**
+Its recorded tokens produce a conditional $0.91-per-shift Standard API pricing
+scenario with 98.1% cached input. This does not establish its subscription charge,
+API cache-write cost or a cost tie with OmniLink.
+
+[![Estimated model cost per scored warehouse shift for the seven Gemini 3.5 Flash configurations. Codex is excluded because its actual cost is unavailable. Lower is better.](docs/media/benchmarks/omnilink-shift-cost.svg)](https://www.omnilink-agents.com/benchmarks/operations-shift/index.html#cost)
+
+The cost graph counts all model usage recorded for the three scored shifts,
+including failed checks. Original infrastructure errors and the superseded Codex
+wave are reported separately in the [cost ledger and pricing conditions](https://www.omnilink-agents.com/benchmarks/operations-shift/index.html#cost).
+Subscriptions, hosting, local compute and tax are excluded. Cost estimates are
+based on recorded usage, not invoices; interrupted Codex calls may lack final usage.
+
+OmniSim is the simulator for every configuration; this compares tested agent
+integrations, not physics engines. One shift, one robot, one Windows laptop
+(RTX 3060 Laptop GPU; Newton/MuJoCo physics on CPU). The benchmark, grader and
+integrations were built by the OmniLink team. OmniLink led on the preregistered
+score, but its equal-tools lead weakens when reply checks are excluded; that
+comparison remains unsettled. Seven errored competitor episodes were re-run
+under a recorded amendment. Simulation only; no hardware validation.
+
+[Full results, methodology and downloadable evidence](https://www.omnilink-agents.com/benchmarks/operations-shift/index.html)
+· [Repository report](tests/benchmarks/robot_ops/evidence/SHIFT_V1_RESULTS.md).
+The graph uses the same published results as the OmniLink landing page. OmniKey
+and your model-provider key are required; model inference is billed separately.
+
 ## Run your first simulation
 
 Three minutes on Windows. About half an hour on Linux, because you build it.

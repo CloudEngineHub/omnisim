@@ -183,6 +183,8 @@ def _http_prompt(kind: str, text: str, bridge: FakeBridge, relay: Mock):
         # bridges disagree on the underscore prefix.
         "shared_stamp_via": _route.stamp_via,
         "_shared_stamp_via": _route.stamp_via,
+        # The mobile bridge notes a halt-before-handling on its /prompt reply.
+        "shared_with_halt": _route.with_halt_note,
         "_tx_begin": lambda *a, **k: None,
         "_tx_end": lambda *a, **k: None,
         "_tx_journal_seq": lambda *a, **k: 0,

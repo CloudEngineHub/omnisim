@@ -262,9 +262,11 @@ class ContactTracker:
 class JointLimitTracker:
     """Emits joint.limit_hit with hysteresis.
 
-    A joint is "in" the lower band when `position <= min_stop + tol_hit`
-    and "out" again when `position > min_stop + tol_clear` (similarly
-    for upper). Only the on-edge transition emits.
+    A joint is "in" the lower band when `position <= lower + tol_hit`
+    and "out" again when `position > lower + tol_clear` (similarly
+    for upper). Only the on-edge transition emits. `lower`/`upper` are the
+    joint's EFFECTIVE limits (observe.effective_joint_limits): the motor's
+    minPosition/maxPosition when they differ, else minStop/maxStop.
     """
 
     HIT_TOL = 1e-3
@@ -286,16 +288,26 @@ class JointLimitTracker:
         # drags it through the entire robot subtree, one getTypeName round-trip
         # per node -- and a round-trip is serviced at an engine step boundary.
         # observe.cached_joints() shares the solid cache's invalidation
-        # (spawn/delete + a 120-poll backstop). minStop/maxStop stay LIVE reads
+        # (spawn/delete + a 120-poll backstop). The limits stay LIVE reads
         # below so a retuned joint limit cannot produce a stale limit event.
-        for j, jid, params in observe.cached_joints(self._supervisor):
+        #
+        # The limits are the EFFECTIVE ones -- the motor's minPosition/
+        # maxPosition when they differ, else minStop/maxStop -- the same rule
+        # the Newton registration uses and GET /robot/<def>/joints reports
+        # (observe.effective_joint_limits). Until 2026-09-25 this read the
+        # stops only, so a joint limited by its motor alone (every full-range
+        # URDF revolute) could never fire joint.limit_hit.
+        for j, jid, params, motor in observe.cached_joints(self._supervisor):
             position = observe._sf_float(params, "position")
-            min_stop = observe._sf_float(params, "minStop")
-            max_stop = observe._sf_float(params, "maxStop")
-            if position is None or min_stop is None or max_stop is None:
+            if position is None:
                 continue
-            if min_stop == 0.0 and max_stop == 0.0:
-                # Unconstrained joint, skip.
+            min_stop, max_stop, _source = observe.effective_joint_limits(
+                observe._sf_float(params, "minStop"),
+                observe._sf_float(params, "maxStop"),
+                observe._sf_float(motor, "minPosition"),
+                observe._sf_float(motor, "maxPosition"))
+            if _source is None:
+                # Unconstrained joint (no limit reaches the solver), skip.
                 continue
 
             current_state = self._state.get(jid)
@@ -333,6 +345,7 @@ class JointLimitTracker:
                     "position": position,
                     "lower": min_stop,
                     "upper": max_stop,
+                    "limit_source": _source,
                 }, t_sim_ms=sim_time_ms)
             self._state[jid] = new_state
 

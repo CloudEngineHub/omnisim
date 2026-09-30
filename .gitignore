@@ -60,7 +60,8 @@ Thumbs.db
 *.cache
 
 # IDE files
-.vscode
+.vscode/*
+!.vscode/settings.json
 
 # Local rules #
 ###############
@@ -484,6 +485,15 @@ packages/*/dist/
 /social/launch/pilots/replies_*/repo/
 /social/launch/pilots/replies_*/*_repo/
 /social/launch/pilots/replies_*/fork/
+#
+# 2026-09-30: a third name. The Bruce lane cloned his repo as a bare `src/`, in
+# the thread folder and once per re-run (`r2/src/`, `r3/src/`), and the r3 clone
+# was committed as a gitlink. A generic `src/` rule would also swallow our own
+# authored `liburdf_roundtrip/src/`, so this is scoped to the thread.
+/social/launch/pilots/replies_*/bruce_bcadm/src/
+/social/launch/pilots/replies_*/bruce_bcadm/*/src/
+# Generated sweep worlds (109 files, 32 MB), rebuilt by that folder's run_sweep.
+/social/launch/pilots/replies_2026_09_29/prishita_curriculum/worlds/
 
 # Company-pilot workspaces (social/launch/pilots/companies/*). The rig we
 # author is TRACKED -- probe scripts, generated worlds, evidence dumps,
@@ -616,3 +626,16 @@ packages/*/dist/
 # it up outside the repo, where the suppression master already lives.
 /social/launch/pipeline/
 /social/launch/_send*.json
+
+# Drafts kept out of git: hidden work-in-progress files (".draft_*") and draft video
+# renders, which are regenerable and can exceed GitHub's 100 MB file limit.
+.draft_*
+social/youtube_videos/**/*_draft*.mp4
+
+# Outreach pilots: the correspondents' own code, shared with us privately for a
+# reproduction. Our analysis beside it is tracked; their sources are not ours to commit.
+social/launch/pilots/replies_2026_09_12/compass_reconcile/harness_probe_libcxx_emulation.hpp
+social/launch/pilots/replies_2026_09_13/compass_repro/harness_probe_libcxx_emulation.hpp
+social/launch/pilots/replies_2026_09_13/compass_repro/probe_include/
+social/launch/pilots/replies_2026_09_25/poom_eod/source/
+social/launch/pilots/replies_2026_09_25/malo_pusht/bundle/

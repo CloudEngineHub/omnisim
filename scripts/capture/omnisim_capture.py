@@ -34,6 +34,9 @@ POST /capture/screenshot     {"path"?, "quality"?, "source"?}    -> image/png or
 POST /capture/movie/start    {"path", "width"?, "height"?, "codec"?, "quality"?,
                                "acceleration"?, "caption"?, "fps"?}
 POST /capture/movie/stop
+POST /capture/record/start   {"dir", "period_ms"?, "quality"?, "track"?: [DEF]}  sim-time frames
+POST /capture/record/stop
+POST /capture/record/status
 GET  /capture/movie/status
 POST /capture/sequence       {"path_keyframes": [...], "duration_s": float, "fps": int,
                                "output": "...", "codec"?, "crf"?, "ease"?,
@@ -1322,6 +1325,37 @@ def make_handler(state: CaptureServiceState):
                 user_path.parent.mkdir(parents=True, exist_ok=True)
                 args["path"] = str(user_path)
                 result = self._supervisor_call("movie_start", args)
+                if result is not None:
+                    self._json(200, result)
+                return
+
+            if path == "/capture/record/start":
+                # Sim-time frame recorder (capture_supervisor record_start):
+                # one frame every period_ms of SIMULATION time, so the PNG
+                # sequence plays back at real time at 1000/period_ms fps.
+                args = {k: body[k] for k in ("dir", "period_ms", "quality", "track", "follow") if k in body}
+                if "dir" not in args:
+                    self._json(400, {"error": "dir is required"})
+                    return
+                out_dir = Path(args["dir"])
+                if not out_dir.is_absolute():
+                    out_dir = DEFAULT_OUTPUT_DIR / out_dir
+                args["dir"] = str(out_dir)
+                result = self._supervisor_call("record_start", args)
+                if result is not None:
+                    self._json(200, result)
+                return
+
+            if path == "/capture/record/follow":
+                args = {k: body[k] for k in ("offset", "look", "move_s") if k in body}
+                result = self._supervisor_call("record_follow", args)
+                if result is not None:
+                    self._json(200, result)
+                return
+
+            if path in ("/capture/record/stop", "/capture/record/status"):
+                result = self._supervisor_call(path.rsplit("/", 1)[1].replace("stop", "record_stop")
+                                               .replace("status", "record_status"))
                 if result is not None:
                     self._json(200, result)
                 return

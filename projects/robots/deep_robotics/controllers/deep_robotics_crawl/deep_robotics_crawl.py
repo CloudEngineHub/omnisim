@@ -86,6 +86,11 @@ ROBOTS = {
 HIPY_SIGN = {"FL": +1.0, "FR": -1.0, "RL": +1.0, "RR": -1.0}
 # Creep order FL -> RR -> FR -> RL, one quarter cycle apart (b2_crawl_gait).
 CRAWL_OFFSET = {"FL": 0.0, "RR": 0.25, "FR": 0.5, "RL": 0.75}
+# Diagonal-pair trot (b2_trot_gait's phasing). Not statically stable -- two
+# feet planted between the four-foot windows -- and not used by this
+# controller; the OmniLink quadruped bridge selects it by name. At duty 0.6
+# phase 0.05 still has all four feet planted, so QS_PHASE serves both.
+TROT_OFFSET = {"FL": 0.0, "RR": 0.0, "FR": 0.5, "RL": 0.5}
 # Gait clock phase (rad) at which all four feet are planted (duty 0.85).
 QS_PHASE = 0.05 * 2.0 * math.pi
 
@@ -93,8 +98,9 @@ QS_PHASE = 0.05 * 2.0 * math.pi
 class Gait:
     """The b2_crawl_gait foot-space model with the geometry as parameters."""
 
-    def __init__(self, cfg: dict, vx=None, freq=None):
+    def __init__(self, cfg: dict, vx=None, freq=None, offsets=None):
         self.cfg = cfg
+        self.offsets = dict(offsets if offsets is not None else CRAWL_OFFSET)
         self.vx = float(vx if vx is not None else cfg["vx"])
         self.freq = float(freq if freq is not None else cfg["freq"])
         self.duty = float(cfg["duty"])
@@ -167,7 +173,7 @@ class Gait:
         phi = (phase_rad / (2.0 * math.pi)) % 1.0
         out = {}
         for leg in LEGS:
-            leg_phi = (phi + CRAWL_OFFSET[leg]) % 1.0
+            leg_phi = (phi + self.offsets[leg]) % 1.0
             dx, dz, sw = self._foot_x_z(leg_phi, t_since_start)
             fx = self.cfg["hip"][leg][0] + self.x0 + dx
             fy = self.lateral_y * HIPY_SIGN[leg]

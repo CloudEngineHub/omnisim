@@ -402,12 +402,28 @@ _EXPLICIT_MOTION_REQUEST = re.compile(
     r"(?:drive|move|go|reverse|back|turn|rotate|walk|pick|place|set)\b", re.I)
 
 
+# ⚠️ LIFTING A RESTRICTION IS NOT IMPOSING ONE. `no longer` is a prohibition
+# word ("you may no longer drive into the bay"), so "That line no longer
+# applies. Drive forward 0.5 metres." -- an operator lifting a boundary and
+# then giving an order -- was refused as a prohibition in every arm, parser
+# and model alike (ops-bench F1, 2026-09-25). Only a named rule/line/limit
+# that "no longer applies" (or "does not apply") is scoped out; "you may no
+# longer ..." and every other prohibition still reach the check.
+_LIFTED_RESTRICTION = re.compile(
+    r"\b(?:the|that|this|your|my)\s+(?:line|boundary|limit|rule|restriction|ban|zone)"
+    r"\s+(?:no\s+longer\s+(?:applies|apply|holds|stands|is\s+in\s+(?:force|effect))|"
+    r"(?:does\s+not|doesn'?t)\s+apply(?:\s+any\s*more)?)\b", re.IGNORECASE)
+
+
 def _intent_guard_text(utterance: str, tool: str) -> str:
-    """Scope two bounded modifiers without deleting other prohibitions."""
+    """Scope three bounded modifiers without deleting other prohibitions."""
+    text = _LIFTED_RESTRICTION.sub(" ", utterance)
+
     def restriction(match):
         # A standalone ban on repetition is not itself an action request.
-        return " " if _EXPLICIT_MOTION_REQUEST.search(utterance[:match.start()]) else match.group()
-    text = _SUCCESS_REPEAT_LIMIT.sub(restriction, utterance)
+        # `text` is the string being scanned, so match offsets index it.
+        return " " if _EXPLICIT_MOTION_REQUEST.search(text[:match.start()]) else match.group()
+    text = _SUCCESS_REPEAT_LIMIT.sub(restriction, text)
     if tool == 'drive_forward':
         text = _STRAIGHT_ONLY.sub(' ', text)
     return text

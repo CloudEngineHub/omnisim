@@ -2399,7 +2399,53 @@ Each entry carries identity (`def`, `name`, `model`, `controller`), pose
 ### 7.14 GET /robot/<def>/joints
 
 Per-joint snapshot: `name`, `type`, `position`, `velocity`, `lower`,
-`upper`, `hit_limit`.
+`upper`, `limit_source`, `stop_lower`, `stop_upper`, `motor_lower`,
+`motor_upper`, `hit_limit`.
+
+```json
+{ "robot": "PROBE",
+  "joints": [
+    { "name": "j_asym_motor", "type": "HingeJoint",
+      "position": 0.785, "velocity": 0.065,
+      "lower": -6.283, "upper": 0.785, "limit_source": "motor",
+      "stop_lower": 0.0, "stop_upper": 0.0,
+      "motor_lower": -6.283, "motor_upper": 0.785,
+      "hit_limit": "upper" } ],
+  "rpc_ms": 6.0 }
+```
+
+- **`lower` / `upper` are the EFFECTIVE limits** — the range the physics
+  actually registers with the solver, chosen by the same rule as the Newton
+  joint registration (`OmBasicJoint.cpp`): the Motor's
+  `minPosition`/`maxPosition` when they differ, else the joint's
+  `minStop`/`maxStop` when they differ, else no limit. `limit_source` says
+  which: `"motor"`, `"stops"`, or `null` for an unconstrained joint, in
+  which case `lower` and `upper` are `null` too. When a motor declares a
+  range the stops are **not** passed to the solver (they still clamp a
+  supervisor `setJointPosition()`), so `"motor"` wins even where the stops
+  differ; the engine warns at load when the stops are tighter than the
+  motor range.
+- **The raw sources are reported alongside:** `stop_lower`/`stop_upper`
+  are `JointParameters.minStop`/`maxStop` as authored (`0`/`0` is the "not
+  set" default), `motor_lower`/`motor_upper` the Motor's
+  `minPosition`/`maxPosition` (`null` when the joint has no motor).
+- **`hit_limit`** is `"lower"` / `"upper"` when `position` is within
+  `1e-3` of that effective limit, else `null` (always `null` for an
+  unconstrained joint).
+- Multi-axis joints (`Hinge2Joint`, `BallJoint`) report axis 1 only. A
+  `BallJoint`'s stops are not enforced by the solver at all (the ball
+  element is built unlimited), so a limit reported for one is authored,
+  not enforced.
+
+⚠️ **Semantic change, 2026-09-25.** Until then `lower`/`upper` were the
+raw `minStop`/`maxStop` and `hit_limit` used only those. A joint limited by
+its motor alone — every full-range URDF `revolute` (motor ±6.283, stops
+unset), and since the 2026-09-20 importer change any revolute whose range
+crosses ±π at one end — read `lower: 0, upper: 0` and never reported a
+hit, and an unconstrained joint also read `0`/`0`. A client that treated
+`lower == upper == 0` as "unconstrained" should branch on
+`limit_source == null` instead; the old raw values are `stop_lower` /
+`stop_upper`. `joint.limit_hit` (§10.4) moved to the same effective limits.
 
 ### 7.15 GET /robot/<def>/devices
 
@@ -3986,7 +4032,13 @@ undocumented in previous editions but always present.
 
 ### 10.4 Joints
 
-- `joint.limit_hit { joint, side: "lower"|"upper", position, lower, upper }`
+- `joint.limit_hit { joint, side: "lower"|"upper", position, lower, upper, limit_source }`
+
+`lower`/`upper` are the joint's EFFECTIVE limits and `limit_source` is
+`"motor"` or `"stops"`, exactly as `GET /robot/<def>/joints` reports them
+(§7.14). Until 2026-09-25 the tracker read `minStop`/`maxStop` only, so a
+joint limited by its motor alone could never fire this event. A joint with
+no effective limit never fires it.
 
 **No `robot_def`.** The emitter deliberately skips the owning-robot
 lookup ("agents can correlate via joint name" — `event_bus.py`), so an

@@ -56,6 +56,12 @@ __all__ = ["route", "execute", "describe_state", "short_circuit",
 
 # tool -> (bridge method, kwargs builder). Names match the act_* API the
 # bridges already expose; anything missing degrades to a spoken refusal.
+# Frames that set or lift a standing spatial rule (interpret._spatial_rule),
+# or schedule a motion for later (interpret._later_order). None actuates when
+# the sentence is spoken; a scheduled motion is gated on its own clause here
+# and again by the bridge when it fires.
+_RULE_FRAMES = frozenset({"boundary", "clear_boundary", "schedule", "watch"})
+
 _ADAPTERS: Dict[str, Tuple[str, Any]] = {
     "stop":            ("act_stop", lambda a: {}),
     "resume_autonomy": ("act_resume_autonomy", lambda a: {}),
@@ -66,6 +72,7 @@ _ADAPTERS: Dict[str, Tuple[str, Any]] = {
     "drive_forward":   ("act_drive_forward", lambda a: {"distance": a["distance"]}),
     "turn":            ("act_turn", lambda a: {"angle_rad": a["angle_rad"]}),
     "drive_to":        ("act_drive_to", lambda a: {"tx": a["x"], "ty": a["y"]}),
+    "go_to_place":     ("act_go_to_place", lambda a: {"place": a["place"]}),
     "set_velocity":    ("act_set_velocity", lambda a: {"linear": a["v"], "angular": a["w"]}),
     "attach_trolley":  ("act_attach_trolley", lambda a: {"def_name": a.get("trolley")}),
     "detach_trolley":  ("act_detach_trolley", lambda a: {}),
@@ -187,10 +194,110 @@ def _describe(tool: str, args: Dict[str, Any], res: Any,
 
     bits = ", ".join(f"{k}={v}" for k, v in args.items() if v is not None)
     said = f"{tool.replace('_', ' ').capitalize()}" + (f" ({bits})" if bits else "") + "."
+    measured = _measured_motion(tool, res)
+    if measured is not None:
+        said, status, detail = measured
+        if status != "ok":
+            return said, status, detail, ""
+        bits = detail
+    if res.get("clipped_by"):
+        # The bridge shortened this move to respect a standing boundary. The
+        # reply used to echo the REQUESTED distance ("Drive forward
+        # (distance=1.0).") over a 0.35 m drive -- the operator's number
+        # handed back as if it had been done (ops-bench F1, 2026-09-25).
+        rule = res["clipped_by"]
+        req, got = float(res.get("requested", 0.0)), float(res.get("commanded", 0.0))
+        said = (f"{tool.replace('_', ' ').capitalize()}: shortened from "
+                f"{req:.2f} to {got:.2f} m to stop at the boundary you set "
+                f"({rule.get('means', 'a standing rule')}).")
+        bits = f"clipped {req:.2f} -> {got:.2f} by {rule.get('id', 'boundary')}"
     if dropped:
         said += (" I ignored " + ", ".join(dropped)
                  + " - this robot's " + tool + " does not take it.")
     return said, "ok", bits or "ok", ""
+
+
+def _measured_motion(tool: str, res: Dict[str, Any]
+                     ) -> Optional[Tuple[str, str, str]]:
+    """Say what a FINISHED drive or turn measured, or None if it did not wait.
+
+    A result with no `achieved` (a non-waiting call, or a bridge that does not
+    measure) keeps the old echo. A motion that timed out or did not settle
+    short of its target is an ERROR -- "stopped short" -- never a success
+    that happens to quote the operator's own number.
+    """
+    if tool in ("drive_to", "go_to_place", "resume_last_order", "reset_to_home") or (
+            tool == "resume_autonomy" and "achieved_xy" in res):
+        return _measured_drive_to(res)
+    if tool not in ("drive_forward", "turn"):
+        return None
+    if res.get("superseded"):
+        return ("That motion was ended before it finished (a newer order or a "
+                "stop took over).", "ok", "superseded")
+    ach, cmd = res.get("achieved"), res.get("commanded")
+    if not isinstance(ach, (int, float)) or not isinstance(cmd, (int, float)):
+        return None
+    if tool == "drive_forward":
+        short = abs(cmd) - abs(ach) > max(0.05, 0.1 * abs(cmd))
+        if res.get("blocked") and short:
+            return (f"I was blocked: I drove {ach:+.2f} m of the {cmd:+.2f} m asked "
+                    "and then stopped making progress, so I stopped trying.",
+                    "err", f"blocked at {ach:+.2f}/{cmd:+.2f} m")
+        if (res.get("timed_out") or res.get("settled") is False) and short:
+            return (f"I stopped short: I drove {ach:+.2f} m of the {cmd:+.2f} m "
+                    "asked, and the drive did not finish -- something may be "
+                    "blocking me.", "err", f"stopped short {ach:+.2f}/{cmd:+.2f} m")
+        return (f"Drove {ach:+.2f} m.", "ok", f"achieved {ach:+.3f} m of {cmd:+.3f}")
+    deg, want = math.degrees(ach), math.degrees(cmd)
+    if (res.get("timed_out") or res.get("settled") is False) and abs(want) - abs(deg) > 10:
+        return (f"I stopped short: I turned {deg:+.0f} deg of the {want:+.0f} deg "
+                "asked.", "err", f"stopped short {deg:+.0f}/{want:+.0f} deg")
+    return (f"Turned {deg:+.0f} deg.", "ok", f"achieved {deg:+.1f} deg of {want:+.1f}")
+
+
+def _measured_drive_to(res: Dict[str, Any]) -> Optional[Tuple[str, str, str]]:
+    """What a drive_to / go_to_place MEASURED: arrived or not, where it
+    ended, whether it went round something, and whether it was pushed.
+    It used to echo the plan ("Drive to (x=4.0, y=-0.0).") whatever happened
+    (ops-bench holdout v1 F4: blocked, shoved and detoured drives all read
+    the same)."""
+    if res.get("accepted") is False:
+        return (str(res.get("say") or res.get("error") or "I could not do that."),
+                "err", str(res.get("refused") or "refused"))
+    xy = res.get("achieved_xy")
+    if not isinstance(xy, (list, tuple)) or len(xy) != 2:
+        return None
+    target = res.get("commanded_xy")
+    where = res.get("place") or (f"({target[0]:.2f}, {target[1]:.2f})" if target else "there")
+    notes = []
+    if res.get("superseded") or "superseded" in str(res.get("aborted") or ""):
+        # What it met on the way is still news: "the pallet is in the way"
+        # must not vanish because the next order arrived first.
+        if res.get("obstacles_met"):
+            notes.append(f"something was blocking my path to {where}, and I was going around it")
+        if res.get("disturbances"):
+            notes.append("I was pushed off course on the way")
+        tail = (" Before that, " + "; ".join(notes) + ".") if notes else ""
+        return ("That drive was ended before it finished (a newer order or a stop took "
+                f"over); I'm at ({xy[0]:.2f}, {xy[1]:.2f}).{tail}", "ok", "superseded")
+    pushes = res.get("disturbances") or []
+    if pushes:
+        big = max(pushes, key=lambda d: d.get("moved_m", 0))
+        notes.append(f"I was pushed off course by about {big['moved_m']:.2f} m on the way "
+                     "and corrected for it")
+    if res.get("obstacles_met"):
+        notes.append("something was blocking my path, so I went around it")
+    elif res.get("detoured"):
+        notes.append("I routed around a keep-out area")
+    tail = (" " + "; ".join(notes) + ".") if notes else ""
+    if res.get("arrived"):
+        return (f"Arrived at {where}: I'm at ({xy[0]:.2f}, {xy[1]:.2f}), "
+                f"{float(res.get('error_m') or 0):.2f} m from the target.{tail}",
+                "ok", f"arrived err {float(res.get('error_m') or 0):.3f} m")
+    return (f"I didn't make it to {where}: I stopped at ({xy[0]:.2f}, {xy[1]:.2f}), "
+            f"{float(res.get('error_m') or 0):.2f} m short, because "
+            f"{'the way was blocked' if 'block' in str(res.get('aborted')) else 'the drive did not finish'}."
+            f"{tail}", "err", f"stopped short err {float(res.get('error_m') or 0):.3f} m")
 
 
 def _match_constraint_rule(intents: Any, text: str) -> Optional[str]:
@@ -362,6 +469,46 @@ def _bridge_pose(bridge: Any) -> Optional[Tuple[float, float, float]]:
     return None
 
 
+def _schedule_frame(bridge: Any, intents: Any, f: Any, utterance: str,
+                    surface: Optional[str]) -> Tuple[str, Tuple[str, ...]]:
+    """Hand a `schedule` / `watch` frame to the store, gated on its own clause.
+
+    Never agrees to what nothing will run: a store without a scheduler (no
+    clock, no disturbance detector on this bridge) answers `unsupported`, and
+    the whole turn then goes to the model instead.
+    """
+    if intents is None or not getattr(intents, "scheduler", False):
+        return ("I can't keep an order for later on this robot, so I have not "
+                "agreed to one.", (f.tool, "unsupported", ""))
+    action_text = str(f.args.get("text") or "")
+    frames = [dict(x) for x in f.args.get("frames") or []]
+    # Vet the action exactly as if it were said now, with its own words.
+    rej = _gate.check(action_text, [_i.Frame(x["tool"], dict(x.get("args") or {}))
+                                    for x in frames], surface=surface)
+    if rej:
+        _emit_gate_refusal(bridge, rej[0], action_text)
+        return (f"I won't schedule that: {rej[0].detail}.",
+                (f.tool, "refused", rej[0].detail, rej[0].rule))
+    if f.tool == "watch":
+        res = intents.schedule_action("on_disturbance", frames, action_text=action_text,
+                                      words=utterance, notify=bool(f.args.get("notify")),
+                                      repeat=bool(f.args.get("repeat")))
+    else:
+        clock = getattr(intents, "sim_clock", None)
+        now = clock() if callable(clock) else getattr(bridge, "sim_time", None)
+        if now is None:
+            return ("I can't read my clock, so I can't time that.",
+                    (f.tool, "unsupported", "no sim clock"))
+        delay = float(f.args["delay_s"])
+        res = intents.schedule_action("after_s", frames, due_sim=float(now) + delay,
+                                      delay_s=delay, action_text=action_text,
+                                      words=utterance)
+    ok = bool(res.get("accepted"))
+    return (str(res.get("say") or ("Scheduled." if ok else "I could not schedule that.")),
+            (f.tool, "ok" if ok else "refused",
+             str(res.get("id") or res.get("reason") or "")))
+
+
 def execute(bridge: Any, r: "_i.Interpretation",
             surface: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Run an interpretation. None = not ours; give it to the model."""
@@ -491,7 +638,22 @@ def execute(bridge: Any, r: "_i.Interpretation",
     # would silently remove them.
     # `surface` picks the rail where two robot classes share a tool -- a
     # drone's move_body{vertical} is a climb, a quadruped's is a body shift.
-    rejections = _gate.check(r.text or "", r.frames, surface=surface)
+    # A spatial RULE frame restricts motion and actuates nothing, so it is not
+    # the gate's to judge (it would refuse it as unknown_tool); every frame
+    # that can move the robot, including one in the same sentence as a rule,
+    # is still vetted with the whole utterance.
+    # The clause that orders something for LATER is not part of what is done
+    # now: "drive 0.5 m now, then 10 s after you arrive, drive back 0.5 m"
+    # would otherwise refuse the first drive as deferred.
+    now_text = r.text or ""
+    for f in r.frames:
+        if f.tool in ("schedule", "watch") and f.source:
+            now_text = now_text.replace(f.source, " ")
+    if any(f.tool == "watch" for f in r.frames):
+        now_text = ""                    # a watched order does nothing now
+    now_frames = [f for f in r.frames if f.tool not in _RULE_FRAMES]
+    rejections = (_gate.check(now_text, now_frames, surface=surface)
+                  if now_frames else [])
     if rejections:
         first = rejections[0]
         # ⚠️ PROSE IN `summary`, THE RULE NAME IN `rule` (§5.7.2). This used
@@ -508,7 +670,77 @@ def execute(bridge: Any, r: "_i.Interpretation",
     tools: List[Tuple[str, str, str]] = []
     motion = [i for i, f in enumerate(r.frames) if f.tool in _ADAPTERS]
     last_motion = motion[-1] if motion else -1
+    if any(f.tool in ("schedule", "watch") for f in r.frames):
+        # A later action is timed from when the steps before it FINISH, so
+        # every immediate step blocks.
+        last_motion = -1
+    if getattr(bridge, "replies_after_motion", False):
+        # The last leg used to return at once "to keep chat responsive", and
+        # the reply echoed the order before anything happened: a Husky a
+        # block stopped at 1.2 m of 2 m was reported as "Drive forward
+        # (distance=2.0)." (ops-bench P7). A bridge whose halts and new
+        # orders get past its lock (so waiting cannot trap a stop) and whose
+        # questions do too (so waiting cannot stall chat) opts in, and every
+        # leg is answered from what it measured.
+        last_motion = -1
+    # AN OPERATOR HALT ENDS THE PLAN, NOT JUST THE LEG. Every leg but the last
+    # blocks, and nothing between legs looked at whether the operator had said
+    # stop meanwhile, so "drive 0.6, turn 90, drive 0.6" + "Stop!" 0.3 m in
+    # halted the first drive and then turned and drove anyway (ops-bench F3,
+    # 2026-09-25). A bridge that counts halts (`halt_seq`) lets the loop see
+    # one it did not issue itself; this plan's own "... then stop" re-baselines.
+    halt_mark = getattr(bridge, "halt_seq", None)
     for idx, f in enumerate(r.frames):
+        if halt_mark is not None and getattr(bridge, "halt_seq", None) != halt_mark:
+            skipped = [g.tool for g in r.frames[idx:]]
+            said.append("You told me to stop, so I did not do the rest of that "
+                        "request.")
+            tools.append(("plan", "cancelled",
+                          "operator_halt: skipped " + ", ".join(skipped)))
+            break
+        if f.tool in ("schedule", "watch"):
+            said_one, tool_row = _schedule_frame(bridge, intents, f, r.text or "", surface)
+            said.append(said_one)
+            tools.append(tool_row)
+            continue
+        if f.tool in ("boundary", "clear_boundary"):
+            if intents is None or not getattr(intents, "spatial", False):
+                # Never agree to a rule nothing on this robot enforces.
+                said.append("I can't hold a boundary on this robot, so I have not "
+                            "agreed to one.")
+                tools.append((f.tool, "unsupported", ""))
+                continue
+            if f.tool == "clear_boundary":
+                res = intents.clear_constraint("boundary")
+                said.append(res.get("say") or ("Boundary lifted." if res.get("accepted")
+                                               else "There was no boundary to lift."))
+                tools.append(("clear_boundary", "ok" if res.get("accepted") else "no_action",
+                              ", ".join(c.get("means", "") for c in res.get("cleared") or [])))
+                continue
+            axis, value, side = f.args["axis"], float(f.args["value"]), f.args["side"]
+            if side == "current":
+                # "Stay behind the line": the side the robot is on NOW,
+                # measured, never assumed from which way it happens to face.
+                pose = _bridge_pose(bridge)
+                if pose is None:
+                    said.append("I can't read my position, so I can't tell which "
+                                "side of that line I'm on. Tell me which side to keep.")
+                    tools.append(("set_boundary", "needs_pose", f"{axis}={value:.2f}"))
+                    continue
+                here = pose[0] if axis == "x" else pose[1]
+                if abs(here - value) < 0.02:
+                    said.append(f"I'm right on {axis} = {value:.2f}. Which side "
+                                "should I stay on?")
+                    tools.append(("set_boundary", "ask", "on_the_line"))
+                    continue
+                side = "max" if here < value else "min"
+            res = intents.set_boundary(axis, max_value=value if side == "max" else None,
+                                       min_value=value if side == "min" else None,
+                                       words=r.text or "")
+            said.append(str(res.get("say", "")))
+            tools.append(("set_boundary", "ok" if res.get("accepted") else "refused",
+                          str(res.get("means") or res.get("reason", ""))))
+            continue
         if f.tool == "hold":
             if intents is not None and hasattr(intents, "hold_now"):
                 res = intents.hold_now(words=f.source)
@@ -535,6 +767,10 @@ def execute(bridge: Any, r: "_i.Interpretation",
             tools.append((f.tool, "unsupported", ""))
             continue
         method, build = entry
+        # "Go home" / "return to the dock": DRIVEN where the bridge can
+        # (act_return_home), never the supervisor teleport of reset_to_home.
+        if f.tool == "reset_to_home" and hasattr(bridge, "act_return_home"):
+            method = "act_return_home"
         # Every motion but the last blocks, so the next one is not refused
         # as `busy`. The last returns immediately and keeps chat responsive.
         res, dropped = _call(bridge, method, build(f.args),
@@ -546,6 +782,8 @@ def execute(bridge: Any, r: "_i.Interpretation",
         text, status, detail, rule = _describe(f.tool, f.args, res, dropped)
         said.append(text)
         tools.append((f.tool, status, detail, rule))
+        if f.tool == "stop":
+            halt_mark = getattr(bridge, "halt_seq", None)
 
     if r.residue:
         said.append(f"I did not act on '{r.residue[:60]}' - I did not "
@@ -556,7 +794,120 @@ def execute(bridge: Any, r: "_i.Interpretation",
 def route(bridge: Any, text: str, surface: str = _i.MOBILE
           ) -> Optional[Dict[str, Any]]:
     """Interpret `text` and execute it. None = hand this to the model."""
+    capture_site_facts(bridge, text)
+    placed = place_order(bridge, text)
+    if placed is not None:
+        return execute(bridge, placed, surface)
     return execute(bridge, _i.interpret(text, surface), surface)
+
+
+import re as _re
+
+# "take this to packing", "head back to the dock", "go over to line 2",
+# "bring it to the charger", "back to packing please" -- an order to a place
+# the robot was TOLD about. The parser cannot know place names (they live in
+# the robot's own store), so this reads them from there.
+_PLACE_ORDER = _re.compile(
+    r"^(?:(?:ok(?:ay)?|right|alright|now|next|great|thanks|good|cool|so)[,.!]?\s+)*"
+    r"(?:please\s+)?(?:can you\s+|could you\s+)?"
+    r"(?:(?:go|head|drive|run|get|move|come)(?:\s+(?:over|back|straight|on|down|up|across|round|along))?\s+to|"
+    r"(?:take|bring|carry|drop|run)\s+(?:this|that|it|these|those|the\s+\w+)(?:\s+\w+)?"
+    r"\s+(?:(?:over|back|down|up|across|round|along)\s+)?to|back\s+to)\s+(?:the\s+)?"
+    r"(?P<place>[a-z0-9][a-z0-9 \-]{0,30}?)\s*(?:,?\s*(?:please|now|thanks|for me))*\s*[.!]*$",
+    _re.IGNORECASE)
+_NOT_NOW = _re.compile(
+    r"\b(?:don'?t|do not|never|no need|avoid|stop going|in \d+|in (?:a|an|one|two|three|"
+    r"five|ten|fifteen|twenty|thirty) |at \d|at (?:the )?\w+ (?:mark|past)|when|once|after|"
+    r"before|if|unless|until|later|every)\b", _re.IGNORECASE)
+
+
+_NUM = r"(-?\d+(?:\.\d+)?)"
+# "the dock is x=4.5, y=0", "Charger's at x=0, y=3.8", "Line 2 is x = 0, y = -3.8"
+_PLACE_DEF = _re.compile(
+    r"(?:^|[.;,]\s*|\b(?:and|also)\s+)(?:the\s+)?(?P<name>[A-Za-z][A-Za-z0-9 \-]{0,24}?)"
+    r"(?:'s|\s+is|\s+are|\s+sits|\s+lives)\s+(?:at\s+|over\s+at\s+|located\s+at\s+|by\s+)?"
+    r"(?:\(\s*)?x\s*[=:]?\s*" + _NUM + r"\s*,?\s*(?:and\s+)?y\s*[=:]?\s*" + _NUM,
+    _re.IGNORECASE)
+# "x 0.5 to 1.7, y -1.5 to 1.5" / "x between 1 and 2, y from -1 to 3"
+_ZONE_BOX = _re.compile(
+    r"x\s*(?:from|between|=|:)?\s*" + _NUM + r"\s*(?:to|and|-|–|through)\s*" + _NUM +
+    r"\s*,?\s*(?:and\s+)?y\s*(?:from|between|=|:)?\s*" + _NUM + r"\s*(?:to|and|-|–|through)\s*" + _NUM,
+    _re.IGNORECASE)
+_KEEP_OUT = _re.compile(
+    r"\b(?:stay out|keep out|stay clear|keep clear|off[- ]limits|no[- ]go|don'?t (?:enter|go in)|"
+    r"do not (?:enter|go in)|out of bounds|pedestrian|fire[- ]door|restricted|closed|forbidden)\b",
+    _re.IGNORECASE)
+_LOCKED = _re.compile(
+    r"\b(?:permanent(?:ly)?|nobody|no one|no-one|no matter who|not even me|whole shift|all shift|"
+    r"never,? ever|no exceptions)\b", _re.IGNORECASE)
+_ZONE_NAME = _re.compile(
+    r"\b((?:pedestrian |fire[- ]door |loading |walk)?(?:aisle|corridor|walkway|zone|area|lane|bay|door))\b",
+    _re.IGNORECASE)
+_NOT_A_PLACE = {"it", "that", "this", "there", "here", "which", "one", "rule", "aisle",
+                "corridor", "walkway", "zone", "area"}
+
+
+def capture_site_facts(bridge: Any, text: str) -> List[str]:
+    """Record the places and keep-out zones a message DEFINES, straight into
+    the robot's store, before any model reads it.
+
+    The facts a shift names once in minute one are the ones everything later
+    depends on, and a model turn that was slow, or cancelled, lost them
+    (ops-bench shift_dev_v1: "line 2" was never saved). The model still sees
+    the message and may record the same facts again; that is harmless.
+    A zone is only captured with an explicit keep-out cue in the sentence."""
+    store = getattr(bridge, "intents", None)
+    if store is None or not hasattr(store, "set_place"):
+        return []
+    body = _i._strip_speaker(text)
+    done = []
+    try:
+        if "?" not in body:
+            for m in _PLACE_DEF.finditer(body):
+                name = m.group("name").strip(" -")
+                words = name.lower().split()
+                while words and (words[0] in ("and", "also", "stations", "station", "then", "the")
+                                 or not any(ch.isalnum() for ch in words[0])):
+                    words = words[1:]
+                name = " ".join(words)
+                if not name or name in _NOT_A_PLACE or _KEEP_OUT.search(name):
+                    continue
+                store.set_place(name, float(m.group(2)), float(m.group(3)), words=body[:200])
+                done.append(f"place {name}")
+        box = _ZONE_BOX.search(body)
+        if box and _KEEP_OUT.search(body) and hasattr(store, "set_zone") and "?" not in body:
+            x0, x1, y0, y1 = (float(box.group(i)) for i in range(1, 5))
+            nm = _ZONE_NAME.search(body)
+            name = (nm.group(1) if nm else "keep-out zone").lower()
+            known = [z for z in store.zones()
+                     if (z["x_min"], z["x_max"], z["y_min"], z["y_max"]) ==
+                     (min(x0, x1), max(x0, x1), min(y0, y1), max(y0, y1))]
+            if not known:
+                store.set_zone(name, x0, x1, y0, y1, words=body[:200],
+                               locked=bool(_LOCKED.search(body)))
+                done.append(f"zone {name}")
+    except Exception:                                   # a fact capture never blocks a reply
+        return done
+    return done
+
+
+def place_order(bridge: Any, text: str) -> Optional[_i.Interpretation]:
+    """A parsed go_to_place, or None to leave the sentence to the parser."""
+    store = getattr(bridge, "intents", None)
+    if store is None or not getattr(store, "places", None) or not hasattr(bridge, "act_go_to_place"):
+        return None
+    body = _i._strip_speaker(text).strip()
+    if "?" in body or _NOT_NOW.search(body):
+        return None
+    m = _PLACE_ORDER.match(body)
+    if not m:
+        return None
+    name = m.group("place").strip()
+    if store.place_xy(name) is None:
+        return None
+    return _i.Interpretation(_i.COMMAND, frames=[_i.Frame("go_to_place", {"place": name},
+                                                          rule="place_order")],
+                             reason="place_order", confidence=0.9, text=text)
 
 
 # ⚠️ `legacy_router_requested()` / OMNISIM_BRIDGE_LEGACY_ROUTER ARE DELETED
@@ -715,6 +1066,120 @@ def parser_first_plan(text: str, surface: str = _i.MOBILE
     return r
 
 
+def is_halt_order(text: Any, surface: str = _i.MOBILE) -> bool:
+    """True when the parser will answer `text` as nothing but a stop.
+
+    For a bridge deciding whether an HTTP /prompt may skip the lock that
+    serialises commands: a halt must never queue behind the motion it is
+    meant to end. Pure regex, no actuation, and it records NO parser
+    statistics -- short_circuit counts the turn when it actually answers it.
+    False whenever parser-first would not answer (disabled, not confident,
+    or any frame that is not a stop), so the caller's ordinary path runs.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return False
+    try:
+        r = _i.interpret(text, surface)
+    except Exception:                                  # pragma: no cover
+        return False
+    return (r.intent == _i.COMMAND and r.confidence >= _MIN_CONFIDENCE
+            and _i.COMMAND in _parser_first_set()
+            and bool(r.frames) and all(f.tool == "stop" for f in r.frames))
+
+
+# Said while the robot works, these do not change what it should be doing.
+_NOT_AN_ORDER = re.compile(
+    r"^\s*(?:ok(?:ay)?|thanks?|thank\s+you|cheers|nice|good(?:\s+(?:job|work))?|great|"
+    r"cool|got\s+it|well\s+done|perfect|lovely|yes|yep|sure|hello|hi|hey)"
+    r"(?:\s+(?:there|robot|mate))?[\s!.,]*$", re.IGNORECASE)
+
+
+def with_halt_note(halted: Any, out: Any) -> Any:
+    """Tell the operator when their message stopped the robot first.
+
+    `halted` is what the bridge measured when it halted before handling the
+    message (None when it did not). A /prompt reply that silently stopped a
+    drive would read like the robot ignoring the order it had been given.
+    """
+    if not halted or not isinstance(out, dict):
+        return out
+    out = dict(out)
+    out["halted_first"] = halted
+    out["response"] = ("I stopped what I was doing first. "
+                       + str(out.get("response") or "")).strip()
+    return out
+
+
+# Words that change the order under way, even when the rest of the sentence
+# is beyond the parser: "change of plan", "actually ... instead", "go back".
+_CORRECTION = _re.compile(
+    r"\b(?:actually|instead|never ?mind|change of plan|scratch that|forget (?:that|it|about it)|"
+    r"cancel (?:that|it)|belay that|hold on|hold up|wait|go back|come back|head back|"
+    r"turn around|don'?t|do not|skip|abort|reroute|redirect)\b", _re.IGNORECASE)
+# Frames that ARE a new order for the body right now.
+_MOTION_FRAMES = frozenset({
+    "drive_forward", "turn", "drive_to", "set_velocity", "stop", "reset_to_home",
+    "go_to_place", "place", "pick", "walk", "move_body", "takeoff", "land", "hover",
+    "attach_trolley", "detach_trolley",
+    # A new LINE said mid-drive binds the drive under way: stop first.
+    "boundary", "clear_boundary"})
+# An order for the body the parser could not read: "Go somewhere more
+# sensible." It is still an order, so it still stops the work under way.
+_MOTION_VERB = _re.compile(
+    r"^(?:(?:ok(?:ay)?|right|now|so|then|please)[,.!]?\s+)*(?:go|drive|head|move|turn|back up|"
+    r"reverse|come|return|take|bring|get (?:over|back|out)|pull|park|spin|rotate|swing|stop)\b",
+    _re.IGNORECASE)
+
+
+def interrupts_motion(text: Any, surface: str = _i.MOBILE, bridge: Any = None) -> bool:
+    """Should this message stop the robot's CURRENT work before it is handled?
+
+    For a bridge whose robot is moving, or whose model turn is still running,
+    when a new operator message arrives. Until 2026-09-25 such a message
+    simply queued: "Change of plan: go back to where you started", said 0.6 m
+    into a 2 m drive, waited for a model -- and with the model unreachable the
+    Husky drove on through the point the operator was trying to stop it
+    reaching (ops-bench P8, unsafe). A parsed new order ("turn left 90")
+    fared no better: it met `busy`. A new instruction supersedes the old one,
+    and stopping is what makes that safe whoever answers next.
+
+    NOT an interruption: a question (the parser's confident QUERY), an
+    acknowledgement or greeting, and an order purely for LATER (a schedule or
+    a bump watch), which is about the future, not the drive under way. A pure
+    stop is not decided here -- `is_halt_order` sends it past the lock itself.
+    Records no parser statistics.
+
+    ⚠️ AND NOT EVERYTHING ELSE, EITHER. The default used to be "interrupt":
+    anything that was not a confident question halted the robot and cancelled
+    the model's turn in flight. On a shift, where someone speaks every
+    fifteen seconds, "Coffee machine's busted again." aborted a delivery, and
+    the turn saving the stations was cancelled half way -- "line 2" was never
+    remembered (ops-bench shift_dev_v1, 2026-09-26). Now a message interrupts
+    only when it IS an order for the body now: a parsed motion, an order to a
+    known place, or correction words ("actually", "instead", "go back").
+    """
+    if not isinstance(text, str) or not text.strip():
+        return False
+    if _NOT_AN_ORDER.match(text):
+        return False
+    try:
+        r = _i.interpret(text, surface)
+    except Exception:                                  # pragma: no cover
+        return True                                    # unreadable: stop first
+    if r.intent == _i.QUERY and r.confidence >= _MIN_CONFIDENCE:
+        return False
+    if r.intent == _i.EMPTY:
+        return False
+    if r.frames and all(f.tool in ("schedule", "watch") for f in r.frames):
+        return False
+    if any(f.tool in _MOTION_FRAMES for f in r.frames):
+        return True
+    if bridge is not None and place_order(bridge, text) is not None:
+        return True
+    body = _i._strip_speaker(text).strip()
+    return bool(_CORRECTION.search(body) or _MOTION_VERB.match(body))
+
+
 def _only_unsupported(tools: Any) -> bool:
     """True when the parse produced ONLY `unsupported` outcomes.
 
@@ -766,6 +1231,15 @@ def short_circuit(bridge: Any, text: str, surface: str = _i.MOBILE
     ThreadingHTTPServer worker. The robot-window path wants
     `parser_first_window` instead.
     """
+    # The shift's standing facts are recorded whoever answers the turn; an
+    # order to a place the robot was told about is the parser's to run.
+    # These used to live only in `route()`, which no bridge calls -- the
+    # dev shift answered "take this one to the charger" with a pick-and-
+    # place question six times (shift-dev-v1-omnilink-02).
+    capture_site_facts(bridge, text)
+    placed = place_order(bridge, text) if _parser_first_set() else None
+    if placed is not None:
+        return parser_first_run(bridge, placed, surface)
     r = parser_first_plan(text, surface)
     if r is None:
         return None
@@ -819,7 +1293,9 @@ def parser_first_window(bridge: Any, text: str, surface: str,
     `handle_wwi_message`.
     """
     try:
-        r = parser_first_plan(text, surface)
+        capture_site_facts(bridge, text)
+        r = (place_order(bridge, text) if _parser_first_set() else None) \
+            or parser_first_plan(text, surface)
     except Exception:                                  # pragma: no cover
         return False
     if r is None:

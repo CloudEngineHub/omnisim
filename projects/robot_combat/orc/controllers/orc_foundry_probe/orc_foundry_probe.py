@@ -23,6 +23,7 @@ sys.path.insert(0,str(ORC/'shared'))
 sys.path.insert(0,str(ORC/'controllers/orc_foundry_director'))
 from foundry_physics import DRIVE, WEAPON, dot, world, powertrain, part_spec
 from orc_foundry_director import Foundry
+from omniworld.viewpoint import look_at
 
 
 class MatchProbe(Foundry):
@@ -39,7 +40,49 @@ class MatchProbe(Foundry):
         self.duration = 180
         if self.capture:
             self.camera_mode = 1
+        # Film capture only: ORC_FOUNDRY_BROADCAST=1 cuts between close camera
+        # angles; ORC_FOUNDRY_CAPTURE_SIZE=WxH sets the movie size. Camera moves
+        # never touch the physics.
+        self.broadcast = os.environ.get('ORC_FOUNDRY_BROADCAST') == '1'
+        self.movie_size = tuple(int(v) for v in os.environ.get('ORC_FOUNDRY_CAPTURE_SIZE','1280x720').split('x'))
+        self.shot = None
         self.initial_mass = self.assembly_audit()['mass_kg']
+
+    def update_camera(self):
+        if not self.broadcast:
+            return super().update_camera()
+        a,b = (self.bots[name].getPosition() for name in ('ANVIL','RAZOR'))
+        middle = [(a[i]+b[i])/2 for i in range(3)]
+        gap = math.dist(a,b)
+        shots = ('close','low','chase_ANVIL','close','chase_RAZOR','low')
+        shot = 'close' if self.phase in ('ready','countdown') else shots[int(self.s.getTime()//4.5)%len(shots)]
+        if shot == 'close':
+            d = max(4.,gap*1.4)
+            target = [middle[0],middle[1],.3]
+            desired = [middle[0]-d*.55,middle[1]-d*.7,d*.5]
+        elif shot == 'low':
+            # Ringside, perpendicular to the line between the fighters.
+            ux,uy = (b[0]-a[0])/max(gap,1e-6),(b[1]-a[1])/max(gap,1e-6)
+            d = max(3.2,gap*1.1)
+            target = [middle[0],middle[1],.25]
+            desired = [middle[0]-uy*d,middle[1]+ux*d,.55]
+        else:
+            name = shot.split('_')[1]
+            p = self.bots[name].getPosition()
+            orient = self.bots[name].getOrientation()
+            yaw = math.atan2(orient[3],orient[0])
+            c,s = math.cos(yaw),math.sin(yaw)
+            target = [p[0]+c*1.5,p[1]+s*1.5,p[2]+.2]
+            desired = [p[0]-c*3.0+s*.8,p[1]-s*3.0-c*.8,max(1.3,p[2]+1.3)]
+        desired[0] = max(-13.8,min(13.8,desired[0]))
+        desired[1] = max(-13.8,min(13.1,desired[1]))
+        if shot != self.shot:
+            self.eye = list(desired)  # a cut, not a pan
+            self.shot = shot
+        alpha = 1-math.exp(-self.dt/1000*4)
+        self.eye = [self.eye[i]+(desired[i]-self.eye[i])*alpha for i in range(3)]
+        self.camera.getField('position').setSFVec3f(self.eye)
+        self.camera.getField('orientation').setSFRotation(list(look_at(self.eye,target)))
 
     def write_event(self, event):
         super().write_event(event)
@@ -49,7 +92,7 @@ class MatchProbe(Foundry):
 
     def after_tick(self, now):
         if self.capture and not self.movie_started:
-            self.s.movieStartRecording(str(self.output.with_suffix('.mp4')),1280,720,0,85,1,False)
+            self.s.movieStartRecording(str(self.output.with_suffix('.mp4')),*self.movie_size,0,85,1,False)
             self.movie_started = True
         if self.finished_at is not None and now >= self.finished_at+2 and not self.recording_saved:
             self.s.worldSave(str(self.output.with_suffix('.aftermath.omniworld')))

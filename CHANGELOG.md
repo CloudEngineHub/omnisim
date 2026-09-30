@@ -25,6 +25,163 @@ top of that foundation.
 ---
 
 
+## [v9.1.0] — 2026-09-30
+
+Physics corrections that change what some worlds do, a harness that reports the
+joint limits the solver actually enforces, OmniLink bridges that can hold a
+30-minute operations shift, a PX4 x500 drone, and a legged OmniLink demo on real
+contact physics. Four of the physics and harness fixes came from external users'
+reports.
+
+### ⚠️ Behaviour changes — read before upgrading
+
+- **A `staticBase` robot's root now collides.** A `URDFRobot` with
+  `staticBase TRUE` (or an articulated `Robot` whose root has no `Physics`) was
+  welded to the world with **no collision shape**: grippers, props and other
+  robots passed silently through every fixed robot base, and MuJoCo generated no
+  contacts for those pairs. Found through an external 5-DOF arm evaluation, where
+  the gripper sat 17.7 mm inside its own base. The root's `boundingObject` and the
+  colliders of its joint-free fixed children now attach to the welded body.
+  Checked on all 78 tracked `staticBase` worlds (load + `--fail-on-runaway`):
+  verdicts are unchanged apart from two timing flips on one world pair that both
+  pass at 40 s. Physics is bit-identical in 37 of the 38 worlds with tracked
+  dynamic bodies, and the `omniarm6_real_pick_place` grasp is bit-identical.
+  `OMNISIM_NEWTON_STATIC_BASE_COLLIDERS=0` reverts (value-parsed). Pinned by
+  `tests/test_newton_static_base_colliders.py`.
+- **A body whose mass comes from `density` now weighs what its density says.**
+  Every dynamic Solid defined by density (`Physics { density 250 }`, or a bare
+  `Physics {}` at the default 1000 kg/m³) was registered on the Newton solver at
+  **0.25 kg**, whatever its size: the body build summed the raw `mass` field
+  (−1 for these bodies) and fell through to a 0.25 kg fallback. Measured: a
+  0.2 m box at density 250 → 2 kg, a 0.2 m-radius sphere at density 2000 →
+  67 kg, a 0.5 m box with `Physics {}` → 125 kg, all previously 0.25 kg. Bodies
+  that declare `mass` (every URDF link and every shipped demo) are unchanged.
+  Most visible for objects spawned at runtime and then simulated with
+  `/sim/rebuild_physics`: a heavy ball used to bounce off a stack of light
+  blocks. Affected shipped worlds are samples only (the device samples,
+  `physics_primitives`, `cylinder_stack`); all still load, and the three with
+  top-level bodies pass `--fail-on-runaway`. Pinned by
+  `tests/test_newton_density_mass.py`.
+- **`GET /robot/<def>/joints` reports the limits the physics enforces.** It read
+  `lower`/`upper` from the joint's raw stops only, but the solver uses the
+  Motor's `minPosition`/`maxPosition` when they are set. So every URDF revolute
+  limited by its motor alone read `lower: 0, upper: 0`, and neither `hit_limit`
+  nor the `joint.limit_hit` event could ever fire for it. Reported by an external
+  user on a Galbot R1. `lower`/`upper` are now the effective limits, with a new
+  `limit_source` (`"motor"`, `"stops"` or `null`) and the raw
+  `stop_lower`/`stop_upper` and `motor_lower`/`motor_upper` beside them.
+  **An unconstrained joint now reads `null`, not `0`/`0`.** `joint.limit_hit`
+  uses the same limits and carries `limit_source`. PROTOCOL.md §7.14 and §10.4
+  and the MCP `get_robot_joints` description are updated.
+
+### Fixed
+
+- **Two joint-registration defects on Newton**, both reported by an external
+  user with minimal probes. A joint under a fixed joint that merged a *rotated*
+  parent into its leader body turned about the wrong axis (0.353 rad
+  orientation error at q = 0.25 rad; 3.7e-6 rad after). A slider child authored
+  at an angle was snapped to its parent's orientation. Across the 72 shipped
+  robot URDFs (743 moving joints) no axis changes; the M20 Piper's two gripper
+  fingers now keep their authored orientation.
+- **The first demo no longer fails on a machine with no CUDA GPU.** A world
+  pinned to `newtonSolver "mujoco_warp"` JIT-compiled its kernels for the CPU,
+  and the first step landed after `run-headless --until-finalized`'s 10 s
+  budget, so the quickstart's `warehouse_husky` FAILed on a healthy install.
+  With zero CUDA devices the pin now runs the CPU MuJoCo step and the solver
+  label says it fell back (`OMNISIM_NEWTON_MJWARP=1` forces the old path).
+  Reported by an external tester.
+- `run-headless` printed the `--step-wait-timeout` budget as the time it waited;
+  it now reports the measured wait beside the budget.
+- The Windows build's Python probe embedded the newest CPython it found (3.14
+  beside 3.12 won silently). It now prefers Python 3.12, warns on any other
+  pick, and `make linker-info` prints the choice.
+- **Harness mutation verbs emit events.** `POST /robot/<def>/joints/set` and its
+  siblings now poll the contact, grip, joint-limit and damage trackers during
+  their settle steps, as `/sim/step` does; motion inside them used to fire no
+  `contact.*` or `joint.limit_hit` events.
+- The Mavic bridge published `v_xy`/`v_z` over wall-clock time, so below real
+  time (e.g. under 1080p capture) a moving drone read ~0 m/s, a flight tool
+  "settled" mid-flight and landings overshot by up to 0.47 m. Velocity is now
+  taken over simulation time (landing drift 0.35–0.47 m → 0.018 m on the x500).
+
+### OmniLink bridges: a robot that keeps a 30-minute shift
+
+Built from what a new benchmark of robot operations under change (below) found
+the bridges getting wrong. Everything here applies to the mobile bridge; the
+gate still vets every motion, including scheduled ones at the moment they fire.
+
+- **Stop means stop, now.** A "Stop!" mid-plan used to queue behind the running
+  motion (answered after 9.4 s, after the robot finished its leg and turn); it
+  is now answered in ~0.3 s. "Emergency stop!", "Abort!", "Stop turning!" parse
+  as stops; "Stop at the door." does not.
+- **A new order while the robot works stops the work first**, and the reply
+  says so. Remarks, information and questions are answered beside the running
+  work instead of interrupting it.
+- **Spatial rules and keep-out zones.** "Keep your x at or below 0.40 until I
+  say so" and rectangular keep-out zones are recorded, enforced on every drive
+  (a drive stops short of the line and reports that it was clipped) and liftable
+  only by the supervisor, the safety lead or whoever set them; a rule worded as
+  permanent cannot be lifted.
+- **Route planning.** `drive_to` plans around zones, lines and obstacles the
+  robot has met; a blocked leg is detected from speed within a fraction of a
+  second, backs off and replans, and a stalled drive ends as `blocked` instead
+  of pushing until its timeout.
+- **Orders for later.** "In 15 seconds, drive forward 1 metre", "if anything
+  bumps into you, back away 0.3 metres", and timed orders to named places run on
+  the simulation clock. They are not persisted: nothing starts moving by itself
+  after a restart.
+- **Replies come from what was measured.** A parsed order is answered after the
+  motion, from the robot's measured result ("I stopped short: I drove +1.20 m of
+  the +2.00 m asked"), not by echoing the request.
+- **Shift memory.** Named places, visit counts, people and roles, rules and the
+  record of scheduled orders are kept per shift; `/state` and the new
+  `get_shift_memory` tool expose them to every caller. A radio-style
+  `"Name: ..."` prefix is read as the speaker.
+
+### Drones and URDF import
+
+- **PX4 x500** (`projects/robots/px4/x500/`, BSD-3-Clause, generated
+  deterministically from the PX4 gazebo models; full trail in its
+  `PROVENANCE.md`) and `showcase/x500_arena.omniworld`, flown by the Mavic
+  OmniLink bridge. Needs `OMNISIM_URDF_USE_SENSORS=1`, like the Mavic chat demo.
+- **Opt-in flight model per airframe:** rotor spin-up lag, ground effect, drag
+  and seeded, modelled wind (not measured air). `/capabilities.airframe` states
+  which effects a world declares; the Mavic declares none and is unchanged
+  except for a softer landing flare.
+- **The URDF importer reads `<texture>`, colour alpha and material names**
+  (textures, transparency and appearance names were parsed and dropped).
+
+### Demos and capture
+
+- **X30 plant inspection** (`showcase/x30_plant_inspection.omniworld`, bridge on
+  port 8796): a Deep Robotics X30 on an inspection round, driven through
+  OmniLink, trotting on real contact physics via the quadruped bridge's new
+  opt-in `--locomotion crawl|trot`. It is a scripted gait on flat ground with
+  Supervisor pose and no obstacle sensing, and the world says so. Everything
+  behind the demo lives in `agents/omnilink_demos/`.
+- **Capture records on simulation time:** `POST /capture/record/{start,stop,status}`
+  saves a frame every `period_ms` of sim time, so footage plays back smoothly
+  at any real-time factor, and `record/follow` keeps a camera on a robot.
+
+### Benchmarks
+
+- **`python -m omnisim ops-bench`** (`validate`, `run`, `judge`, `regrade`)
+  grades what happens *while* a robot works: standing rules, interruptions,
+  timed orders, disturbances. See `tests/benchmarks/robot_ops/`.
+- **Warehouse shift v1 results** (README, "How OmniLink compares in OmniSim"):
+  one blind 30-minute shift, seven configurations, three repeats each, one
+  laptop, simulation only. The report states its deviations first:
+  `tests/benchmarks/robot_ops/evidence/SHIFT_V1_RESULTS.md`, with costs in
+  `SHIFT_V1_COSTS.md`. The raw per-episode evidence is published as a
+  downloadable bundle on the benchmark page rather than in this repository.
+
+### Known limitations
+
+- The OmniLink edge connector still needs OmniLink SDK 0.6.4, which is not yet
+  on PyPI; with the published 0.6.3 it reports itself `unavailable`.
+- Bump detection runs only while the robot is at rest, and its 5 mm threshold
+  was chosen on one fixture.
+
 ## [v9.0.1] — 2026-09-25
 
 ### Fixed

@@ -1,12 +1,13 @@
 # agents/ — OmniLink agents that drive OmniSim
 
-Every OmniLink agent in the repo lives under this tree. Three slots, organized by how much code you bring:
+Every OmniLink agent in the repo lives under this tree. Four slots, organized by how much code you bring:
 
 | Slot | Subdir | What lives here | Pattern |
 |---|---|---|---|
 | **Templates** | [`templates/`](templates/) | Profile-only specialist starters that reuse an existing bridge | `profile.json` + `register.py` |
 | **Production** | [`production/`](production/) | Full agents with their own runner, tools, knowledge, long-term memory | `*_agent.py` + `profile.json` + `tools/` + `prompts/` + `knowledge/` |
 | **Bridges** | [`bridges/`](bridges/) | Sim-to-real bridge stubs (no Webots, no OmniSim) | `*_bridge_stub.py` |
+| **Demos** | [`omnilink_demos/`](omnilink_demos/) | Showcase demos of OmniLink driving a robot: README, world generator, film scripts, evidence | `README.md` + `film/` + `evidence/` |
 
 The bridge HTTP surface (`/list_robots`, `/prompt`, `/tool`, `/get_robot_state`, `/stop_robot`) is identical across the three slots, so the same agent runs against a sim bridge or a real-robot bridge with no code changes.
 

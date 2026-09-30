@@ -296,3 +296,24 @@ def test_custom_data_without_an_airframe_is_ignored(raw):
 def test_custom_data_airframe_is_read():
     got = _dynamics().airframe_from_custom_data('{"rotor_dynamics": {"k_thrust": 0.001}}')
     assert got == {"k_thrust": 0.001}
+
+
+def test_published_velocity_is_differenced_over_sim_time_not_wall_time():
+    # Measured 2026-09-23 under 1080p capture (0.06x real time): /state v_xy
+    # read 0.00-0.02 m/s while the aircraft moved at 0.3-0.5 m/s, because the
+    # published velocity divided by WALL-clock dt. A waiting flight tool then
+    # "settled" mid-flight and the following land overflew its touchdown point
+    # by 0.47 m. The flight loop is a closure inside main(), so pin the source:
+    # the pose history that v_xy / v_z are differenced against must be stamped
+    # with the loop's sim clock.
+    tree = ast.parse(BRIDGE.read_text(encoding="utf-8"))
+    stamps = [n.value for n in ast.walk(tree)
+              if isinstance(n, ast.Assign) and any(
+                  isinstance(t, ast.Attribute) and t.attr == "last_pose_for_v"
+                  for t in n.targets) and isinstance(n.value, ast.Tuple)]
+    assert stamps, "no pose-history stamp found"
+    for tup in stamps:
+        clock = ast.unparse(tup.elts[3])
+        assert clock == "now_sim", f"velocity history stamped with {clock!r}"
+    src = BRIDGE.read_text(encoding="utf-8")
+    assert "now_sim = state.sim_time" in src

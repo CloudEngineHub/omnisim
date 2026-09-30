@@ -96,6 +96,8 @@ Combat-oriented Newton worlds (`newton_husky_head_on*.wbt`, `newton_husky_combat
 | `husky_rocks_traverse.omniworld` | Rocky terrain traverse |
 | `jackal_drive.omniworld`, `turtlebot3_drive.omniworld` | Drive testbeds |
 | `city_traffic.omniworld` | Urban traffic scene |
+| `x30_plant_inspection.omniworld` | Deep Robotics X30 inspection round in a process-plant yard, driven through OmniLink (`omnilink_quadruped_bridge --locomotion trot`, port 8796). Real-contact scripted trot, flat ground, walkway routing from `customData`; no obstacle sensing. Sign textures: [`showcase/textures/x30_plant/`](projects/samples/demos/worlds/showcase/textures/x30_plant/PROVENANCE.md) |
+| `x500_arena.omniworld` | PX4 x500 quadcopter in the pad arena, flown by `mavic_omnilink_bridge` (needs `OMNISIM_URDF_USE_SENSORS=1`; wind is modelled). Package: [`projects/robots/px4/x500/`](projects/robots/px4/x500/PROVENANCE.md) |
 
 Combat showcase worlds (head-on, damage arena, brawl, duel) live under [`projects/robot_combat/worlds/`](projects/robot_combat/worlds/). For the BattleBox combat-sport scene — `battlebox_husky_proving.omniworld`, `battlebox_duel.omniworld`, `battlebox_royal_rumble.omniworld` — see the [Robot Combat README](projects/robot_combat/README.md#battlebots-league--battlebots).
 

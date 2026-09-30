@@ -35,7 +35,9 @@
 
 #include <QtCore/QPointer>
 #include <QtCore/QSet>
+#include <algorithm>
 #include <cassert>
+#include <cmath>
 
 namespace {
   // P3.7: deferred-registration queue. Joints push themselves here from
@@ -645,7 +647,9 @@ void OmBasicJoint::flushPendingNewtonRegistrations() {
       continue;
     }
 
-    const OmVector3 axisLocal = hinge ? hinge->axis() : slider->axis();
+    // Authored in the parent SOLID's frame; re-expressed below when that Solid
+    // is merged into a leader body with a different orientation.
+    OmVector3 axisLocal = hinge ? hinge->axis() : slider->axis();
     // Webots' anchor is in the parent's LOCAL frame; Newton's
     // parent_xform takes that directly. For child_xform (joint
     // frame in the child's LOCAL space), we project:
@@ -707,14 +711,29 @@ void OmBasicJoint::flushPendingNewtonRegistrations() {
       const OmVector3 leaderWorld = leader->matrix().translation();
       const OmMatrix3 leaderRot = leader->rotationMatrix();
       parentAnchor = (jointWorld - leaderWorld) * leaderRot;
+      // The AXIS needs the same re-expression as the anchor (2026-09-27).
+      // Newton reads it in the joint frame, whose parent side is the leader
+      // body's frame (parent_xform carries no rotation), while `axis` is
+      // authored in the merged-away parent Solid's frame. Passing it raw rotated
+      // every joint whose parent sits below a ROTATED fixed frame about the wrong
+      // axis: an external user's probe (moving joint -> fixed frame rotated 90 deg
+      // about X -> fixed bracket -> moving joint) read 0.353 rad of orientation
+      // error at q = 0.25 rad, while a correct pose at q = 0 hid it. Leader-frame
+      // axis = R_leader^T * R_parent * axis (`v * M` is M^T * v). An unrotated
+      // chain (R_parent == R_leader) is unchanged to rounding.
+      axisLocal = (parentRot * axisLocal) * leaderRot;
       jointParentRot = leaderRot;
     }
     // Child link's authored rotation relative to its joint PARENT body
-    // (R_child^T * R_parent): baked into Newton's child_xform so a revolute
+    // (R_child^T * R_parent): baked into Newton's child_xform so the
     // constraint preserves an off-axis child `rotation` (e.g. battlebox
     // wheels' `rotation 1 0 0 1.5708`) instead of projecting it to the
     // parent's orientation. Identity for axis-aligned children (URDF wheels,
-    // huskies) -> those joints stay byte-unchanged.
+    // huskies) -> those joints stay byte-unchanged. Passed for SLIDERS too
+    // since 2026-09-27: before that only revolutes carried it, so a slider
+    // child authored at 90 deg to its parent was snapped to the parent's
+    // orientation at registration (1.5708 rad error on a minimal probe while
+    // the slider readback still said the correct 0.1 m).
     const OmQuaternion childRelRot =
         (childRot.transposed() * jointParentRot).toQuaternion();
 
@@ -897,6 +916,7 @@ void OmBasicJoint::flushPendingNewtonRegistrations() {
               targetKe, targetKd,
               limitLower, limitUpper,
               effortLimit, velocityLimit,
+              childRelRot.x(), childRelRot.y(), childRelRot.z(), childRelRot.w(),
               initialPosition)
         : newton->addJointRevolute(
               parentIdx, childIdx,
@@ -911,6 +931,27 @@ void OmBasicJoint::flushPendingNewtonRegistrations() {
     p->mNewtonJointIndex = idx;
     if (idx >= 0 && motor != nullptr && limitlessWheel)
       limitlessNewtonJointIndices().insert(idx);
+    // Name every joint the 2026-09-27 frame fixes register differently from the
+    // code before them, so a changed behaviour is attributable from the log:
+    //  * an axis re-expressed into a merged leader whose frame is rotated;
+    //  * a slider child whose authored rotation is now kept (it was identity).
+    if (idx >= 0) {
+      const OmVector3 authoredAxis = hinge ? hinge->axis() : slider->axis();
+      if ((axisLocal - authoredAxis).length() > 1e-9)
+        OmLog::info(QString("[OmNewtonBackend] joint %1 '%2': axis re-expressed in its merged leader's frame "
+                            "(%3, %4, %5) -> (%6, %7, %8)")
+                        .arg(idx).arg(p->endPointName())
+                        .arg(authoredAxis.x()).arg(authoredAxis.y()).arg(authoredAxis.z())
+                        .arg(axisLocal.x()).arg(axisLocal.y()).arg(axisLocal.z()));
+      if (slider != nullptr) {
+        const double w = std::min(1.0, std::abs(childRelRot.w()));
+        const double angleDeg = 2.0 * std::acos(w) * 180.0 / M_PI;
+        if (angleDeg > 1e-6)
+          OmLog::info(QString("[OmNewtonBackend] slider joint %1 '%2': child keeps its authored rotation "
+                              "relative to the parent body (%3 deg)")
+                          .arg(idx).arg(p->endPointName()).arg(angleDeg));
+      }
+    }
     if (idx >= 0) {
       OmLog::info(QString("[OmNewtonBackend] hinge joint %1 (parent=body %2, child=body %3) "
                           "axis=(%4, %5, %6) anchor=(%7, %8, %9) "

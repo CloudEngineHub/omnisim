@@ -45,6 +45,15 @@ movie_status      -> {ready, failed}
 sim_snapshot      -> {name, sim_time_ms, names}      args: {name: str}
 sim_restore       -> {name, sim_time_ms, boundary}   args: {name: str}
 sim_snapshots     -> {snapshots: [{name, sim_time_ms}]}
+record_start      -> {dir, period_ms, fps, tracked}  args: {dir: str, period_ms?: int (default 40),
+                                                            quality?: int, track?: [DEF, ...],
+                                                            follow?: {def, offset, look?, smooth_s?}}
+                     saves <dir>/NNNNNN.png every period_ms of SIM time + index.jsonl
+                     ({index, file, sim_time_ms, poses: {DEF: {x, y, z, yaw}}})
+record_stop       -> {dir, frames, period_ms}
+record_follow     -> {offset, look, move_s}         args: {offset?, look?, move_s?: sim s (default 2)}
+                     re-aims a running follow, easing to the new offset on sim time
+record_status     -> {active, frames, period_ms}
 
 The Camera device's resolution is fixed at world-load time by the sibling
 stanza the capture service writes; it is read here for `sim_state` so the
@@ -54,6 +63,7 @@ caller can confirm.
 from __future__ import annotations
 
 import json
+import math
 import os
 import select
 import socket
@@ -212,6 +222,9 @@ class CaptureState:
         self.movie_codec = 0
         self.movie_fps = 0
         self.frame_counter = 0
+        # Sim-time recorder (record_start / record_stop): one frame every
+        # `period_ms` of SIMULATION time, whatever the host's speed.
+        self.rec: dict | None = None
         # Checkpoints live only for the loaded world and intentionally restore
         # engine scene state, not arbitrary Python controller memory.
         self.snapshots: dict[str, float] = {}
@@ -613,6 +626,143 @@ def cmd_restore(state: CaptureState, sim_time_ms: float, args: dict) -> dict:
             "boundary": "scene state restored; controller process memory and clock were not rewound"}
 
 
+# ── Sim-time recorder ──────────────────────────────────────────────────────
+#
+# A screenshot loop driven from outside samples WALL time: when the world runs
+# below real time (a 1080p camera rendered every basic step held one drone
+# world to 0.06x), consecutive frames are unevenly and sparsely spaced in sim
+# time, so footage is either choppy at 1x or has to be time-compressed. This
+# recorder saves the camera image every `period_ms` of SIMULATION time from
+# inside the step loop, so frame N is exactly N * period_ms of sim time after
+# the first: play the sequence at 1000 / period_ms fps and it is real time.
+# While it runs the camera is enabled at the frame period instead of every
+# basic step, which is also most of the render cost.
+
+def cmd_record_start(state: CaptureState, sim_time_ms: float, args: dict) -> dict:
+    if state.rec is not None:
+        raise CommandError("a recording is already active; call record_stop first")
+    if state.camera is None:
+        raise CommandError(f"record needs the capture camera ({state.camera_reason})")
+    out_dir = args.get("dir")
+    if not isinstance(out_dir, str) or not out_dir:
+        raise CommandError("record_start requires a 'dir' string")
+    period = int(args.get("period_ms", 40))
+    if period < state.basic_step_ms or period % state.basic_step_ms:
+        raise CommandError(f"period_ms must be a positive multiple of the basic time "
+                           f"step ({state.basic_step_ms} ms)")
+    quality = int(args.get("quality", 100))
+    track = [d for d in (args.get("track") or []) if isinstance(d, str)]
+    follow = _parse_follow(state, args.get("follow"))
+    os.makedirs(out_dir, exist_ok=True)
+    state.camera.enable(period)
+    state.rec = {"dir": out_dir, "period": period, "quality": quality,
+                 "next": sim_time_ms + period, "index": 0,
+                 "nodes": {d: state.supervisor.getFromDef(d) for d in track},
+                 "follow": follow,
+                 "log": open(os.path.join(out_dir, "index.jsonl"), "w", encoding="utf-8")}
+    return {"dir": out_dir, "period_ms": period, "fps": 1000.0 / period,
+            "first_frame_sim_ms": sim_time_ms + period,
+            "tracked": [d for d, n in state.rec["nodes"].items() if n is not None],
+            "follow": None if follow is None else {k: follow[k] for k in ("def", "offset", "look", "smooth_s")}}
+
+
+# Optional camera follow for the recorder, stepped on SIM time so it is as
+# smooth in the footage as the motion it films: every basic step the camera
+# eases toward (subject position + a fixed WORLD-frame offset) and looks at
+# the subject + `look`. The offset does not turn with the subject, so a turn
+# stays readable as a turn. args.follow = {def, offset: [dx, dy, dz],
+# look?: [dx, dy, dz], smooth_s?: seconds (0 = rigid)}.
+def _parse_follow(state: CaptureState, spec) -> dict | None:
+    if spec is None:
+        return None
+    if not isinstance(spec, dict) or not isinstance(spec.get("def"), str):
+        raise CommandError("follow must be {def, offset, look?, smooth_s?}")
+    node = state.supervisor.getFromDef(spec["def"])
+    if node is None:
+        raise CommandError(f"follow: no node with DEF {spec['def']!r}")
+    offset = spec.get("offset")
+    if not (isinstance(offset, list) and len(offset) == 3):
+        raise CommandError("follow.offset must be a list of 3 numbers")
+    look = spec.get("look", [0.0, 0.0, 0.0])
+    if not (isinstance(look, list) and len(look) == 3):
+        raise CommandError("follow.look must be a list of 3 numbers")
+    p = node.getPosition()
+    off = [float(v) for v in offset]
+    return {"def": spec["def"], "node": node,
+            "offset": off, "look": [float(v) for v in look],
+            "smooth_s": max(0.0, float(spec.get("smooth_s", 1.0))),
+            "focus": [float(p[0]), float(p[1]), float(p[2])],
+            "offset_now": list(off), "move_s": 0.0}
+
+
+def cmd_record_follow(state: CaptureState, args: dict) -> dict:
+    """Re-aim a running follow: a new offset / look, reached by easing over
+    `move_s` seconds of SIM time (0 = cut), so the camera travels around its
+    subject rather than jumping."""
+    rec = state.rec
+    fol = rec.get("follow") if rec is not None else None
+    if fol is None:
+        raise CommandError("record_follow needs a recording started with a follow")
+    for key in ("offset", "look"):
+        if key in args:
+            v = args[key]
+            if not (isinstance(v, list) and len(v) == 3):
+                raise CommandError(f"{key} must be a list of 3 numbers")
+            fol[key] = [float(x) for x in v]
+    fol["move_s"] = max(0.0, float(args.get("move_s", 2.0)))
+    if fol["move_s"] == 0.0:
+        fol["offset_now"] = list(fol["offset"])
+    return {"offset": fol["offset"], "look": fol["look"], "move_s": fol["move_s"]}
+
+
+def follow_tick(state: CaptureState) -> None:
+    rec = state.rec
+    fol = rec.get("follow") if rec is not None else None
+    if fol is None:
+        return
+    dt = state.basic_step_ms / 1000.0
+    p = fol["node"].getPosition()
+    tau = fol["smooth_s"]
+    a = 1.0 if tau <= 0 else min(1.0, dt / tau)
+    fol["focus"] = [f + a * (float(v) - f) for f, v in zip(fol["focus"], p)]
+    b = 1.0 if fol["move_s"] <= 0 else min(1.0, dt / (fol["move_s"] / 3.0))
+    fol["offset_now"] = [o + b * (t - o) for o, t in zip(fol["offset_now"], fol["offset"])]
+    eye = [f + o for f, o in zip(fol["focus"], fol["offset_now"])]
+    target = [f + l for f, l in zip(fol["focus"], fol["look"])]
+    cmd_set_camera_pose(state, {"position": eye, "target": target})
+
+
+def record_tick(state: CaptureState, sim_time_ms: float) -> None:
+    rec = state.rec
+    if rec is None or sim_time_ms + 1e-6 < rec["next"]:
+        return
+    name = f"{rec['index']:06d}.png"
+    if state.camera.saveImage(os.path.join(rec["dir"], name), rec["quality"]) == -1:
+        return          # first-frame race: try again on the next step
+    poses = {}
+    for d, node in rec["nodes"].items():
+        if node is None:
+            continue
+        p = node.getPosition()
+        m = node.getOrientation()
+        poses[d] = {"x": p[0], "y": p[1], "z": p[2], "yaw": math.atan2(m[3], m[0])}
+    rec["log"].write(json.dumps({"index": rec["index"], "file": name,
+                                 "sim_time_ms": sim_time_ms, "poses": poses}) + "\n")
+    rec["log"].flush()
+    rec["index"] += 1
+    rec["next"] += rec["period"]
+
+
+def cmd_record_stop(state: CaptureState, _args: dict) -> dict:
+    rec = state.rec
+    if rec is None:
+        raise CommandError("no active recording")
+    rec["log"].close()
+    state.rec = None
+    state.camera.enable(state.basic_step_ms)
+    return {"dir": rec["dir"], "frames": rec["index"], "period_ms": rec["period"]}
+
+
 def dispatch(state: CaptureState, sim_time_ms: float, cmd: str, args: dict) -> dict:
     if cmd == "ping":
         return {}
@@ -651,6 +801,17 @@ def dispatch(state: CaptureState, sim_time_ms: float, cmd: str, args: dict) -> d
         return cmd_screenshot(state, args)
     if cmd == "frame_dump":
         return cmd_frame_dump(state, args)
+    if cmd == "record_start":
+        return cmd_record_start(state, sim_time_ms, args)
+    if cmd == "record_stop":
+        return cmd_record_stop(state, args)
+    if cmd == "record_follow":
+        return cmd_record_follow(state, args)
+    if cmd == "record_status":
+        rec = state.rec
+        return {"active": rec is not None,
+                "frames": rec["index"] if rec else 0,
+                "period_ms": rec["period"] if rec else None}
     if cmd == "movie_start":
         return cmd_movie_start(state, args)
     if cmd == "movie_stop":
@@ -699,6 +860,8 @@ def main() -> int:
 
     while supervisor.step(basic_step_ms) != -1:
         sim_time_ms += basic_step_ms
+        follow_tick(state)
+        record_tick(state, sim_time_ms)
 
         try:
             while True:

@@ -209,6 +209,17 @@ CASES = [
     ("Should your y coordinate be above 0.4 metres, drive backward 0.5 metres; otherwise turn left 110 degrees.", "turn", {"angle_rad": 1.9199}),
     ("should I drive forward 2 metres?", "drive_forward", {"distance": 2}),
 
+    # lifting a restriction is not imposing one (ops-bench F1, 2026-09-25)
+    ("That line no longer applies. Drive forward 0.5 metres.", "drive_forward", {"distance": 0.5}),
+    ("The rule does not apply any more, drive forward 1 metre.", "drive_forward", {"distance": 1}),
+    ("You may no longer drive into the bay. Drive forward 1 metre.", "drive_forward", {"distance": 1}),
+    ("That line no longer applies, but don't drive forward 1 metre.", "drive_forward", {"distance": 1}),
+    # 23cae4d13's two scopings, which no case covered, so a port that lacks
+    # them passed parity (found 2026-09-25)
+    ("Reverse 0.25 metres without turning.", "drive_forward", {"distance": -0.25}),
+    ("Reverse 0.25 metres without turning.", "turn", {"angle_rad": 1.5708}),
+    ("Drive forward 0.5 metres. Do not repeat a successful movement.", "drive_forward", {"distance": 0.5}),
+
     # the bridge vocabulary, through normalise
     ("drive forward 2 metres", "drive_forward", {"distance": 2, "wait": True}),
     ("stop", "stop_robot", {"wait": True}),

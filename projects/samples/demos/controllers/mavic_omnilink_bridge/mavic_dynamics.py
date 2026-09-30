@@ -39,6 +39,8 @@ what it did against the PROTO.
 from __future__ import annotations
 
 import json
+import math
+import random
 from typing import Optional, Tuple
 
 
@@ -104,14 +106,75 @@ class RotorDynamics:
         Anchors shifted onto the CoM: 0.013 m."""
         self.robot = robot_node
         self.props = (_PROP_FL, _PROP_FR, _PROP_RL, _PROP_RR)
+        # Optional realism terms (2026-09-25), each OFF unless the airframe
+        # declares it -- the Mavic declares none and flies exactly as before:
+        #   motor_tau_s                   first-order rotor spin-up lag
+        #   ground_effect_rotor_radius_m  per-rotor ground effect (Cheeseman-
+        #                                 Bennett), ground plane at ground_z
+        #   drag_coeff                    quadratic drag, N per (m/s)^2, on the
+        #                                 velocity RELATIVE TO THE AIR
+        #   wind {mean: [x,y,z] m/s, gust_sigma m/s, tau_s, seed,
+        #         torque_sigma N*m}       seeded Ornstein-Uhlenbeck wind, felt
+        #                                 through the drag, plus a small seeded
+        #                                 turbulence torque. MODELLED, not
+        #                                 measured air: say so wherever shown.
+        self.motor_tau = None
+        self.ge_radius = None
+        self.ground_z = 0.0
+        self.drag = 0.0
+        self.wind = None
+        self._w = [0.0, 0.0, 0.0, 0.0]
+        self._last = (0.0, 0.0, 0.0, 0.0)
         if airframe:
             self.k_thrust = float(airframe.get("k_thrust", self.k_thrust))
             self.k_torque = float(airframe.get("k_torque", self.k_torque))
             p = airframe.get("props") or {}
             self.props = tuple(tuple(float(c) for c in p.get(k, d))
                                for k, d in zip(("fl", "fr", "rl", "rr"), self.props))
+            if airframe.get("motor_tau_s"):
+                self.motor_tau = float(airframe["motor_tau_s"])
+            if airframe.get("ground_effect_rotor_radius_m"):
+                self.ge_radius = float(airframe["ground_effect_rotor_radius_m"])
+            self.ground_z = float(airframe.get("ground_z", 0.0))
+            self.drag = float(airframe.get("drag_coeff", 0.0))
+            w = airframe.get("wind")
+            if isinstance(w, dict):
+                self.wind = {
+                    "mean": [float(c) for c in (w.get("mean") or [0.0, 0.0, 0.0])][:3],
+                    "sigma": float(w.get("gust_sigma", 0.0)),
+                    "tau": max(1e-3, float(w.get("tau_s", 2.0))),
+                    "tq_sigma": float(w.get("torque_sigma", 0.0)),
+                    "rng": random.Random(int(w.get("seed", 0))),
+                }
+                self.wind["gust"] = [0.0, 0.0, 0.0]
+                self.wind["tq"] = [0.0, 0.0, 0.0]
 
-    def step(self, fl: float, fr: float, rl: float, rr: float) -> None:
+    def rotor_speed(self) -> float:
+        """Mean |rotor speed| (rad/s) the thrust was computed from last tick."""
+        return sum(abs(w) for w in self._last) / 4.0
+
+    def idle(self) -> None:
+        """Motors off (on the ground): the lagged rotor speeds spin down to 0,
+        so the next takeoff spools up from rest, not from the last hover."""
+        self._w = [0.0, 0.0, 0.0, 0.0]
+        self._last = (0.0, 0.0, 0.0, 0.0)
+
+    @staticmethod
+    def ground_effect(radius: float, height: float) -> float:
+        """Thrust ratio in / out of ground effect, 1 / (1 - (R / 4z)^2).
+        Capped at R / 4z = 0.5 (x1.33): the formula diverges as z -> 0 and
+        the cap is where published hover measurements flatten out."""
+        ratio = min(0.5, radius / (4.0 * max(height, 1e-3)))
+        return 1.0 / (1.0 - ratio * ratio)
+
+    def _ou(self, x: float, mean: float, sigma: float, tau: float, dt: float) -> float:
+        """One Ornstein-Uhlenbeck step: mean-reverting, stationary std `sigma`."""
+        rng = self.wind["rng"]
+        return (x + (mean - x) * dt / tau
+                + sigma * math.sqrt(2.0 * dt / tau) * rng.gauss(0.0, 1.0))
+
+    def step(self, fl: float, fr: float, rl: float, rr: float,
+             dt: Optional[float] = None) -> None:
         """Apply rotor forces + yaw torque for one control tick.
 
         Arguments are the four motor target velocities the bridge most
@@ -125,6 +188,12 @@ class RotorDynamics:
         # through zero under a large attitude error, so the side that should
         # have pushed down pushed up, and every big correction amplified
         # itself (public issue #10's ±2 rad oscillation).
+        if self.motor_tau and dt:
+            # Rotors cannot change speed instantly: lag the commanded speed.
+            a = 1.0 - math.exp(-dt / self.motor_tau)
+            self._w = [w + (c - w) * a for w, c in zip(self._w, (fl, fr, rl, rr))]
+            fl, fr, rl, rr = self._w
+        self._last = (fl, fr, rl, rr)
         fl2 = fl * abs(fl)
         fr2 = fr * abs(fr)
         rl2 = rl * abs(rl)
@@ -133,10 +202,17 @@ class RotorDynamics:
         # Per-propeller lift. addForceWithOffset(force, offset, relative=True)
         # applies the force in body coordinates at the body-relative offset.
         p_fl, p_fr, p_rl, p_rr = self.props
-        self.robot.addForceWithOffset([0.0, 0.0, self.k_thrust * fl2], list(p_fl), True)
-        self.robot.addForceWithOffset([0.0, 0.0, self.k_thrust * fr2], list(p_fr), True)
-        self.robot.addForceWithOffset([0.0, 0.0, self.k_thrust * rl2], list(p_rl), True)
-        self.robot.addForceWithOffset([0.0, 0.0, self.k_thrust * rr2], list(p_rr), True)
+        ge = (1.0, 1.0, 1.0, 1.0)
+        if self.ge_radius:
+            pos, rot = self.robot.getPosition(), self.robot.getOrientation()
+            ge = tuple(self.ground_effect(
+                self.ge_radius,
+                pos[2] + rot[6] * p[0] + rot[7] * p[1] + rot[8] * p[2] - self.ground_z)
+                for p in self.props)
+        self.robot.addForceWithOffset([0.0, 0.0, self.k_thrust * fl2 * ge[0]], list(p_fl), True)
+        self.robot.addForceWithOffset([0.0, 0.0, self.k_thrust * fr2 * ge[1]], list(p_fr), True)
+        self.robot.addForceWithOffset([0.0, 0.0, self.k_thrust * rl2 * ge[2]], list(p_rl), True)
+        self.robot.addForceWithOffset([0.0, 0.0, self.k_thrust * rr2 * ge[3]], list(p_rr), True)
 
         # Yaw torque from diagonal-pair asymmetry. The bridge already
         # encoded the yaw command into pair magnitudes (FR + RL bigger
@@ -144,7 +220,25 @@ class RotorDynamics:
         # the same magnitudes here so the sign comes out right without
         # tracking spin direction separately.
         yaw_tau = self.k_torque * ((fr2 + rl2) - (fl2 + rr2))
-        self.robot.addTorque([0.0, 0.0, yaw_tau], True)
+        torque = [0.0, 0.0, yaw_tau]
+
+        if self.wind and dt:
+            wd = self.wind
+            wd["gust"] = [self._ou(g, 0.0, wd["sigma"], wd["tau"], dt) for g in wd["gust"]]
+            wd["tq"] = [self._ou(t, 0.0, wd["tq_sigma"], wd["tau"] / 4.0, dt) for t in wd["tq"]]
+            # Turbulence rocks the airframe in roll and pitch; its yaw share is
+            # small (a quad's yaw is set by rotor drag, which gusts barely move).
+            tq = (wd["tq"][0], wd["tq"][1], 0.05 * wd["tq"][2])
+            torque = [a + b for a, b in zip(torque, tq)]
+        if self.drag:
+            v = self.robot.getVelocity()[:3]
+            air = [0.0, 0.0, 0.0]
+            if self.wind:
+                air = [m + g for m, g in zip(self.wind["mean"], self.wind["gust"])]
+            rel = [vi - ai for vi, ai in zip(v, air)]
+            speed = math.sqrt(sum(r * r for r in rel))
+            self.robot.addForce([-self.drag * speed * r for r in rel], False)
+        self.robot.addTorque(torque, True)
 
 
 def airframe_from_custom_data(custom_data: str) -> Optional[dict]:
