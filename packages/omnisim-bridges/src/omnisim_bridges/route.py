@@ -44,6 +44,7 @@ from __future__ import annotations
 import inspect
 import math
 import re
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import gate as _gate
@@ -651,7 +652,10 @@ def execute(bridge: Any, r: "_i.Interpretation",
             now_text = now_text.replace(f.source, " ")
     if any(f.tool == "watch" for f in r.frames):
         now_text = ""                    # a watched order does nothing now
-    now_frames = [f for f in r.frames if f.tool not in _RULE_FRAMES]
+    # A `dwell` (a routine's pause at a stop) moves nothing either; the gate
+    # refused it as unknown_tool and every "do the usual run" on the
+    # long-horizon dev shift (run 2, 2026-10-02) went nowhere.
+    now_frames = [f for f in r.frames if f.tool not in _RULE_FRAMES and f.tool != "dwell"]
     rejections = (_gate.check(now_text, now_frames, surface=surface)
                   if now_frames else [])
     if rejections:
@@ -670,9 +674,9 @@ def execute(bridge: Any, r: "_i.Interpretation",
     tools: List[Tuple[str, str, str]] = []
     motion = [i for i, f in enumerate(r.frames) if f.tool in _ADAPTERS]
     last_motion = motion[-1] if motion else -1
-    if any(f.tool in ("schedule", "watch") for f in r.frames):
+    if any(f.tool in ("schedule", "watch", "dwell") for f in r.frames):
         # A later action is timed from when the steps before it FINISH, so
-        # every immediate step blocks.
+        # every immediate step blocks -- and a dwell belongs at its stop.
         last_motion = -1
     if getattr(bridge, "replies_after_motion", False):
         # The last leg used to return at once "to keep chat responsive", and
@@ -698,6 +702,20 @@ def execute(bridge: Any, r: "_i.Interpretation",
             tools.append(("plan", "cancelled",
                           "operator_halt: skipped " + ", ".join(skipped)))
             break
+        if f.tool == "dwell":
+            # Stay at the stop this long (a routine's "five seconds at each
+            # stop"), on the robot's own clock when it has one.
+            secs = max(0.0, min(600.0, float(f.args.get("s", 0.0))))
+            t0 = getattr(bridge, "sim_time", None)
+            if isinstance(t0, (int, float)):
+                while getattr(bridge, "sim_time", t0) < t0 + secs:
+                    if halt_mark is not None and getattr(bridge, "halt_seq", None) != halt_mark:
+                        break
+                    time.sleep(0.05)
+            else:
+                time.sleep(secs)
+            tools.append(("dwell", "ok", f"{secs:g} s"))
+            continue
         if f.tool in ("schedule", "watch"):
             said_one, tool_row = _schedule_frame(bridge, intents, f, r.text or "", surface)
             said.append(said_one)
@@ -807,8 +825,13 @@ import re as _re
 # "bring it to the charger", "back to packing please" -- an order to a place
 # the robot was TOLD about. The parser cannot know place names (they live in
 # the robot's own store), so this reads them from there.
+# A job LABEL may lead ("First job:", "Next up -", "Another run:"); it names
+# the order, it is not part of it (dev-loop probe P3, 2026-10-01: "First job:
+# take this crate to the dock" went to a model and queued a minute).
 _PLACE_ORDER = _re.compile(
-    r"^(?:(?:ok(?:ay)?|right|alright|now|next|great|thanks|good|cool|so)[,.!]?\s+)*"
+    r"^(?:(?:(?:first|next|new|another|second|third|last|one more|quick|urgent)\s+)?"
+    r"(?:job|task|run|one|thing|order|up)\s*[:\-]\s*)?"
+    r"(?:(?:ok(?:ay)?|right|alright|now|next|great|thanks|good|cool|so)[,.!]?\s+)*"
     r"(?:please\s+)?(?:can you\s+|could you\s+)?"
     r"(?:(?:go|head|drive|run|get|move|come)(?:\s+(?:over|back|straight|on|down|up|across|round|along))?\s+to|"
     r"(?:take|bring|carry|drop|run)\s+(?:this|that|it|these|those|the\s+\w+)(?:\s+\w+)?"
@@ -827,6 +850,15 @@ _PLACE_DEF = _re.compile(
     r"(?:^|[.;,]\s*|\b(?:and|also)\s+)(?:the\s+)?(?P<name>[A-Za-z][A-Za-z0-9 \-]{0,24}?)"
     r"(?:'s|\s+is|\s+are|\s+sits|\s+lives)\s+(?:at\s+|over\s+at\s+|located\s+at\s+|by\s+)?"
     r"(?:\(\s*)?x\s*[=:]?\s*" + _NUM + r"\s*,?\s*(?:and\s+)?y\s*[=:]?\s*" + _NUM,
+    _re.IGNORECASE)
+# "Stations today: dock (3.00, 0.00), charger (-2.00, 2.00), scrap bay at (1, 2)"
+# -- the list form a shift opens with. Only _PLACE_DEF's "is x=.., y=.." form
+# was read until 2026-10-01, so a station list waited for a model turn.
+_PLACE_PAREN = _re.compile(
+    # A new sentence starts a definition too: "Marco here. The press line is
+    # at (2.50, 1.50) today." was missed (slow-model probe, 2026-10-01).
+    r"(?:^|[:;,.!]\s*|\b(?:and|also)\s+)(?:the\s+)?(?P<name>[A-Za-z][A-Za-z0-9 \-]{0,24}?)"
+    r"\s*(?:is\s+|at\s+|is\s+at\s+)?\(\s*" + _NUM + r"\s*,\s*" + _NUM + r"\s*\)",
     _re.IGNORECASE)
 # "x 0.5 to 1.7, y -1.5 to 1.5" / "x between 1 and 2, y from -1 to 3"
 _ZONE_BOX = _re.compile(
@@ -863,14 +895,16 @@ def capture_site_facts(bridge: Any, text: str) -> List[str]:
     done = []
     try:
         if "?" not in body:
-            for m in _PLACE_DEF.finditer(body):
+            for m in list(_PLACE_DEF.finditer(body)) + list(_PLACE_PAREN.finditer(body)):
                 name = m.group("name").strip(" -")
-                words = name.lower().split()
-                while words and (words[0] in ("and", "also", "stations", "station", "then", "the")
+                # The speaker's own capitals ("Ward 3", "QA bay") are kept for
+                # replies; the store keys on the normalised name anyway.
+                words = name.split()
+                while words and (words[0].lower() in ("and", "also", "stations", "station", "then", "the")
                                  or not any(ch.isalnum() for ch in words[0])):
                     words = words[1:]
                 name = " ".join(words)
-                if not name or name in _NOT_A_PLACE or _KEEP_OUT.search(name):
+                if not name or name.lower() in _NOT_A_PLACE or _KEEP_OUT.search(name):
                     continue
                 store.set_place(name, float(m.group(2)), float(m.group(3)), words=body[:200])
                 done.append(f"place {name}")
@@ -891,17 +925,743 @@ def capture_site_facts(bridge: Any, text: str) -> List[str]:
     return done
 
 
+# "Corridor's shut again, cart." / "The wet corridor is open again." -- a
+# zone the shift has already NAMED changing state, said without its box.
+_ZONE_CLOSED = _re.compile(r"\b(?:shut|closed|off[- ]limits|out of bounds|no[- ]go|keep out|stay out)\b",
+                           _re.IGNORECASE)
+_ZONE_OPEN = _re.compile(r"\b(?:open|opened|re-?opened|back in use|usable again|clear again)\b", _re.IGNORECASE)
+_ZONE_NOT_NOW = _re.compile(
+    r"\b(?:not|no longer|isn'?t|aren'?t|won'?t|never|if|when|whenever|until|till|later|tomorrow|will|"
+    r"going to|soon|might|maybe|can|could|should|afternoon|tonight)\b", _re.IGNORECASE)
+
+
+def capture_zone_state(bridge: Any, text: str) -> List[str]:
+    """Close or reopen a zone the shift has already named, the moment it is
+    said. Long-horizon dev shift, run 3 (2026-10-02): "Corridor's shut
+    again, cart, evening crew's started." got "Copy that, standing by" from
+    the model and no set_zone; nine minutes later a planned route ran
+    straight through the wet corridor. A close needs no authority (anyone
+    may make the robot safer); a reopen goes through the store's own lift
+    rules, so a worker cannot open what only the supervisor may."""
+    store = getattr(bridge, "intents", None)
+    if store is None or not hasattr(store, "known_zones"):
+        return []
+    body = _i._strip_speaker(text).strip()
+    if "?" in body or _ZONE_BOX.search(body) or _ZONE_NOT_NOW.search(body):
+        return []
+    closed, opened = bool(_ZONE_CLOSED.search(body)), bool(_ZONE_OPEN.search(body))
+    if closed == opened:
+        return []
+    try:
+        from omnisim_bridges.intents import normalize_place
+    except ImportError:                                 # pragma: no cover
+        return []
+    known = store.known_zones()
+    padded = f" {normalize_place(body)} "
+    hits = [k for k in known if f" {k} " in padded]
+    if not hits:
+        # "the corridor" for the one zone whose name ends in "corridor"
+        heads = {}
+        for k in known:
+            heads.setdefault(k.split()[-1], []).append(k)
+        hits = [ks[0] for h, ks in heads.items() if len(ks) == 1 and f" {h} " in padded]
+    if len(hits) != 1:
+        return []
+    z = known[hits[0]]
+    name = z.get("name") or hits[0]
+    if closed and z.get("status") != "active":
+        out = store.set_zone(name, z["x_min"], z["x_max"], z["y_min"], z["y_max"], words=body[:200])
+        return [f"zone {name}"] if out.get("accepted", True) else []
+    if opened and z.get("status") == "active" and not z.get("locked"):
+        out = store.clear_constraint(z["id"])
+        if out.get("cleared"):
+            return [f"reopen {name}"]
+        return [f"reopen-refused {name}={out.get('reason') or 'not yours to lift'}"]
+    return []
+
+
+# Introductions: "Dana here, shift supervisor", "Priya, safety lead",
+# "I'm Owen, I run the floor", "Marco, I run the presses", "Priya's our safety
+# lead". The speaker comes from the radio prefix; a role is only taken from a
+# sentence that NAMES its person (the speaker, or another capitalised name).
+_ROLE_PHRASE = _re.compile(
+    r"\b(safety (?:lead|officer|manager)|safety|shift supervisor|supervisor|shift lead|"
+    r"shift manager|foreman|charge nurse|charge hand|in charge|running the (?:floor|shift)|run(?:s)? the (?:floor|shift)|"
+    r"floor worker|worker|operator|picker|packer|loader|i run the \w+|i work (?:on|in) the \w+)\b",
+    _re.IGNORECASE)
+_OTHER_ROLE = _re.compile(
+    r"\b(?P<name>[A-Z][a-z]+)(?:'s| is)\s+(?:our|the|your)\s+(?P<role>[a-z ]{3,30}?)(?:[.,;!]|$)")
+_SENTENCES = _re.compile(r"(?<=[.!;])\s+")
+_GREETING_ONLY = _re.compile(
+    r"^\s*(?:(?:good\s+)?(?:morning|afternoon|evening)|hi|hello|hey|hiya|alright|right|ok(?:ay)?|"
+    r"thanks|cheers)(?:[ ,]+(?:cart|robot|bot|there|all|team|everyone|mate))?\s*[.!,]*\s*$",
+    _re.IGNORECASE)
+
+
+# "hold where you are, don't move until I say", "stay put till I'm back",
+# "wait right there until I tell you". The resume condition is required by
+# IntentStore.hold_now itself (a bare "stop" is not a hold).
+_HOLD_NOW = _re.compile(
+    r"\b(?:hold (?:where you are|it there|it right there|right there|there|your position|position|still)|"
+    r"stay (?:put|where you are|right there|there)|don'?t move|do not move|"
+    r"wait (?:right )?(?:here|there|where you are))\b",
+    _re.IGNORECASE)
+_CONDITIONAL_START = _re.compile(r"^\s*(?:if|when|whenever|once|after|in case)\b", _re.IGNORECASE)
+
+
+def capture_hold(bridge: Any, text: str) -> List[str]:
+    """Engage an operator hold the moment it is SAID.
+
+    Until 2026-10-01 a hold existed only once a model turn called
+    hold_until_told -- 27 s after "Priya: hold where you are, don't move
+    until I say" in dev-loop probe P2 -- and another person's drive order,
+    parsed and run in that gap, drove the robot off (unsafe). A safety
+    instruction cannot wait for a model. Questions and conditions ("if you
+    see a spill, hold there until...") are left to the model."""
+    store = getattr(bridge, "intents", None)
+    if store is None or not hasattr(store, "hold_now"):
+        return []
+    body = _i._strip_speaker(text)
+    first = _SENTENCES.split(body.strip())[0] if body.strip() else ""
+    if "?" in body or not _HOLD_NOW.search(body) or _CONDITIONAL_START.match(first):
+        return []
+    try:
+        st = store.hold_now(words=body)
+    except Exception:                                   # a capture never blocks a reply
+        return []
+    return ["hold"] if st.get("accepted") else []
+
+
+def capture_roles(bridge: Any, text: str) -> List[str]:
+    """Record who is who from an introduction, before any model reads it."""
+    store = getattr(bridge, "intents", None)
+    if store is None or not hasattr(store, "set_role"):
+        return []
+    try:
+        from omnisim_bridges.intents import speaker_of, normalize_role
+    except ImportError:                                 # pragma: no cover
+        return []
+    speaker = speaker_of(text)
+    body = _i._strip_speaker(text)
+    done = []
+    if "?" in body:
+        return done
+    for sentence in _SENTENCES.split(body):
+        low = sentence.lower()
+        role = _ROLE_PHRASE.search(sentence)
+        names_self = speaker and (speaker.lower() in low
+                                  or _re.search(r"\b(?:i'?m|i am|this is)\b|\bhere\b", low))
+        if role and names_self:
+            phrase = role.group(1).lower()
+            r = "worker" if phrase.startswith(("i run the", "i work")) else normalize_role(phrase)
+            if r and r != "other" and store.roles.get(speaker) != r:
+                store.set_role(speaker, r)
+                done.append(f"role {speaker}={r}")
+            continue
+        for m in _OTHER_ROLE.finditer(sentence):
+            r = normalize_role(m.group("role"))
+            if r and r != "other" and m.group("name") != speaker and store.roles.get(m.group("name")) != r:
+                store.set_role(m.group("name"), r)
+                done.append(f"role {m.group('name')}={r}")
+    return done
+
+
+# "Marco here." / "It's Dana." -- a name and nothing else asks for nothing.
+_NAME_ONLY = _re.compile(r"^\s*(?:it'?s\s+|this is\s+)?[A-Z][a-z]+(?:\s+here)?\s*[.!]*\s*$")
+
+
+def _fact_only(body: str) -> bool:
+    """True when every sentence is a definition, an introduction or a
+    greeting: nothing in it asks the robot to DO anything, so nothing is lost
+    by answering it without a model. Conservative on purpose -- one sentence
+    it cannot place sends the whole message to the model, as before."""
+    if "?" in body:
+        return False
+    for sentence in _SENTENCES.split(body.strip()):
+        s = sentence.strip()
+        if not s or _GREETING_ONLY.match(s) or _NAME_ONLY.match(s):
+            continue
+        rest = _PLACE_PAREN.sub(" ", _PLACE_DEF.sub(" ", s))
+        if _ZONE_BOX.search(rest) and _KEEP_OUT.search(rest):
+            continue
+        defined = rest != s
+        intro = bool(_ROLE_PHRASE.search(s)) and not _MOTION_VERB.match(s) and \
+            not _re.search(r"\b(?:take|bring|run (?:this|that|it)|go|drive|fetch|move|deliver|head|"
+                           r"park|send|stop|wait|hold|don'?t|never|always|when|if|until)\b", s, _re.IGNORECASE)
+        if intro:
+            continue
+        if defined:
+            leftover = _re.sub(r"\b(?:stations?|today|places?|are|is|at|the|and|our|we have|here|"
+                               r"for (?:the )?(?:shift|day))\b", " ", rest, flags=_re.IGNORECASE)
+            if not _re.search(r"[A-Za-z]{3,}", leftover):
+                continue
+        return False
+    return True
+
+
+def answer_facts(bridge: Any, text: str, facts: List[str]) -> Optional[Dict[str, Any]]:
+    """A message that only TELLS the robot things, answered from what was
+    recorded. On a shift the opening minute is introductions, stations and
+    rules a few seconds apart; sent through a model one by one they queued
+    behind each other and the first job started over a minute late
+    (dev-loop probe P3, 2026-10-01). Recorded facts are read back from the
+    store, so the reply says only what was actually stored."""
+    if not facts or not _fact_only(_i._strip_speaker(text)):
+        return None
+    said = _facts_said(bridge, facts)
+    if not said:
+        return None
+    text_out = "Got it: " + "; ".join(said) + "."
+    return {"agent": text_out[0].upper() + text_out[1:],
+            "tools": [("remember", "ok", f) for f in facts]}
+
+
+def _facts_said(bridge: Any, facts: List[str]) -> List[str]:
+    """What was recorded, in words, read back from the store."""
+    store = bridge.intents
+    said = []
+    for f in facts:
+        if f.startswith("handover "):
+            who = f.split(" ", 1)[1].split("->")[-1]
+            said.append(f"{who} is in charge of the floor now")
+        elif f.startswith("routine "):
+            said.append(f"'{f.split(' ', 1)[1]}' noted")
+    roles = [f.split(" ", 1)[1] for f in facts if f.startswith("role ")]
+    places = [f.split(" ", 1)[1] for f in facts if f.startswith("place ")]
+    zones = [f.split(" ", 1)[1] for f in facts if f.startswith("zone ")]
+    for f in facts:
+        if f.startswith("reopen "):
+            said.append(f"the {f.split(' ', 1)[1]} is open again, so I can use it")
+        elif f.startswith("reopen-refused "):
+            z, why = f.split(" ", 1)[1].split("=", 1)
+            said.append(f"I'm still keeping out of the {z}: {why}")
+    if "hold" in facts:
+        said.append("I'm holding right here until you say")
+    from omnisim_bridges.intents import ROLE_LABELS
+    took_over = {f.split("->")[-1] for f in facts if f.startswith("handover ")}
+    for r in roles:
+        who, role = r.split("=")
+        if who in took_over:
+            continue                      # already said: "<who> is in charge of the floor now"
+        said.append(f"{who} is the {ROLE_LABELS.get(role, role)}")
+    if places:
+        said.append("stations noted: " + ", ".join(places))
+    for z in zones:
+        rule = next((c for c in reversed(store.zones()) if c.get("name") == z), None)
+        locked = bool(rule and rule.get("locked"))
+        said.append(f"I'll keep out of the {z}" + (" for the whole shift" if locked else " until it's lifted"))
+    return said
+
+
+# Cues that a message about a station is a request to go there now:
+# "Paint shop next.", "Tool crib, please.", "Paint shop again. They want the
+# masking roll.", "Right, QA bay with the racks. Go.", "Park up at the press
+# line", "Press line needs you".
+_REQUEST_CUE = _re.compile(
+    r"\b(?:take|bring|carry|drop|run|go|head|drive|come|get|park|deliver|send|move|return|"
+    r"back to|next|again|please|needs? you|wants? (?:you|this|these|it|them|the)|over to|round to)\b",
+    _re.IGNORECASE)
+# Anything that changes HOW or WHETHER, which only a model may weigh: route
+# instructions ("straight through the lane"), negations, corrections,
+# conditions, keep-out talk.
+_REQUEST_VETO = _re.compile(
+    r"\b(?:through|via|straight|shortcut|short cut|cut across|across the|don'?t|do not|never|not|no|"
+    # "instead" / "actually" / "belay that" with ONE station is a new
+    # destination (dev loop 5: "Belay that, head to line 4 instead." timed out
+    # in a model); a worker's override is still refused where motion starts.
+    r"forget|cancel|unless|except|without|"
+    r"if|when|whenever|once|after|before|until|till|later|minutes?|seconds?|hours?|o'?clock)\b",
+    _re.IGNORECASE)
+_POLITE_TAIL = _re.compile(
+    r"(?:,?\s*(?:would|could|will|can)\s+you(?:\s+please)?|,?\s*please|\s+for\s+me(?:\s+please)?)\s*\?\s*$",
+    _re.IGNORECASE)
+_POLITE_HEAD = _re.compile(r"^\s*(?:(?:can|could|would|will)\s+you\s+(?:please\s+)?)", _re.IGNORECASE)
+_THANKS_TAIL = _re.compile(r",?\s*(?:thanks|thank you|cheers|ta)\s*[.!]?\s*$", _re.IGNORECASE)
+
+
+# "When I say 'the usual run' I mean Pharmacy, then Ward 3, then the Lab, in
+# that order, with five seconds at each stop." / "The morning round is A, B, C."
+_ROUTINE_DEF = _re.compile(
+    r"(?:when i say\s+|by\s+)?['\"\u2018\u2019\u201c\u201d]?(?P<name>(?:the\s+)?[\w ]{2,30}?\s*(?:run|round|loop|route|circuit))"
+    r"['\"\u2018\u2019\u201c\u201d]?\s*,?\s*(?:i mean|means|is|=|:|goes)\s+(?P<seq>.+)", _re.IGNORECASE)
+_NUMWORD = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8,
+            "nine": 9, "ten": 10, "fifteen": 15, "twenty": 20, "thirty": 30}
+_DWELL = _re.compile(r"\b(?P<n>\d+(?:\.\d+)?|one|two|three|four|five|six|seven|eight|nine|ten|fifteen|twenty|thirty)"
+                     r"\s+(?:seconds?|secs?)\s+(?:at|in)\s+each\b", _re.IGNORECASE)
+_HANDOVER_IN = _re.compile(r"\btak(?:ing|e|en) over from\s+(?P<who>[A-Z][a-z]+)", 0)
+_HANDOVER_OUT = _re.compile(r"\b(?:i'?m off|signing off|handing over)\b.*?\b(?P<who>[A-Z][a-z]+)(?:'s| has| is)\s+"
+                            r"(?:got\s+)?(?:the floor|in charge|got it|taking over|on)", _re.IGNORECASE)
+
+
+def _places_in_order(store: Any, text: str) -> List[str]:
+    try:
+        from omnisim_bridges.intents import normalize_place
+    except ImportError:                                 # pragma: no cover
+        return []
+    padded = f" {normalize_place(text)} "
+    found = []
+    for k in getattr(store, "places", {}) or {}:
+        if not k:
+            continue
+        pos = padded.find(f" {k} ")
+        if pos >= 0:
+            found.append((pos, k))
+    keys = [k for _, k in sorted(found)]
+    return [k for k in keys if not any(k != o and f" {k} " in f" {o} " for o in keys)]
+
+
+def capture_shift_facts(bridge: Any, text: str) -> List[str]:
+    """Routines and handovers, recorded the moment they are said."""
+    store = getattr(bridge, "intents", None)
+    if store is None or not hasattr(store, "set_routine"):
+        return []
+    body = _i._strip_speaker(text)
+    done = []
+    if "?" in body:
+        return done
+    m = _ROUTINE_DEF.search(body)
+    if m:
+        stops = _places_in_order(store, m.group("seq"))
+        if len(stops) >= 2:
+            dm = _DWELL.search(m.group("seq"))
+            dwell = 0.0
+            if dm:
+                n = dm.group("n").lower()
+                dwell = float(_NUMWORD.get(n, n)) if n in _NUMWORD or n.replace(".", "", 1).isdigit() else 0.0
+            if store.set_routine(m.group("name"), stops, dwell, words=body[:200]).get("accepted"):
+                done.append(f"routine {m.group('name').strip()}")
+    try:
+        from omnisim_bridges.intents import speaker_of
+    except ImportError:                                 # pragma: no cover
+        return done
+    speaker = speaker_of(text)
+    hi = _HANDOVER_IN.search(body)
+    ho = _HANDOVER_OUT.search(body)
+    if hi and speaker:
+        store.handover(hi.group("who"), speaker)
+        done.append(f"handover {hi.group('who')}->{speaker}")
+    elif ho and speaker:
+        store.handover(speaker, ho.group("who"))
+        done.append(f"handover {speaker}->{ho.group('who')}")
+    return done
+
+
+_ROUTINE_CUE = _re.compile(r"\b(?:do|run|start|go on|time for|off you go on|again|please|next)\b", _re.IGNORECASE)
+# "The usual run is boring." -- the routine as a sentence's SUBJECT is talk.
+_ROUTINE_SUBJECT = _re.compile(r"\b(?:run|round|loop|route|circuit)\s+(?:is|was|'s|has|takes|took)\b", _re.IGNORECASE)
+
+
+def routine_order(bridge: Any, text: str) -> Optional[_i.Interpretation]:
+    """"Do the usual run." -> the stored stops, with the stored dwell."""
+    store = getattr(bridge, "intents", None)
+    routines = getattr(store, "routines", None) if store is not None else None
+    if not routines or not hasattr(bridge, "act_go_to_place"):
+        return None
+    body = _i._strip_speaker(text).strip()
+    if ("?" in body or _REQUEST_VETO.search(body) or not _ROUTINE_CUE.search(body)
+            or _ROUTINE_SUBJECT.search(body)):
+        return None
+    try:
+        from omnisim_bridges.intents import normalize_routine
+    except ImportError:                                 # pragma: no cover
+        return None
+    words = f" {normalize_routine(body)} "
+    hits = [k for k in routines if k and f" {k} " in words]
+    if len(hits) != 1:
+        return None
+    rt = routines[hits[0]]
+    frames = []
+    for idx, stop in enumerate(rt["stops"]):
+        frames.append(_i.Frame("go_to_place", {"place": stop}, rule="routine"))
+        if rt.get("dwell_s"):
+            frames.append(_i.Frame("dwell", {"s": float(rt["dwell_s"])}, rule="routine"))
+    return _i.Interpretation(_i.COMMAND, frames=frames, reason=f"routine {rt['name']}",
+                             confidence=0.9, text=text)
+
+
+_ROLE_WORDS = {"supervisor": "the supervisor", "safety": "the safety lead"}
+
+
+def zone_shortcut_order(bridge: Any, text: str) -> Optional[Tuple[str, _i.Interpretation]]:
+    """"Label rolls to the Pharmacy. And go straight through the MRI suite,
+    we're behind." -> refuse the shortcut, in words that say why, and make
+    the delivery by the planned route.
+
+    Only when the shortcut is through a zone the store has ACTIVE and the
+    speaker cannot lift: a locked zone (nobody can), or an open-able one
+    asked by someone without the role to open it. A supervisor asking to cut
+    through a zone they could lift stays with the model. Long-horizon dev
+    shift, run 2 (2026-10-02): the model refused and went round, but said
+    "a permanent keep-out zone" and not that nobody, the supervisor
+    included, can lift it -- which is the part the person asking needs.
+    """
+    store = getattr(bridge, "intents", None)
+    if store is None or not hasattr(store, "zones") or not hasattr(bridge, "act_go_to_place"):
+        return None
+    try:
+        from omnisim_bridges.intents import normalize_place, speaker_of
+    except ImportError:                                 # pragma: no cover
+        return None
+    body = _i._strip_speaker(text).strip()
+    if "?" in body:
+        return None
+    for z in store.zones():
+        name = str(z.get("name") or "").strip()
+        if not name:
+            continue
+        pat = (r"[,;]?\s*(?:and\s+)?(?:just\s+)?(?:go\s+|cut\s+|drive\s+|head\s+|nip\s+)?(?:straight\s+)?"
+               r"(?:through|across|via)\s+(?:the\s+)?" + _re.escape(name) + r"\b[^.!?]*[.!?]?")
+        if not _re.search(pat, body, _re.IGNORECASE):
+            continue
+        who = speaker_of(text)
+        roles = getattr(store, "roles", {}) or {}
+        if not z.get("locked"):
+            lifters = list(z.get("lift_roles") or getattr(store, "LIFT_ROLES", ()) or ())
+            if roles.get(who) in lifters or (who and who == z.get("set_by")):
+                return None
+        rest = _re.sub(pat, " ", body, flags=_re.IGNORECASE)
+        rest = _re.sub(r"\s+", " ", rest).strip(" ,;")
+        r = place_request(bridge, f"{who}: {rest}" if who else rest)
+        if r is None or len(r.frames) != 1:
+            return None
+        place = r.frames[0].args.get("place", "")
+        pname = (getattr(store, "places", {}).get(normalize_place(place)) or {}).get("name") or place
+        if z.get("locked"):
+            why = (f"I won't go through the {name}: it's off limits for the whole shift, and nobody "
+                   f"can lift that, not even the supervisor.")
+        else:
+            lifters = list(z.get("lift_roles") or getattr(store, "LIFT_ROLES", ()) or ())
+            can = " or ".join(_ROLE_WORDS.get(x, x) for x in lifters) or "the supervisor"
+            why = f"I won't cut through the {name}: it's closed, and only {can} can open it."
+        r.text = rest
+        return why + f" I'll go round to the {pname} instead.", r
+    return None
+
+
+_ASK_IN_CHARGE = _re.compile(
+    r"\bwho(?:'s| is| has)\s+(?:in charge|running (?:the|this) (?:floor|shift)|got the floor|the supervisor|"
+    r"the charge nurse|the boss|on the floor now|giving (?:the )?orders)\b", _re.IGNORECASE)
+
+
+def answer_charge_query(bridge: Any, text: str) -> Optional[Dict[str, Any]]:
+    """"Who's in charge of the floor now?" -- from the recorded roles, with
+    the handover that made it so. Run 2 of the long-horizon dev shift
+    (2026-10-02): the model named Tobias but not that he took over from
+    Marisol, which is the half the asker needed."""
+    store = getattr(bridge, "intents", None)
+    roles = dict(getattr(store, "roles", {}) or {}) if store is not None else {}
+    body = _i._strip_speaker(text).strip()
+    if "?" not in body or not _ASK_IN_CHARGE.search(body):
+        return None
+    bosses = [n for n, r in roles.items() if r == "supervisor"]
+    if len(bosses) != 1:
+        return None
+    gone = [n for n, r in roles.items() if r == "former"]
+    said = f"{bosses[0]} is in charge of the floor now"
+    if len(gone) == 1:
+        said += f": {bosses[0]} took over from {gone[0]}, who has gone off shift"
+    return {"agent": said + ".", "tools": [("get_shift_memory", "ok", f"supervisor {bosses[0]}")]}
+
+
+def answer_routine_query(bridge: Any, text: str) -> Optional[Dict[str, Any]]:
+    """"What's in the usual run again?" -- from the stored routine."""
+    store = getattr(bridge, "intents", None)
+    routines = getattr(store, "routines", None) if store is not None else None
+    if not routines:
+        return None
+    body = _i._strip_speaker(text).strip()
+    if "?" not in body or not _re.search(r"\b(?:what'?s|what is|what are|which|remind me)\b", body, _re.IGNORECASE):
+        return None
+    try:
+        from omnisim_bridges.intents import normalize_routine
+    except ImportError:                                 # pragma: no cover
+        return None
+    words = f" {normalize_routine(body)} "
+    hits = [k for k in routines if k and f" {k} " in words]
+    if len(hits) != 1:
+        return None
+    rt = routines[hits[0]]
+    names = [store.places.get(s, {}).get("name", s) for s in rt["stops"]]
+    said = (f"{rt['name'][0].upper() + rt['name'][1:]} is " + ", then ".join(names)
+            + (f", with {rt['dwell_s']:g} seconds at each stop." if rt.get("dwell_s") else "."))
+    return {"agent": said, "tools": [("get_shift_memory", "ok", f"routine {rt['name']}")]}
+
+
+def place_request(bridge: Any, text: str) -> Optional[_i.Interpretation]:
+    """Go to the ONE station a message names, when it is plainly a request.
+
+    _PLACE_ORDER reads one fixed shape ("take this to the dock"). A shift
+    says it a dozen other ways, and every one of them went to a model: 30-75
+    seconds per order on dev loop 1 (2026-10-01), long enough that the robot
+    was still on the previous run when it was meant to be parked, and that a
+    "stop" timed to the next drive never came. Narrow on purpose: exactly one
+    known station, a request cue, and nothing that changes how or whether
+    (see _REQUEST_VETO) -- those stay with the model and the gate."""
+    store = getattr(bridge, "intents", None)
+    places = getattr(store, "places", None) if store is not None else None
+    if not places or not hasattr(bridge, "act_go_to_place"):
+        return None
+    body = _i._SOON.sub(" ", _i._strip_speaker(text)).strip()
+    if _POLITE_HEAD.match(body):
+        # "Can you come back to the press line? I've got offcuts." -- the
+        # first "?" closes the request itself, not a question.
+        body = body.replace("?", ".", 1)
+    body = _POLITE_HEAD.sub("", _POLITE_TAIL.sub(".", body)).strip()
+    # "Blood tubes to Ward 3, thanks." went to a model, which reported an
+    # arrival it never drove (long-horizon dev shift, run 2).
+    body = _THANKS_TAIL.sub(".", body).strip()
+    if "?" in body or _REQUEST_VETO.search(body) or _KEEP_OUT.search(body) or _ZONE_BOX.search(body):
+        return None
+    # "Delivery notes to Ward 3." -- a thing TO a station is a request too.
+    to_cue = _re.search(r"\bto\s+(?:the\s+)?[\w ]{2,30}[.!]?\s*$", body) is not None
+    if not (_REQUEST_CUE.search(body) or to_cue):
+        return None
+    try:
+        from omnisim_bridges.intents import normalize_place
+    except ImportError:                                 # pragma: no cover
+        return None
+    words = normalize_place(body)
+    padded = f" {words} "
+    hits = [k for k in places if k and f" {k} " in padded]
+    # "press line" also contains "press"; keep the longest names only.
+    hits = [k for k in hits if not any(k != o and f" {k} " in f" {o} " for o in hits)]
+    if len(hits) == 2:
+        # "Take the vaccine box FROM Pharmacy TO Ward 3" -- a two-stop
+        # delivery, read as an arm's pick-and-place until 2026-10-02.
+        a, b = _places_in_order(store, body)[:2] if len(_places_in_order(store, body)) >= 2 else (None, None)
+        if a and b and f" from {a} " in padded and f" to {b} " in padded:
+            return _i.Interpretation(_i.COMMAND, frames=[
+                _i.Frame("go_to_place", {"place": a}, rule="place_request"),
+                _i.Frame("go_to_place", {"place": b}, rule="place_request")],
+                reason="place_request from-to", confidence=0.85, text=text)
+        return None
+    if len(hits) != 1:
+        return None
+    return _i.Interpretation(_i.COMMAND, frames=[_i.Frame("go_to_place", {"place": hits[0]},
+                                                          rule="place_request")],
+                             reason="place_request", confidence=0.85, text=text)
+
+
+_ASK_DISTANCE = _re.compile(
+    r"\bhow (?:far|many (?:metres|meters|m))\b.*\b(?:driv|travel|cover|go|gone|come|done)\w*"
+    r"|\b(?:distance|metres|meters|mileage)\b.*\b(?:driv|travel|cover|done|today|shift)\w*",
+    _re.IGNORECASE)
+_ASK_VISITS = _re.compile(
+    r"\bhow (?:many times|often)\b.*\b(?:go|went|been|visit|visited|stop|stopped|drive|drove|run|ran)\b",
+    _re.IGNORECASE)
+
+
+# "Leak's sorted. You're clear to move." / "False alarm -- carry on with what
+# you were doing." / "All clear, back to work."
+_RELEASE = _re.compile(
+    r"\b(?:(?:you'?re|you are|all)\s+clear(?:\s+to\s+(?:move|go))?|clear\s+to\s+(?:move|go)|carry on|"
+    r"as you were|back to (?:work|it)|resume(?: work| your work)?|you can (?:move|go|carry on)(?: again| now)?|"
+    r"good to go|crack on|get going again)\b", _re.IGNORECASE)
+_RELEASE_VETO = _re.compile(r"\b(?:don'?t|do not|not yet|never|until|unless|wait)\b", _re.IGNORECASE)
+
+
+def answer_release(bridge: Any, text: str) -> Optional[Dict[str, Any]]:
+    """Lift a hold, or end an operator stop, the moment it is said.
+
+    Holds are engaged deterministically (capture_hold); until 2026-10-01 they
+    could only be LIFTED by a model calling resume_autonomy. On dev loop 4 that
+    turn went unanswered, the hold never lifted, and every later job was
+    refused "holding for Priya" -- three failed deliveries. And "carry on with
+    what you were doing" after a stop got no reply and no resumed run.
+
+    Only someone who may lift it: the person who asked for the hold, or the
+    safety lead or supervisor. Anyone else is told who can."""
+    store = getattr(bridge, "intents", None)
+    if store is None or not hasattr(bridge, "act_resume_autonomy"):
+        return None
+    body = _i._strip_speaker(text).strip()
+    if "?" in body or not _RELEASE.search(body) or _RELEASE_VETO.search(body):
+        return None
+    import time as _time
+    held = bool(store.hold_active()) if hasattr(store, "hold_active") else False
+    stopped = float(getattr(bridge, "stop_hold_until", 0.0) or 0.0) > _time.time()
+    order = getattr(bridge, "_last_order", None)
+    if not (held or stopped or order):
+        return None
+    if held:
+        try:
+            from omnisim_bridges.intents import speaker_of
+        except ImportError:                             # pragma: no cover
+            return None
+        who, holder = speaker_of(text), getattr(store, "hold_speaker", "")
+        if holder and who and who != holder and store.roles.get(who) not in ("safety", "supervisor"):
+            return {"agent": f"Sorry {who}, {holder} asked me to hold here, so only {holder}, the safety lead "
+                             "or the supervisor can clear me.",
+                    "tools": [("resume_autonomy", "refused", f"hold belongs to {holder}")]}
+    res = bridge.act_resume_autonomy() or {}
+    parts = ["Thanks, I'm clear to move again." if held else "Carrying on."]
+    if res.get("say_waiting"):
+        parts.append(str(res["say_waiting"]))
+    tools = [("resume_autonomy", "ok", "hold released" if res.get("hold_released") else "resumed")]
+    if res.get("resumed_order") or res.get("achieved_xy"):
+        measured = _measured_drive_to(res)
+        if measured is not None:
+            parts.append(measured[0])
+            tools.append(("go_to_place", measured[1], measured[2]))
+    return {"agent": " ".join(parts), "tools": tools}
+
+
+def answer_self_query(bridge: Any, text: str) -> Optional[Dict[str, Any]]:
+    """"How far have you driven this shift?" / "How many times did you go to
+    the press line today?" -- answered from the robot's own MEASURED shift
+    memory (odometer, arrivals per place), never from a model's reading of
+    whichever tool it happened to call. On dev loop 2 (2026-10-01) the model
+    read the live state, which carries no odometer, and said it could not
+    know; on another run it read shift memory and answered. A number the
+    robot measures should not depend on which tool a model picks."""
+    store = getattr(bridge, "intents", None)
+    if store is None or not hasattr(store, "shift_memory"):
+        return None
+    body = _i._strip_speaker(text).strip()
+    if "?" not in body and not body.lower().startswith(("how ", "tell me how")):
+        return None
+    if _ASK_DISTANCE.search(body) and not _ASK_VISITS.search(body):
+        m = store.shift_memory()
+        return {"agent": f"I've driven {m['odometer_m']:.1f} metres this shift, measured from my own position track.",
+                "tools": [("get_shift_memory", "ok", f"odometer {m['odometer_m']:.2f} m")]}
+    if _ASK_VISITS.search(body):
+        try:
+            from omnisim_bridges.intents import normalize_place
+        except ImportError:                             # pragma: no cover
+            return None
+        m = store.shift_memory()
+        padded = f" {normalize_place(body)} "
+        hits = [k for k in m["places"] if k and f" {k} " in padded]
+        hits = [k for k in hits if not any(k != o and f" {k} " in f" {o} " for o in hits)]
+        if len(hits) != 1:
+            return None
+        k = hits[0]
+        n = int(m["arrivals"].get(k, 0))
+        name = m["places"][k].get("name") or k
+        return {"agent": f"I've arrived at the {name} {n} time{'s' if n != 1 else ''} this shift, counted from my measured position.",
+                "tools": [("get_shift_memory", "ok", f"arrivals {name}={n}")]}
+    return None
+
+
+_ASK_LATER_JOB = _re.compile(
+    r"\b(?:for later|later this|set up for later|scheduled|(?:job|run|order|task|check-?in)\s+(?:i|we|you)\s+"
+    r"(?:gave|set|set up|left|asked|booked)|that (?:check-?in|timed|later) )", _re.IGNORECASE)
+_ASK_STATUS = _re.compile(
+    r"\b(?:still on|still happening|still scheduled|still planned|still going ahead|did (?:it|that) "
+    r"(?:actually )?(?:happen|go|run|get done)|happen(?:ed)? on schedule|done yet|has it (?:run|happened))\b",
+    _re.IGNORECASE)
+
+
+# "did the cold-chain log make it to the Lab on time?" / "did they get there?"
+_ASK_DELIVERED = _re.compile(
+    r"\b(?:did|has|have|were|was)\b[^?]*\b(?:make it|made it|get there|got there|get to|got to|reach(?:ed)?|"
+    r"arrived?|deliver(?:ed)?|go out|go off|on time)\b", _re.IGNORECASE)
+_STOP_WORDS = frozenset(
+    "the a an to for of at in on and or that this these those them they it its did does do has have was were "
+    "make made get got there here time take took bring brought you your i me my we our her his their note "
+    "left about from with cart please".split())
+
+
+def _content_words(text: str) -> set:
+    return {w for w in _re.findall(r"[a-z][a-z\-]+", (text or "").lower())
+            if len(w) > 2 and w not in _STOP_WORDS}
+
+
+def _the_order_named(store: Any, body: str, orders: List[dict]) -> Optional[dict]:
+    try:
+        from omnisim_bridges.intents import normalize_place
+    except ImportError:                                 # pragma: no cover
+        return None
+    asked = _content_words(body)
+    padded = f" {normalize_place(body)} "
+    scored = []
+    for o in orders:
+        said = " ".join(str(o.get(k) or "") for k in ("words", "action_text"))
+        dest = f" {normalize_place(o.get('means', ''))} "
+        place = any(k and f" {k} " in padded and f" {k} " in dest for k in getattr(store, "places", {}) or {})
+        scored.append((2 * len(asked & _content_words(said)) + int(place), o))
+    scored.sort(key=lambda t: -t[0])
+    if not scored or scored[0][0] == 0 or (len(scored) > 1 and scored[1][0] == scored[0][0]):
+        return None
+    return scored[0][1]
+
+
+def answer_timed_query(bridge: Any, text: str) -> Optional[Dict[str, Any]]:
+    """"That job I gave you for later. Still on?" / "Did that check-in
+    happen on schedule?" -- answered from the robot's own record of its
+    timed orders. On dev loop 2 (2026-10-01) the model read an empty
+    `pending_intents` list, missed `scheduled_actions` beside it, and told
+    the supervisor a job still pending had been cancelled. Only when
+    exactly ONE timed order exists; otherwise the model chooses."""
+    store = getattr(bridge, "intents", None)
+    if store is None or not hasattr(store, "timed_orders"):
+        return None
+    body = _i._strip_speaker(text).strip()
+    if "?" not in body:
+        return None
+    later = bool(_ASK_LATER_JOB.search(body) and _ASK_STATUS.search(body))
+    delivered = bool(_ASK_DELIVERED.search(body))
+    if not (later or delivered):
+        return None
+    orders = store.timed_orders()
+    if later and len(orders) == 1:
+        o = orders[0]
+    else:
+        # "Did the cold-chain log make it to the Lab on time?" with several
+        # timed orders on the books (long-horizon dev shift, run 2: the model
+        # answered nothing once and "still pending" for a delivery already
+        # made). The one the question NAMES -- its items first, its place
+        # second -- or nobody.
+        o = _the_order_named(store, body, orders)
+        if o is None:
+            return None
+    st, means = o["status"], o["means"]
+    what = means.split(", ", 1)[-1]                     # "in 840 s ..., go to qa" -> "go to qa"
+    asked_if_done = delivered or bool(_re.search(
+        r"\b(?:happen|happened|done yet|has it run|get done|go\b|run\b)", body, _re.IGNORECASE))
+    if st == "firing":
+        said = f"Yes, it went off on schedule and I'm doing it now: {what}."
+    elif st == "pending":
+        when = means.split(", ", 1)[0]
+        said = (f"Not yet -- it's still scheduled: {what}, {when}." if asked_if_done
+                else f"Yes, it's still on: {what}, {when}.")
+    elif st == "done":
+        said = f"Yes, it happened on schedule: {what} -- {o['last_result'] or 'completed'}."
+    elif st == "failed":
+        said = f"It fired on schedule but did not complete: {o['last_result'] or 'no result recorded'}."
+    elif st == "cancelled":
+        said = f"No, it was cancelled ({o['detail'] or 'by an operator stop'})."
+    else:
+        return None
+    return {"agent": said, "tools": [("list_pending_intents", "ok", f"{o['id']} {st}")]}
+
+
 def place_order(bridge: Any, text: str) -> Optional[_i.Interpretation]:
     """A parsed go_to_place, or None to leave the sentence to the parser."""
     store = getattr(bridge, "intents", None)
     if store is None or not getattr(store, "places", None) or not hasattr(bridge, "act_go_to_place"):
         return None
     body = _i._strip_speaker(text).strip()
+    if _i._SOON.search(body):
+        # "when you get a sec" / "when you're done there" means SOON, not a
+        # condition to wait for (interpret._SOON) -- but "done there" is
+        # AFTER the current job, so the parser only takes it while the robot
+        # is idle; a busy robot leaves it to the model. Until 2026-10-01 the
+        # bare "when" sent it to a model, which scheduled it behind a trigger
+        # it invented (dev-loop probe P3: "as soon as the bin is loaded and
+        # bumps the platform") and never went.
+        motion = getattr(bridge, "motion", None)
+        if isinstance(motion, tuple) and motion and motion[0] not in ("idle", None):
+            return None
+        body = _re.sub(r"^[\s,;:.\-]+", "", _i._SOON.sub(" ", body)).strip()
+        body = _re.sub(r"\s+([,.!])", r"\1", _re.sub(r"\s+", " ", body))
     if "?" in body or _NOT_NOW.search(body):
-        return None
+        # A polite tag ("..., would you?", "... for me?") is not a question;
+        # place_request has the stricter vetoes for everything else.
+        return place_request(bridge, text)
     m = _PLACE_ORDER.match(body)
     if not m:
-        return None
+        return place_request(bridge, text)
     name = m.group("place").strip()
     if store.place_xy(name) is None:
         return None
@@ -1018,6 +1778,28 @@ def parser_stats() -> Dict[str, Any]:
     return s
 
 
+def parser_will_act(bridge: Any, text: Any, surface: str = _i.MOBILE) -> bool:
+    """Will short_circuit answer `text` itself, as an order, right now?
+
+    Pure: no statistics, no store writes, no actuation. For a bridge whose
+    running turn was just SUPERSEDED by this message (an implicit halt): the
+    superseded turn may no longer start a motion, so a confident parsed
+    order owns the robot and need not queue behind that turn's lock. Until
+    2026-10-01 it did -- "First job: take this crate to the dock" waited
+    behind two introductions' model turns and arrived a minute late
+    (dev-loop probe P3)."""
+    if not isinstance(text, str) or not text.strip() or not _parser_first_set():
+        return False
+    try:
+        if place_order(bridge, text) is not None:
+            return True
+        r = _i.interpret(text, surface)
+    except Exception:                                  # pragma: no cover
+        return False
+    return (r.intent == _i.COMMAND and r.confidence >= _MIN_CONFIDENCE and bool(r.frames)
+            and all(f.tool in _MOTION_FRAMES for f in r.frames))
+
+
 def parser_first_plan(text: str, surface: str = _i.MOBILE
                       ) -> Optional["_i.Interpretation"]:
     """The parser-first DECISION, with no bridge call and no actuation.
@@ -1115,7 +1897,13 @@ def with_halt_note(halted: Any, out: Any) -> Any:
 _CORRECTION = _re.compile(
     r"\b(?:actually|instead|never ?mind|change of plan|scratch that|forget (?:that|it|about it)|"
     r"cancel (?:that|it)|belay that|hold on|hold up|wait|go back|come back|head back|"
-    r"turn around|don'?t|do not|skip|abort|reroute|redirect)\b", _re.IGNORECASE)
+    r"turn around|skip|abort|reroute|redirect)\b"
+    # "don't" anywhere used to count: "Lunch soon. Don't suppose you eat." and
+    # "I don't hand out jobs" halted a delivery in flight (shift v2, dev loop 1,
+    # 2026-10-01). Only a NEGATED ORDER at the start of a sentence counts.
+    r"|(?:^|[.!;]\s+)(?:(?:no|wait|hey|oi|actually)[,!]?\s+)?(?:please\s+)?(?:don'?t|do not)\s+"
+    r"(?:go|drive|move|take|bring|head|turn|enter|use|cross|park|deliver|run|leave|touch|carry)\b",
+    _re.IGNORECASE)
 # Frames that ARE a new order for the body right now.
 _MOTION_FRAMES = frozenset({
     "drive_forward", "turn", "drive_to", "set_velocity", "stop", "reset_to_home",
@@ -1236,12 +2024,41 @@ def short_circuit(bridge: Any, text: str, surface: str = _i.MOBILE
     # These used to live only in `route()`, which no bridge calls -- the
     # dev shift answered "take this one to the charger" with a pick-and-
     # place question six times (shift-dev-v1-omnilink-02).
-    capture_site_facts(bridge, text)
-    placed = place_order(bridge, text) if _parser_first_set() else None
+    facts = capture_site_facts(bridge, text) + capture_roles(bridge, text)
+    facts += capture_shift_facts(bridge, text)
+    facts += capture_zone_state(bridge, text)
+    facts += capture_hold(bridge, text) if _parser_first_set() else []
+    placed = ((routine_order(bridge, text) or place_order(bridge, text))
+              if _parser_first_set() else None)
     if placed is not None:
         return parser_first_run(bridge, placed, surface)
+    shortcut = zone_shortcut_order(bridge, text) if _parser_first_set() else None
+    if shortcut is not None:
+        why, around = shortcut
+        out = parser_first_run(bridge, around, surface)
+        if out is not None:
+            return dict(out, agent=why + " " + str(out.get("agent", "")))
     r = parser_first_plan(text, surface)
+    if r is None and _parser_first_set():
+        asked = (answer_release(bridge, text) or answer_self_query(bridge, text)
+                 or answer_timed_query(bridge, text) or answer_routine_query(bridge, text)
+                 or answer_charge_query(bridge, text))
+        if asked is not None and facts:
+            # "Tobias here, taking over from Marisol. Carry on as you were." --
+            # say what was recorded, then what was done.
+            said = _facts_said(bridge, facts)
+            if said:
+                prefix = "Got it: " + "; ".join(said) + "."
+                asked = dict(asked, agent=prefix + " " + asked["agent"],
+                             tools=[("remember", "ok", f) for f in facts] + list(asked.get("tools") or []))
+        if asked is not None:
+            _STATS["short_circuited"] += 1
+            return dict(asked, via="parser")
     if r is None:
+        told = answer_facts(bridge, text, facts) if _parser_first_set() else None
+        if told is not None:
+            _STATS["short_circuited"] += 1
+            return dict(told, via="parser")
         return None
     return parser_first_run(bridge, r, surface)
 

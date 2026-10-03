@@ -95,6 +95,7 @@ Combat-oriented Newton worlds (`newton_husky_head_on*.wbt`, `newton_husky_combat
 | `husky_fleet_arena.omniworld` | Indoor fleet — render/physics stress |
 | `husky_rocks_traverse.omniworld` | Rocky terrain traverse |
 | `jackal_drive.omniworld`, `turtlebot3_drive.omniworld` | Drive testbeds |
+| `tb3_lidar_walls.omniworld`, `jackal_lidar_walls.omniworld`, `husky_lidar_walls.omniworld` | Lidar check: TurtleBot3 Burger (LDS-01, 360 deg, 0.12-3.5 m), Jackal (front SICK LMS1xx, 270 deg, 0.1-30 m) and Husky (SICK LMS111, 270 deg, 0.1-20 m) facing walls at known distances, driven by `omnilink_mobile_bridge` on ports 8781 / 8782 / 8783 (`/list_sensors`, `/read_sensor`). **Needs `OMNISIM_URDF_USE_SENSORS=1`**, or the URDF lidar is dropped. Measurement: `python scripts/dev/measure_urdf_lidar.py tb3` / `jackal` / `husky` |
 | `city_traffic.omniworld` | Urban traffic scene |
 | `x30_plant_inspection.omniworld` | Deep Robotics X30 inspection round in a process-plant yard, driven through OmniLink (`omnilink_quadruped_bridge --locomotion trot`, port 8796). Real-contact scripted trot, flat ground, walkway routing from `customData`; no obstacle sensing. Sign textures: [`showcase/textures/x30_plant/`](projects/samples/demos/worlds/showcase/textures/x30_plant/PROVENANCE.md) |
 | `x500_arena.omniworld` | PX4 x500 quadcopter in the pad arena, flown by `mavic_omnilink_bridge` (needs `OMNISIM_URDF_USE_SENSORS=1`; wind is modelled). Package: [`projects/robots/px4/x500/`](projects/robots/px4/x500/PROVENANCE.md) |

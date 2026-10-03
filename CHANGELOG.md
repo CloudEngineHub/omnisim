@@ -25,6 +25,202 @@ top of that foundation.
 ---
 
 
+## [v9.1.3] — 2026-10-03
+
+A working planar lidar on TurtleBot3, Jackal and Husky, with ROS 2 `/scan` and
+`/clock` verified end to end. OmniLink's mobile bridge gets fixes for the failures
+a preregistered operations-shift rerun found. That rerun met neither of its claims.
+This release includes an engine change (the URDF importer), so use the v9.1.3
+installer: an older binary still turns these scanners into a 4-layer fan.
+
+### ⚠️ Behaviour changes — read before upgrading
+
+- **A planar URDF lidar is now single-layer.** The URDF importer wrote
+  `numberOfLayers` only when it was above 1. So a planar `<ray>` sensor (no
+  `<vertical>` block) arrived as the Lidar node's default 4-layer fan, tilted
+  ±5.7° / ±1.9°. Its bottom layer read the floor: a ring at ~1.8 m on the
+  TurtleBot3 and at ~4 m on the Jackal. `omnisim_ros2`'s `sensor_node` picks
+  the layer with the most returns by default, so it took that floor ring for
+  obstacles. The importer now always writes `numberOfLayers`, so the
+  Husky's LMS111 is single-layer too. This applies only with
+  `OMNISIM_URDF_USE_SENSORS=1`. On an older binary, pass `lidar_layer:=1`.
+  Pinned by `tests/test_urdf_lidar_tb3_jackal.py`.
+- **ROS 2 `/clock` follows the robot's own clock.** `clock_node` published
+  `GET /sim/state` → `sim_time_ms`, which is the harness supervisor's loop
+  counter, not the engine clock. Over one run it advanced 23 s while the
+  engine advanced 281 s. With the bring-up's default `use_sim_time:=true`,
+  `/scan`, `/odom`, `/imu` and `/gps` published 3 messages in 30 s (0.106 Hz)
+  instead of 5 Hz. This was found by an external evaluation against the Husky
+  lidar world. When the bridge is up (`bridge:=true`, the default), `/clock`
+  now follows the bridge's `POST /get_robot_state` → `sim_time`. That is the
+  robot controller's clock, refreshed every control step, and the one its
+  sensor stamps use. Otherwise it uses `engine_time_ms`, which is coarse because
+  it is sampled only when the harness supervisor steps (11 distinct values in 30 s).
+  `sim_time_ms` is used only on a harness too old to report anything else, and
+  it logs a warning. `robot_state_node` stamps from `engine_time_ms`. Measured
+  after the fix on the Husky (`use_sim_time:=true`, realtime engine at 0.64×
+  wall): `/clock` had 293 distinct values of 300 with a largest step of
+  0.128 s; `/scan` ran at 5.0 Hz and `joint_states` at 2.5 Hz in simulated time.
+- **`/scan` angles are the engine's own beam angles.** `sensor_node` spread
+  the beams edge to edge (`angle_increment = fov/(n−1)`), but the engine fires
+  each beam at its bin centre. The error was up to half a step (0.5° on the
+  LDS-01), and on a 360° scanner the first and last beams both claimed ±π.
+  `conversions.scan_angles()` now publishes `angle_increment = fov/n` and
+  `angle_min = −fov/2 + fov/(2n)`. TurtleBot3 worst wall error: 8.6 → 5.5 mm.
+- **OmniLink mobile bridge: pending timed orders now survive a controller
+  restart.** The v9.1.0 notes said timed orders were not persisted and nothing
+  would start moving by itself after a restart. **That is no longer true.**
+  Arrivals, odometer, routines, holds and pending timed orders are now restored
+  when the controller restarts (`OMNILINK_INTENT_PERSIST`, on by default). A
+  restored order still fires on the simulation clock and is still vetted by the
+  gate when it fires. A restored order whose simulation clock went backwards
+  (a world reload, not a restart) is dropped, and the drop is recorded.
+- **An implicit halt no longer cancels the conversation.** When a new order
+  arrived while the robot was working, it used to halt through the operator-STOP
+  path. That cancelled the running prompt and dropped every queued one, each
+  answered "Stopped. I cancelled the rest of that request because you told me
+  to stop". Now the earlier prompts keep running and answering (facts saved,
+  rules set, questions answered), but they may not start a motion tool. An
+  explicit stop still cancels everything, as before.
+
+### Lidar and ROS 2
+
+- **Planar lidar on TurtleBot3 and Jackal** (with
+  `OMNISIM_URDF_USE_SENSORS=1`). TurtleBot3 burger, waffle and waffle_pi carry
+  the ROBOTIS LDS-01: 360 samples over 6.28 rad, 0.12–3.5 m. The Jackal carries
+  Clearpath's default front SICK LMS1xx: 720 samples over 270°, 0.1–30 m.
+  That 30 m is the Gazebo accessory default, not the datasheet's 20 m. The
+  TurtleBot3 URDFs had the `base_scan` mount but no sensor. Their `base_scan`
+  visual also enclosed the lidar origin, so the render-based Lidar read the
+  inside of its own housing (0 of 1440 finite values). The visual now has an
+  8 mm open band at the scan plane, and the collider is unchanged.
+- **Three known-wall worlds:** `showcase/tb3_lidar_walls.omniworld` (bridge
+  :8781), `showcase/jackal_lidar_walls.omniworld` (:8782) and
+  `showcase/husky_lidar_walls.omniworld` (:8783). `scripts/dev/measure_urdf_lidar.py`
+  reproduces the numbers. Every wall straight ahead reads within 1 mm, ≥ 98 %
+  of beams agree with the authored geometry, and beyond-max reads as no return.
+  A 0.9949 m drive shrank the Jackal's forward range by 0.9953 m, and a
+  0.987 m drive shrank the Husky's by 0.987 m.
+- **`/scan` verified end to end through ROS 2** on all three scanners. The
+  path was the engine on Windows → `omnilink_mobile_bridge` →
+  `wsl_harness_link` → `sensor_node` under Humble in WSL → an rclpy
+  subscriber. Every beam was scored at the angle ROS publishes for it:
+  - TurtleBot3: 360/360 beams equal to the bridge row, 359/360 within 5.5 mm.
+  - Jackal: 720/720 equal, 720/720 within 8.0 mm.
+  - Husky: 541/541 equal, 540/541 within 9.0 mm.
+
+  The two misses graze a box corner ~3.5 mm outside it. `/tf_static`
+  base→scanner equals the bridge's measured mount on all three. The tunnel
+  delivered 4.99–5.03 Hz for 5 Hz requested.
+- Caveats: the scan has **no noise model** (the importer ignores `<noise>`;
+  ranges are exact to ~1 mm). On the TurtleBot3, index 0 points straight
+  behind, not straight ahead as on the real LDS-01 driver, so index by angle,
+  not by position. The lidar runs only with `OMNISIM_URDF_USE_SENSORS=1`.
+  Measured in simulation only; nothing here was checked against a physical
+  scanner.
+
+### OmniLink bridges: fixes from the operations-shift traces
+
+These are mobile-bridge fixes, each made from a failure measured in an OmniLink
+trace. The shifts they were tuned on have been **seen**, so the tests pin
+behaviour. They are not evidence of generalisation, which needs a new blind
+holdout (see Benchmarks).
+
+- **An addressed stop is a stop.** "Priya: Cart, stop! Stop right there." was
+  not treated as a halt. The address left the parser explaining 44 % of the
+  clause, so the stop queued 17.5 s behind a model turn while the robot drove on
+  ~5 m. A declined parse now gets a second reading. That reading drops a
+  leading address of at most two words before a comma (never a condition: "If
+  you see a person, stop" stays a rule), and reads stops sentence by sentence.
+  The second reading only ever upgrades a declined parse.
+- **A hold binds every voice, and is engaged when said.** One person's "Hold
+  where you are, don't move until I say" used to bind only the robot's own
+  autonomy, and another person's order drove it off. The hold also existed only
+  once a model called `hold_until_told` (27 s later in one probe). Now the hold
+  is captured the moment it is said and records who asked for it. A motion order
+  from anyone else is refused and queued, and the holder's own new order lifts
+  the hold. Unattributed speech is unchanged.
+- **A supervisor's order is protected from a worker's countermand** for 180 s
+  after it is given. "Who's in charge?" names the latest handover ("I'm off,
+  Sam's got the floor").
+- **More is handled without a model:** the facts a shift opens with (station
+  lists like "dock (3.00, 0.00)", roles from introductions), plain requests to
+  one known station ("Tool crib, please."), and routines ("when I say 'the
+  usual run' I mean ..."). Questions about the robot's own record ("how far have
+  you driven", "how many times did you go to X", "did that job for later
+  happen") are answered from its measured odometer, arrivals and timed orders.
+  Route instructions, negations, corrections, conditions and keep-out talk still
+  go to the model.
+- **Zones a shift has named can be re-closed or reopened by name** ("corridor's
+  shut again"). A reopened zone keeps its lift rules. A shortcut through a zone
+  the speaker cannot lift is refused in words that say why, and the delivery
+  goes round.
+- The relay withdraws an arrival claim on an order turn that ran no motion tool
+  (a model had reported an arrival it never drove). "Don't" interrupts only as
+  a negated order ("Don't suppose you eat." no longer halts a delivery), and a
+  standing rule ("whenever you're at Ward 3, wait fifteen seconds") no longer
+  parks the robot.
+- **Gate:** "when you get a sec" / "when you're done there" is politeness, not
+  a deferral. "... for me?" is a request tag, and "notes to" + a destination
+  is a noun, not reported speech. These fixes remove false refusals. The parity
+  fixture (`tests/benchmarks/gate_parity/`) carries the new cases. The
+  platform's TypeScript copy of the gate lives in the OmniLink repository.
+- `OMNILINK_TEST_MODEL_DELAY_S`: a test hatch that simulates a slow model
+  provider.
+
+### Benchmarks
+
+- **Native Claude Code on the published warehouse shift**
+  (`ops-bench run --arms claude_full`). This is the Codex extension's
+  counterpart, run under a protocol copied clause for clause
+  (`tests/benchmarks/robot_ops/shift/CLAUDE_EXTENSION.md`, fixed before any
+  scored run). Claude Code 2.1.284 with `claude-opus-5-5` at high effort scored
+  78.8 / 84.8 / 78.8 % (mean 80.8 %) with 0 unsafe checks. Codex scored 76.8 %
+  with 1 unsafe check, and OmniLink 89.9 %. **The scores overlap Codex's, so
+  this makes no superiority claim.** Disclosed:
+  - The Claude episodes ran at ~0.97× real time, against 0.15–0.26× for
+    Codex, which may have favoured them.
+  - The adapter was written by a Claude Code session on the same model.
+  - Claude Code's billed cost is unavailable and is excluded from the cost
+    ranking.
+
+  Report: `tests/benchmarks/robot_ops/evidence/CLAUDE_SHIFT_V1_RESULTS.md`.
+- **Shift v2, the preregistered rerun: neither claim was met.** Under
+  `FREEZE_V2.md` there were five waves of seven arms on a new blind holdout,
+  judged by gemini-2.5-pro.
+  - Claim A (vs the basic tier): **not met**. OmniLink separates from every
+    basic arm (p = 0.004) but had 13 unsafe checks against 0.
+  - Claim B (vs the full tier): **not met, a tie** (p = 0.48 / 0.75 / 0.77;
+    unsafe 13 vs 12 / 12 / 14). OmniLink's mean was 0.608 and the full tier's
+    0.615–0.672.
+
+  Every preregistered sensitivity agrees. OmniLink's estimated model spend was
+  $5.18 against $10.89–16.95 for the full tier: cheaper at a tie, estimated
+  from recorded usage. Disclosed: waves 1–3 ran at 0.06–0.15× real time under
+  a load from outside the campaign. The bridge fixes above address the four
+  OmniLink failure causes read from its traces. They have not yet been scored
+  on a blind shift. Report: `tests/benchmarks/robot_ops/evidence/SHIFT_V2_RESULTS.md`.
+- **Prepared, not yet run:**
+  - **Shift v3**: a new blind holdout, preregistration and a real-time
+    validity rule. A wave whose median worst-5 s real-time factor is under
+    0.8× is void and re-run.
+  - **A long-horizon (3-hour) shift**: a blind holdout, a DRAFT
+    preregistration, a `restart` fixture that restarts the robot's controller
+    mid-shift, and a third competitor tier `lc` (last 40 turns plus a rolling
+    model-written summary, persisted across the restart).
+
+  Two v3 calibration attempts were void, and neither produced a row.
+- **`tests/benchmarks/robot_ops/devloop/`**: the development loop (probes, the
+  seen shifts against stored competitor baselines, `explain`, `confirm`).
+  Its scores are a development signal on seen shifts, not a result.
+
+### Known limitations
+
+- The ROS 2 rig behind the `/scan` end-to-end figures is not in this
+  repository.
+- The baselines the development loop compares against predate the
+  2026-09-30 / 10-01 fixes.
+
 ## [v9.1.2] — 2026-09-30
 
 ### Fixed

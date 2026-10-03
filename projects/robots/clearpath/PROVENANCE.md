@@ -146,7 +146,7 @@ enclosure, and nothing in the file suggests otherwise.
 | package | mesh files | referenced by its URDF |
 |---|---:|---:|
 | `husky_description/` | 32 | 7 — `base_link.dae`, `bumper.dae`, `top_chassis.dae`, `top_plate.dae`, `top_plate.stl`, `user_rail.dae`, `wheel.dae` |
-| `jackal_description/` | 18 | 3 — `jackal-base.stl`, `jackal-fender.stl`, `jackal-wheel.stl` |
+| `jackal_description/` | 18 | 4 — `jackal-base.stl`, `jackal-fender.stl`, `jackal-wheel.stl`, `sick-lms1xx-upright-bracket.stl` (since 2026-09-30, §8) |
 
 Three of the husky meshes are additionally referenced by
 `projects/default/controllers/harness_supervisor/damage_profiles.py`
@@ -159,3 +159,26 @@ manufacturer's product, Clearpath's BSD-3 does not reach it, and neither does
 anybody else's — author a primitive instead, as
 [`projects/devices/`](../../devices/PROVENANCE.md) and
 [`projects/robots/omnisim/`](../omnisim/PROVENANCE.md) do.
+
+## 8. The front laser, 2026-09-30
+
+`jackal.urdf` gained upstream Clearpath's **default** laser accessory by hand,
+because `accessories.urdf.xacro` was never imported (§4): with `JACKAL_LASER=1`
+upstream selects `JACKAL_LASER_MODEL lms1xx`, `JACKAL_LASER_MOUNT front`,
+`JACKAL_LASER_MOUNT_TYPE upright` and topic `front/scan`. The links, joints and
+offsets are copied from `accessories/sick_lms1xx_upright_mount.urdf.xacro`:
+`front_laser_mount` on `front_mount` at offset 0, carrying
+`sick-lms1xx-upright-bracket.stl` (the Clearpath-designed bracket §4 kept for
+exactly this), and `front_laser` 0.149 m above the bracket base — so the focal
+point sits 0.12 m ahead of and 0.333 m above `base_link`.
+
+The `<sensor type="ray" name="front_laser">` values are the defaults of
+Clearpath's `LMS1xx/urdf/sick_lms1xx.urdf.xacro` macro — 720 samples over
+±2.35619 rad (270°), range 0.1–30 m, `update_rate` 50, gaussian noise stddev
+0.001 — i.e. what a lab gets from `JACKAL_LASER=1` in Gazebo. They were chosen
+over a datasheet transcription on purpose (the LMS111 datasheet quotes 0.5°
+resolution and a 20 m range) so a Gazebo-trained stack sees the same scan
+shape. **No model of the scanner body is included**: SICK designs it and
+Clearpath's grant does not reach it, the same test §2 applies to meshes. The
+importer does not read `<noise>`, so the simulated scan is noise-free, and the
+device exists only when the world is loaded with `OMNISIM_URDF_USE_SENSORS=1`.

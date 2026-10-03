@@ -447,12 +447,38 @@ _NOT_A_TRIGGER = re.compile(
     re.IGNORECASE)
 
 
+# "when you get a sec", "when you're done there", "whenever you're ready":
+# idioms about the ROBOT'S OWN availability, meaning soon. They are not an
+# event to wait for, and refusing them as deferred refused real orders
+# (ops-bench shift v2 r10; dev-loop probe P3, 2026-10-01). Kept in step with
+# interpret._SOON; the TypeScript mirror (omnilink api/_robot-gate.ts) has
+# not been updated yet.
+_AVAILABILITY = re.compile(
+    r"[,;]?\s*\b(?:when(?:ever)? you(?:'ve| have)? got a|when(?:ever)? you (?:get|have) a|"
+    r"if you (?:get|have) a)\s+(?:sec|second|moment|minute|min|chance|mo)\b"
+    r"|[,;]?\s*\b(?:when(?:ever)? you(?:'re| are) (?:free|ready|done there)|"
+    r"when(?:ever)? you can)\b",
+    re.IGNORECASE)
+
+
 def _is_deferred(utterance: str) -> bool:
-    return bool(_DEFERRED.search(_NOT_A_TRIGGER.sub(" then ", utterance or "")))
+    text = _words(utterance)
+    return bool(_DEFERRED.search(_NOT_A_TRIGGER.sub(" then ", text)))
 
 
 def _is_contradictory(utterance: str) -> bool:
     return bool(_CONTRADICTION.search(utterance or ""))
+
+
+# "Delivery NOTES to Ward 3." -- `notes`/`reports`/`reads`/`states` followed
+# straight by a preposition is a NOUN, not a reporting verb (long-horizon dev
+# shift, 2026-10-02: the order was refused as reported speech).
+# Only `to` needs this: it is the one preposition _COMPLEMENTISER also takes,
+# and only a DESTINATION after it (a determiner, a name, a number) makes it a
+# preposition -- "the handbook states to drive forward" is still speech.
+# Deliberately case-sensitive past the first letter, so [A-Z0-9] means a name.
+_NOUN_NOT_VERB = re.compile(r"\b(?:[Nn]otes|[Rr]eports|[Rr]eads|[Ss]tates)\s+to\s+"
+                            r"(?=(?:the|an?|my|your|our|their|this|that)\b|[A-Z0-9])")
 
 
 def _is_reported(utterance: str) -> bool:
@@ -464,6 +490,7 @@ def _is_reported(utterance: str) -> bool:
     regex cannot express that without variable-length lookbehind, and the
     version that tried refused "collect the reports from bay 3".
     """
+    utterance = _NOUN_NOT_VERB.sub("for ", utterance or "")
     u = utterance or ""
     for m in _REPORTED.finditer(u):
         head = m.group(0).split()
@@ -526,8 +553,18 @@ def _is_bare_retraction(utterance: str) -> bool:
     return not _ACTIONABLE_AFTER.search(utterance[m.end():])
 
 
+# A radio-style "Dana: ..." / "Sam (packing): ..." prefix names the speaker,
+# not the sentence. Mirrors interpret._SPEAKER_PREFIX.
+_SPEAKER_PREFIX = re.compile(r"^\s*[A-Z][A-Za-z'\-]{0,30}\s*(?:\([^)]{0,40}\))?\s*:\s+")
+
+
+def _words(utterance: str) -> str:
+    """The operator's words: no speaker prefix, no availability idiom."""
+    return _AVAILABILITY.sub(" ", _SPEAKER_PREFIX.sub("", utterance or "", count=1))
+
+
 def _is_question(utterance: str) -> bool:
-    u = (utterance or "").strip()
+    u = _words(utterance).strip(" ,;")
     if not u:
         return False
     if _HYPOTHETICAL.search(u):
@@ -546,6 +583,10 @@ def _is_question(utterance: str) -> bool:
     tag = _REQUEST_TAG.search(u)
     if tag:
         head = u[:tag.start()].strip()
+        # "... for me?" is a request only after an IMPERATIVE: "you drove
+        # forward 1.4 metres for me?" asks about the past.
+        if "for me" in tag.group(0).lower() and re.match(r"(?:you|i|we|it|they|he|she)\b", head, re.IGNORECASE):
+            return True
         return not head or bool(_INTERROGATIVE.match(head))
     return bool(u.endswith("?") or _INTERROGATIVE.match(u))
 
@@ -563,7 +604,11 @@ _CORRECTION = re.compile(
     re.IGNORECASE)
 
 _REQUEST_TAG = re.compile(
-    r"[,;]\s*(?:(?:would|could|will|can)\s+you(?:\s+please)?|please)\s*\?\s*$",
+    r"(?:[,;]\s*(?:(?:would|could|will|can)\s+you(?:\s+please)?|please)"
+    # "Drop these gloves off at the tool crib for me?" (2026-10-01, shift v2
+    # r12, refused as a question). Only after a non-interrogative head, which
+    # _is_question checks: "can you do it for me?" stays the question path.
+    r"|\s+for\s+me(?:\s+please)?)\s*\?\s*$",
     re.IGNORECASE)
 
 

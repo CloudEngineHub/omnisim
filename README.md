@@ -79,7 +79,7 @@ blind 30-minute warehouse shift: **89.9%**, versus **47.9–78.8%** for the othe
 configurations. Every agent used Gemini 3.5 Flash on the same simulated Husky,
 with 33 scored checks and three repeats each.
 
-[![Warehouse-shift commitments kept: seven original Gemini configurations and Codex with GPT-6.1 Sol, high reasoning, tested later. Three repeats each; higher is better.](docs/media/benchmarks/omnilink-shift-comparison.svg)](https://www.omnilink-agents.com/benchmarks/operations-shift/index.html)
+[![Warehouse-shift commitments kept: seven original Gemini configurations, plus Codex with GPT-6.1 Sol (high reasoning) and Claude Code with Opus 5.5 (high effort), both tested later. Three repeats each; higher is better.](docs/media/benchmarks/omnilink-shift-comparison.svg)](https://www.omnilink-agents.com/benchmarks/operations-shift/index.html)
 
 A later retrospective run of **Codex with GPT-6.1 Sol, high reasoning, scored 76.8%**
 on the same shift across three repeats, with one check flagged unsafe in
@@ -89,14 +89,25 @@ Each Codex session was isolated from the test script and previous results.
 This is a system comparison, not a fresh blind or model-controlled test.
 [Codex conditions and evidence](https://www.omnilink-agents.com/benchmarks/operations-shift/index.html#codex-extension).
 
+A matching retrospective run of **Claude Code with Opus 5.5, high effort, scored 80.8%**
+across three repeats, with no check flagged unsafe. It used the same protocol,
+machine, engine binary and robot tools as the Codex run. Its episodes ran
+closer to real time than Codex's (worst window 0.97× vs 0.15–0.26×), which may
+have favoured it. Its scores overlap Codex's, so neither is shown to be better.
+The adapter was written by a Claude Code session on the same model.
+[Claude Code conditions and downloadable evidence](https://www.omnilink-agents.com/benchmarks/operations-shift/index.html#claude-extension)
+· [Repository report](tests/benchmarks/robot_ops/evidence/CLAUDE_SHIFT_V1_RESULTS.md).
+
 **OmniLink also had the lowest estimated model cost in the original study:**
 **$0.90 per scored shift**, 32–59% below the six original comparison configurations.
-**Codex's actual cost is unavailable and is excluded from the cost ranking.**
-Its recorded tokens produce a conditional $0.91-per-shift Standard API pricing
+**Codex's and Claude Code's actual costs are unavailable and are excluded from the cost ranking.**
+Codex's recorded tokens produce a conditional $0.91-per-shift Standard API pricing
 scenario with 98.1% cached input. This does not establish its subscription charge,
 API cache-write cost or a cost tie with OmniLink.
+Claude Code's own CLI reports an unranked list-price estimate of $1.24 per shift;
+it does not establish the actual subscription charge or a comparable API cost.
 
-[![Estimated model cost per scored warehouse shift for the seven Gemini 3.5 Flash configurations. Codex is excluded because its actual cost is unavailable. Lower is better.](docs/media/benchmarks/omnilink-shift-cost.svg)](https://www.omnilink-agents.com/benchmarks/operations-shift/index.html#cost)
+[![Estimated model cost per scored warehouse shift for the seven Gemini 3.5 Flash configurations. Codex and Claude Code are excluded because their actual costs are unavailable. Lower is better.](docs/media/benchmarks/omnilink-shift-cost.svg)](https://www.omnilink-agents.com/benchmarks/operations-shift/index.html#cost)
 
 The cost graph counts all model usage recorded for the three scored shifts,
 including failed checks. Original infrastructure errors and the superseded Codex

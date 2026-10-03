@@ -100,8 +100,16 @@ def generate_launch_description() -> LaunchDescription:
                 name="omnisim_clock",
                 output="screen",
                 # No use_sim_time here, deliberately: this node produces it.
+                # With the bridge up, /clock follows the robot controller's own
+                # clock (fine-grained, and what the sensor stamps are in); the
+                # harness engine clock is only sampled when its supervisor steps.
                 parameters=[
-                    {"harness_url": cfg["harness_url"], "publish_rate_hz": cfg["clock_rate_hz"]}
+                    {
+                        "harness_url": cfg["harness_url"],
+                        "bridge_url": cfg["bridge_url"],
+                        "use_bridge_clock": cfg["bridge"],
+                        "publish_rate_hz": cfg["clock_rate_hz"],
+                    }
                 ],
             ),
             Node(

@@ -277,3 +277,43 @@ Ask the question in §2 before you add it. If the shape is another
 manufacturer's product, ROBOTIS' Apache-2.0 grant does not reach it — author a
 primitive instead, as [`projects/devices/`](../../../devices/PROVENANCE.md) and
 [`projects/robots/omnisim/`](../../omnisim/PROVENANCE.md) do.
+
+## 6. LDS-01 sensor block, 2026-09-30
+
+All three robot URDFs gained a `<gazebo reference="base_scan"><sensor type="ray"
+name="lds_lfcd_sensor">` block, so the LDS-01 the robot has always carried a
+mount for (`base_scan`, unchanged) is now a working lidar in OmniSim.
+
+**Where the numbers come from.** ROBOTIS' own simulation package,
+`turtlebot3_simulations/turtlebot3_gazebo/models/turtlebot3_burger/model.sdf`
+(same block in `_waffle` and `_waffle_pi`), sensor `hls_lfcd_lds`, copied
+value for value: 360 samples, `min_angle` 0.0, `max_angle` 6.28, range
+0.120–3.5 m (resolution 0.015), `update_rate` 5, gaussian noise mean 0 /
+stddev 0.01. These are ROBOTIS-authored simulation parameters under the same
+Apache-2.0 grant as the rest of the package; no HLDS material is involved.
+The sensor name follows the ROS 1 `turtlebot3_*.gazebo.xacro` name,
+`lds_lfcd_sensor`.
+
+**What the importer does with it.** It reads the sample count, the field of
+view (`max_angle − min_angle` = 6.28 rad, centred on the link's +X) and the
+range min/max. It does **not** read `<noise>`, the range `<resolution>` or
+`update_rate` (the bridge enables the device at the world's basic time step),
+so the simulated scan is noise-free and unquantised. The device exists **only**
+when the world is loaded with `OMNISIM_URDF_USE_SENSORS=1`.
+
+**One visual changed with it.** The §3.3 `base_scan` puck enclosed the focal
+point, and OmniSim's Lidar is render-based, so every ray hit the inside of the
+puck at 0.04–0.07 m (below the 0.12 m min range) and all beams read "no
+return" — measured 0 finite values of 1440. The same envelope is now drawn as
+two cylinders, `z −0.02225…−0.004` and `z +0.004…+0.00925` in the link frame,
+leaving an 8 mm open band on the scan plane. The `<collision>` cylinder, the
+`scan_joint` origin and the `<inertial>` are untouched.
+
+**Measured** (`scripts/dev/measure_urdf_lidar.py`, world
+`projects/samples/demos/worlds/showcase/tb3_lidar_walls.omniworld`,
+2026-09-30): burger, waffle and waffle_pi each read the walls within 1 mm on
+the perpendicular beams and 359–360 of 360 beams agree with the authored
+geometry. Beam order: index 0 points straight BEHIND and the scan sweeps
+CLOCKWISE seen from above (index ≈ 89 is left, 179/180 straddle straight
+ahead, ≈ 270 is right) — the opposite origin and direction from a real LDS-01
+driver, which starts at the front and sweeps counter-clockwise.

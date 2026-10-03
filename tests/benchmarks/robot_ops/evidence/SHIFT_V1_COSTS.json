@@ -6,6 +6,7 @@
   "excluded_costs": [
     "OmniLink subscription",
     "Codex subscription or credits",
+    "Claude subscription",
     "hosting",
     "local compute",
     "tax"
@@ -38,7 +39,8 @@
   },
   "source_archive_sha256": {
     "evidence.zip": "724e05061bad7a5e06ba353080673b13262e1ad6327a6a13a27748d1ba329cca",
-    "codex-evidence.zip": "9cfbedcd3d0981c1d0a55003243bb9f7e28987ebd9e5fad59a65713d7cf62186"
+    "codex-evidence.zip": "9cfbedcd3d0981c1d0a55003243bb9f7e28987ebd9e5fad59a65713d7cf62186",
+    "claude-evidence.zip": "c66413a79c470f057a9ca439ee75986769dc32fc60aa067ac8e17f79d6537e7b"
   },
   "arms": {
     "omnilink": {
@@ -129,6 +131,20 @@
       "comparable_cost": false,
       "dollar_basis": "Conditional recorded-token Standard API pricing scenario; excluded from cost ranking; actual signed-in cost unavailable",
       "billed_usd": null
+    },
+    "claude_full": {
+      "model": "claude-opus-5-5",
+      "scored_shifts": 3,
+      "attempts": 3,
+      "scored_usd": null,
+      "usd_per_scored_shift": null,
+      "overhead_usd": null,
+      "all_attempts_usd": null,
+      "comparable_cost": false,
+      "billed_usd": null,
+      "cli_list_price_estimate_usd": 3.7243320000000004,
+      "cli_list_price_estimate_per_shift_usd": 1.2414440000000002,
+      "dollar_basis": "Claude Code's own API list-price estimate, not a bill; actual signed-in cost unavailable; excluded from ranking"
     }
   },
   "codex_attempts": [
@@ -241,5 +257,53 @@
       "standard_api_equivalent_usd": 0.77911
     }
   ],
-  "limits": "Retrospective cost analysis. Only the original seven metered API configurations are ranked. Codex's actual cost is unavailable; its conditional recorded-token pricing scenario does not establish a cost tie or advantage. Same workload, different models for Codex and original seven; later Codex build and concurrency differ. Superseded Codex wave and original error episodes are retained as overhead. Development pilots and this coding chat's work are excluded for all systems."
+  "claude_attempts": [
+    {
+      "run": "claude-shift-v1-20260930-r0",
+      "primary": true,
+      "outcome": "FAIL",
+      "tokens_cli_reported": {
+        "inputTokens": 186,
+        "cacheCreationInputTokens": 53693,
+        "cacheReadInputTokens": 3161503,
+        "outputTokens": 7958,
+        "thinkingTokens": 1208
+      },
+      "elapsed_s": 1865.015000000014,
+      "cli_list_price_estimate_usd": 1.2217485999999997,
+      "billed_usd": null
+    },
+    {
+      "run": "claude-shift-v1-20260930-r1",
+      "primary": true,
+      "outcome": "FAIL",
+      "tokens_cli_reported": {
+        "inputTokens": 190,
+        "cacheCreationInputTokens": 54865,
+        "cacheReadInputTokens": 3245497,
+        "outputTokens": 8666,
+        "thinkingTokens": 1710
+      },
+      "elapsed_s": 1865.25,
+      "cli_list_price_estimate_usd": 1.2620994000000005,
+      "billed_usd": null
+    },
+    {
+      "run": "claude-shift-v1-20260930-r2",
+      "primary": true,
+      "outcome": "FAIL",
+      "tokens_cli_reported": {
+        "inputTokens": 188,
+        "cacheCreationInputTokens": 53686,
+        "cacheReadInputTokens": 3197520,
+        "outputTokens": 8537,
+        "thinkingTokens": 1582
+      },
+      "elapsed_s": 1864.7029999999795,
+      "cli_list_price_estimate_usd": 1.240484,
+      "billed_usd": null
+    }
+  ],
+  "claude_usage_conditions": "Signed-in Claude subscription; billed cost unavailable. Report the final native modelUsage cumulative totals, not the frozen adapter's partial output snapshots or sums of repeated results. CLI costUSD is Claude Code's own list-price estimate, not an invoice or a comparable metered API charge. No separate API-rate recalculation was made. Development pilot excluded.",
+  "limits": "Retrospective cost analysis. Only the original seven metered API configurations are ranked. Codex and Claude Code actual costs are unavailable; neither native account is cost-ranked. The conditional Codex token-pricing scenario and Claude CLI list-price estimate do not establish a cost tie or advantage. Same workload, different models and timing conditions; later builds and concurrency differ from the original study. Superseded Codex wave and original error episodes are retained as overhead. Development pilots and this coding chat's work are excluded for all systems."
 }

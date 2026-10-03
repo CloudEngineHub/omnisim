@@ -178,12 +178,20 @@ def test_a_store_without_a_scheduler_refuses_and_offers_no_tool(tmp_path):
     assert "schedule_action" in {t.name for t in build_intent_tools(Tool, store(tmp_path))}
 
 
-def test_scheduled_actions_are_never_restored_after_a_restart(tmp_path):
+def test_a_timed_order_survives_a_controller_restart_but_not_a_world_reload(tmp_path):
+    # 2026-10-02: the long-horizon shift restarts the controller mid-shift and
+    # a 35-minute order was simply gone. The sim clock runs on through a
+    # controller restart; a world reload rewinds it, and then the order drops.
     s = store(tmp_path)
     s.schedule_action("after_s", [D(1.0)], due_sim=115, delay_s=15, action_text="drive forward 1 metre")
     s.tick()                                  # flush
     again = store(tmp_path)
-    assert again.scheduled_actions() == []
+    again.sim_clock = lambda: 101.0
+    assert [a["status"] for a in again.scheduled_actions()] == ["pending"]
+    assert again.take_due_actions(110.0) == []
+    assert [a["action_text"] for a in again.take_due_actions(116.0)] == ["drive forward 1 metre"]
+    reloaded = store(tmp_path)
+    assert reloaded.take_due_actions(3.0) == [] and reloaded.take_due_actions(200.0) == []
 
 
 def test_the_model_tool_uses_the_sim_clock(tmp_path):

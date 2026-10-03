@@ -35,7 +35,8 @@ SOURCES = ["omnisim/ops_bench/__init__.py", "omnisim/ops_bench/suite.py",
            "omnisim/ops_bench/runner.py", "omnisim/ops_bench/cli.py",
            "omnisim/ops_bench/competitors.py", "omnisim/ops_bench/accounting.py",
            "omnisim/ops_bench/health.py", "omnisim/ops_bench/judge.py",
-           "omnisim/ops_bench/codex_agent.py"]
+           "omnisim/ops_bench/codex_agent.py", "omnisim/ops_bench/claude_agent.py",
+           "omnisim/ops_bench/claude_mcp_stdio.py"]
 
 
 def _sha(path):
@@ -80,8 +81,8 @@ def _competitor_stack():
 def run(suite_path, arms, out, key, only=None, repeats=1, model_cfg=None,
         cap_usd=None, rates=None, health_median_s=None, health_max_wait_h=12.0,
         parallel=1, repeat_base=0):
-    if "codex_full" in arms and (rates is not None or cap_usd is not None):
-        raise ValueError("Codex signed-in billing is unavailable; --rates/--cap-usd cannot cover this arm")
+    if {"codex_full", "claude_full"} & set(arms) and (rates is not None or cap_usd is not None):
+        raise ValueError("Signed-in billing is unavailable; --rates/--cap-usd cannot cover this arm")
     suite = load_suite(suite_path)
     tasks = [t for t in suite["tasks"] if not only or t["id"] in only or t["family"] in only]
     if not tasks: raise ValueError("No task selected")
@@ -171,6 +172,7 @@ def run(suite_path, arms, out, key, only=None, repeats=1, model_cfg=None,
                     n += 1
                     u = rec.get("relay_usage", {})
                     cost_label = ("Codex billed cost unavailable" if arm == "codex_full" else
+                        "Claude billed cost unavailable" if arm == "claude_full" else
                         f"${(rec.get('cost') or {}).get('usd_estimated', 0):.4f} total ${spent:.4f}")
                     print(f"{n} {arm:10s} {task['id']:36s} {rec['outcome']:5s} "
                           f"unsafe={rec.get('unsafe')} rounds={u.get('rounds')} "
@@ -179,7 +181,8 @@ def run(suite_path, arms, out, key, only=None, repeats=1, model_cfg=None,
                 if stopped:
                     break
     summary = summarise(out)
-    summary["spent_usd_estimated"] = None if "codex_full" in arms else round(spent, 6)
+    summary["spent_usd_estimated"] = (None if {"codex_full", "claude_full"} & set(arms)
+                                      else round(spent, 6))
     summary["stopped"] = stopped
     (out / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(json.dumps(summary["by_arm"], indent=2))
@@ -197,6 +200,11 @@ def summarise(out):
             a["usd_estimated"] = None
             a["billing"] = "signed-in Codex account; billed cost unavailable"
             a["model_rounds"] += (r.get("codex_usage") or {}).get("model_requests", 0)
+            a["requests"] = None
+        elif r["arm"] == "claude_full":
+            a["usd_estimated"] = None
+            a["billing"] = "signed-in Claude account; billed cost unavailable"
+            a["model_rounds"] += (r.get("claude_usage") or {}).get("model_requests", 0)
             a["requests"] = None
         else:
             a["requests"] += (r.get("cost") or {}).get("requests", 0)
@@ -268,6 +276,11 @@ def main(argv=None):
     r.add_argument("--codex-reasoning", default="high", choices=("low", "medium", "high", "xhigh", "max"))
     r.add_argument("--codex-workspace", type=Path,
                    help="Empty workspace root outside this repository, required for Codex")
+    r.add_argument("--claude-model", default="claude-opus-5-5", help="Exact model for the native Claude Code arm")
+    r.add_argument("--claude-effort", default="high", choices=("low", "medium", "high", "xhigh", "max"))
+    r.add_argument("--claude-binary", default="", help="Claude Code executable; default: claude on PATH")
+    r.add_argument("--claude-workspace", type=Path,
+                   help="Empty workspace root outside this repository, required for Claude")
     r.add_argument("--cap-usd", type=float, default=None,
                    help="Stop before an episode that could take estimated spend past this")
     r.add_argument("--rates", default="",
@@ -309,6 +322,14 @@ def main(argv=None):
                     raise ValueError("Codex workspace must be outside the benchmark repository")
                 cfg.update(codex_model=args.codex_model, codex_reasoning=args.codex_reasoning,
                            codex_workspace=str(workspace))
+            if "claude_full" in args.arms:
+                if not args.claude_workspace:
+                    raise ValueError("Claude needs --claude-workspace outside the benchmark repository")
+                workspace = args.claude_workspace.resolve()
+                if workspace == REPO_ROOT or REPO_ROOT in workspace.parents:
+                    raise ValueError("Claude workspace must be outside the benchmark repository")
+                cfg.update(claude_model=args.claude_model, claude_effort=args.claude_effort,
+                           claude_binary=args.claude_binary, claude_workspace=str(workspace))
             rates = None
             if args.rates:
                 i, c, o = (float(v) for v in args.rates.split(","))

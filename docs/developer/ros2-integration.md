@@ -115,7 +115,7 @@ across two clients.
 
 | Topic | Type | Source |
 |---|---|---|
-| `/clock` | `rosgraph_msgs/Clock` | `GET /sim/state` → `sim_time_ms` |
+| `/clock` | `rosgraph_msgs/Clock` | bridge `POST /get_robot_state` → `sim_time` when the bridge is up (default bring-up); else `GET /sim/state` → `engine_time_ms`. ⚠ Fixed 2026-10-02: it used to publish `sim_time_ms`, the harness supervisor's loop counter, which ran 23 s while the engine ran 281 s, so every `use_sim_time:=true` node published at ~0.1 Hz. `engine_time_ms` alone was the right ruler but sampled only when the supervisor stepped (11 values in 30 s), still throttling timers. On the bridge clock, measured on the Husky: `/scan` 5.0 Hz and `joint_states` 2.5 Hz in simulated time, exactly as configured |
 | `/tf`, `/tf_static` | `tf2_msgs/TFMessage` | `GET /scene/tree` |
 | `<robot>/joint_states` | `sensor_msgs/JointState` | `GET /robot/<def>/joints` |
 | `/odom` | `nav_msgs/Odometry` | bridge `POST /get_robot_state` |
@@ -190,6 +190,55 @@ The Husky URDF gained a `<sensor type="ray">` block (a SICK LMS111 on the sensor
 arch, 270° / 541 samples / 0.1–20 m) so the lidar path could be verified against
 a real device. It is **inert** unless the flag above is set — verified by a
 control run: the same world reports `devices: []` without it.
+
+**TurtleBot3 and Jackal lidars (2026-09-30).** The three TurtleBot3 URDFs now
+carry the LDS-01 (`lds_lfcd_sensor` on `base_scan`: ROBOTIS' upstream Gazebo
+values, 360 samples over 6.28 rad, 0.12–3.5 m) and the Jackal carries
+upstream's default `JACKAL_LASER` accessory (`front_laser`, a SICK LMS1xx on
+the upright front bracket: 720 samples over 270°, 0.1–30 m). Same gate: no
+lidar without `OMNISIM_URDF_USE_SENSORS=1`. Measured against walls at known
+distances with `scripts/dev/measure_urdf_lidar.py` (worlds
+`showcase/tb3_lidar_walls.omniworld`, `showcase/jackal_lidar_walls.omniworld`):
+perpendicular beams within 1 mm, ≥ 98 % of all beams agree with the authored
+geometry, and a 0.99 m drive shrinks the Jackal's forward range by 0.9953 m.
+The Husky's LMS111 has its own known-wall world since 2026-10-02
+(`showcase/husky_lidar_walls.omniworld`, bridge :8783, `measure_urdf_lidar.py
+husky`: every check passes, a 0.987 m drive shrinks the forward range by 0.987 m).
+
+✅ **`/scan` verified end to end through ROS 2 (2026-10-02)** on all three
+scanners: engine on Windows → `omnilink_mobile_bridge` → `wsl_harness_link`
+tunnel → `sensor_node` under Humble in WSL → a ROS subscriber, every beam scored
+at the angle ROS publishes for it against the authored walls. TurtleBot3:
+360/360 beams equal to the bridge's raw row (reversed), 359/360 agree with the
+geometry within 5.5 mm, walls at +90° / −90° where they belong. Jackal:
+720/720 equal, 720/720 agree within 8 mm. Husky: 541/541 equal, 540/541 agree
+within 9 mm. The two misses are beams grazing a box corner ~3.5 mm outside it
+(well inside one beam's footprint). `/tf_static` base→scanner equals the
+bridge's measured mount on all three; 5 Hz requested, 4.99–5.03 Hz received
+through the tunnel. The in-simulator half is reproducible with
+`scripts/dev/measure_urdf_lidar.py`; the ROS-side capture rig is not in this
+repository. Three
+things a `/scan` consumer must know:
+
+- ⚠ **An engine built before 2026-09-30 turns these planar scanners into the
+  Lidar node's default 4-layer fan** (±5.7° / ±1.9°): the importer only wrote
+  `numberOfLayers` above 1. The bottom layer hits the floor (TurtleBot3: a
+  ring at ~1.8 m), and `sensor_node`'s default `lidar_layer: -1` picks the
+  layer with the most returns — that floor layer. Fixed in `OmUrdfImporter.cpp`
+  the same day and pinned by `tests/test_urdf_lidar_tb3_jackal.py` (single
+  layer, 6/6 on the rebuilt engine); the Husky's LMS111 is single-layer now
+  too. On an older binary, pass `lidar_layer:=1`.
+- **Beam order**: OmniSim index 0 is the LEFT end of the FOV and the scan
+  sweeps clockwise (theta_i = fov/2 − (i + 0.5)·fov/n); `sensor_node` reverses
+  it so angles increase counter-clockwise, and since 2026-10-02 publishes the
+  engine's own bin centres: `angle_increment = fov/n`, `angle_min = −fov/2 +
+  fov/(2n)` (`conversions.scan_angles`). Before that it spread the beams
+  edge-to-edge (`fov/(n − 1)`), up to half a step off (0.5° on the LDS-01),
+  with the TurtleBot3's first and last beams both claiming ±π. For the
+  TurtleBot3, index 0 still points straight behind, not straight ahead as on
+  the real LDS-01 driver (which publishes `angle_min = 0`): index by angle,
+  not by position.
+- **No noise**: the importer ignores `<noise>`; ranges are exact to ~1 mm.
 
 ### Tier 3 — `ros2_control` ✅ velocity-commanded bases · ⛔ arms
 

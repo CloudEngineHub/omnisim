@@ -26,8 +26,62 @@ import pytest
 from omnisim_ros2.conversions import (
     finite_triplet,
     lidar_layer_ranges,
+    scan_angles,
     select_lidar_layer,
+    simulated_time_ms,
 )
+
+
+# -- simulated_time_ms --------------------------------------------------------
+
+def test_clock_prefers_the_engine_clock():
+    """The supervisor counter lagged the engine by 258 s on 2026-10-02; /clock
+    must follow the clock the robot's sensors stamp with."""
+    body = {"sim_time_ms": 23400.0, "engine_time_ms": 281500.0}
+    assert simulated_time_ms(body) == (281500.0, "engine_time_ms")
+
+
+def test_clock_falls_back_and_says_so():
+    assert simulated_time_ms({"sim_time_ms": 1200.0}) == (1200.0, "sim_time_ms")
+    assert simulated_time_ms({"sim_time_ms": 1200.0, "engine_time_ms": None}) == (
+        1200.0, "sim_time_ms")
+
+
+def test_clock_none_when_nothing_is_loaded():
+    assert simulated_time_ms({}) == (None, "sim_time_ms")
+
+
+def _engine_beam_angle(i, n, fov):
+    """OmLidar::updatePointCloud: beam i at the centre of its bin, leftmost first."""
+    return fov / 2.0 - (i + 0.5) * fov / n
+
+
+# -- scan_angles --------------------------------------------------------------
+
+@pytest.mark.parametrize("fov,n", [(6.28, 360), (2 * math.pi, 360), (math.radians(270), 720), (1.0, 3)])
+def test_every_published_angle_is_the_engine_beam_angle(fov, n):
+    """After the node's reversal, ROS beam j is engine beam n-1-j; its published
+    angle (angle_min + j * angle_increment) must be that beam's real azimuth."""
+    amin, amax, inc = scan_angles(fov, n, reverse=True)
+    for j in range(n):
+        assert amin + j * inc == pytest.approx(_engine_beam_angle(n - 1 - j, n, fov), abs=1e-12)
+    assert amin + (n - 1) * inc == pytest.approx(amax, abs=1e-12)
+
+
+def test_full_circle_end_beams_do_not_coincide():
+    """Edge-to-edge spacing put beam 0 and beam n-1 both at +-pi (one direction)."""
+    amin, amax, inc = scan_angles(2 * math.pi, 360)
+    assert inc == pytest.approx(2 * math.pi / 360)
+    assert amax - amin == pytest.approx(2 * math.pi - inc)
+
+
+def test_unreversed_order_runs_clockwise():
+    """Without the reversal the row is leftmost-first, so angles must DECREASE."""
+    fov, n = 1.0, 4
+    amin, amax, inc = scan_angles(fov, n, reverse=False)
+    assert inc < 0
+    for i in range(n):
+        assert amin + i * inc == pytest.approx(_engine_beam_angle(i, n, fov), abs=1e-12)
 
 
 # -- select_lidar_layer -------------------------------------------------------

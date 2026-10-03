@@ -312,7 +312,17 @@ class IntentStore:
         self.hold_until = 0.0     # bounded ceiling; not an auto-resume window
         self.hold_words = ""
         self.hold_intent = ""
+        # Who asked for the hold ("Priya: hold where you are...") and the
+        # motion orders other people gave while it stood (see hold_conflict).
+        self.hold_speaker = ""
+        self.hold_waiting: List[Dict[str, str]] = []
+        # Named routines ("the usual run" = Pharmacy, Ward 3, the Lab, 5 s at
+        # each stop), defined once and later asked for by name (2026-10-02).
+        self.routines: Dict[str, Dict[str, Any]] = {}
         # The operator's verbatim text for the turn in flight (see hold_now).
+        # PER THREAD since 2026-10-01: turns overlap (the relay's conversation
+        # lane, the bridge's aside path), and a single slot let one message's
+        # speaker stand in for another's -- the hold rule decides by speaker.
         self._turn_text = ""
 
         # SITE MEMORY: what a shift establishes once and refers to by name
@@ -342,6 +352,18 @@ class IntentStore:
         # would be overwritten with False and the robot would quietly resume.
         if self._persist:
             self._restore()
+
+    @property
+    def _turn_text(self) -> str:
+        tl = self.__dict__.get("_turn_tl")
+        return getattr(tl, "text", "") if tl is not None else ""
+
+    @_turn_text.setter
+    def _turn_text(self, value: str) -> None:
+        tl = self.__dict__.get("_turn_tl")
+        if tl is None:
+            tl = self.__dict__["_turn_tl"] = threading.local()
+        tl.text = str(value or "")
 
     def set_turn_text(self, text: str) -> None:
         """Hand the store the operator's OWN words for this chat turn.
@@ -608,8 +630,54 @@ class IntentStore:
             self.hold_until = 0.0
             self.hold_words = ""
             self.hold_intent = ""
+            self.hold_speaker = ""
+            waiting, self.hold_waiting = self.hold_waiting, []
             self._flush_locked()
-        return {"released": bool(was)}
+        out = {"released": bool(was)}
+        if waiting:
+            # Orders refused while the hold stood are news on release: the
+            # person who gave them was told "when I'm cleared", so say it.
+            out["waiting_orders"] = waiting
+            out["say_waiting"] = "While I was holding, " + "; ".join(
+                f"{w['by']} asked me: \"{w['words']}\"" for w in waiting) + "."
+        return out
+
+    def hold_conflict(self) -> Optional[dict]:
+        """Refuse a MOTION order that would break someone's hold.
+
+        "Cart, hold where you are, don't move until I say -- I'm checking a
+        leak" is a promise to that person. Until 2026-09-30 it only paused
+        the robot's own autonomy: another person's order ("run the racks to
+        the QA bay now") drove straight off while the first was still at the
+        press (ops-bench shift v2, unsafe). Now, while an operator hold
+        stands, a motion order from anyone but the person who asked for it
+        is refused, and remembered for when the hold is lifted. The holder's
+        own new order lifts it -- "until I say" is them saying. A STOP is not
+        a motion order and never comes here. Unattributed speech (no
+        "Name:") keeps the old behaviour: one operator, one voice."""
+        if not self.hold_active():
+            return None
+        with self._lock:
+            if self.hold_intent != "operator":
+                return None
+            holder = self.hold_speaker
+            who = self.current_speaker()
+            if not holder or not who:
+                return None
+            if who == holder:
+                pass
+            else:
+                words = _strip_speaker_text(self._turn_text)
+                self.hold_waiting.append({"by": who, "words": words})
+                self._flush_locked()
+                return {"accepted": False, "refused": "hold",
+                        "error": f"refused: holding for {holder} until they say so",
+                        "say": (f"Sorry {who}, {holder} asked me to hold right here and not "
+                                f"move until they say so, so I'm staying put. I'll tell "
+                                f"{holder} you need me, and I'll do it once I'm cleared.")}
+        # The holder's own new order: their "until I say" has been said.
+        self.release_hold(reason=f"a new order from {holder}, who asked for the hold")
+        return None
 
     def set_constraint(self, rule: Any, words: str = "",
                        ttl_s: Optional[float] = None) -> dict:
@@ -841,6 +909,20 @@ class IntentStore:
             return [dict(c) for c in self._constraints
                     if c["rule"] == "zone" and c["status"] == "active"]
 
+    def known_zones(self) -> Dict[str, dict]:
+        """Every zone this shift has NAMED, active or lifted, by normalised
+        name -> its latest record. A lifted zone keeps its rectangle, so
+        "the corridor's shut again" can close the same box again."""
+        with self._lock:
+            out: Dict[str, dict] = {}
+            for lf in self.lifted:
+                if lf.get("name") and "x_min" in lf:
+                    out[normalize_place(lf["name"])] = dict(lf, status="lifted")
+            for c in self._constraints:
+                if c["rule"] == "zone" and c.get("name") and c["status"] == "active":
+                    out[normalize_place(c["name"])] = dict(c)
+            return out
+
     # ── places ───────────────────────────────────────────────────────
 
     def set_place(self, name: Any, x: Any, y: Any, *, words: str = "") -> dict:
@@ -859,6 +941,39 @@ class IntentStore:
         self._log(f"PLACE {key} = ({px:.2f}, {py:.2f})")
         return {"accepted": True, "place": key, "x": px, "y": py,
                 "say": f"Got it: {str(name).strip()} is at ({px:.2f}, {py:.2f})."}
+
+    def set_routine(self, name: Any, stops: Sequence[str], dwell_s: float = 0.0, *, words: str = "") -> dict:
+        key = normalize_routine(name)
+        stops = [normalize_place(s) for s in stops if normalize_place(s)]
+        if not key or len(stops) < 2:
+            return {"accepted": False, "say": "A routine needs a name and at least two known stops."}
+        with self._lock:
+            self.routines[key] = {"name": str(name).strip(), "stops": stops,
+                                  "dwell_s": max(0.0, float(dwell_s or 0.0)), "words": str(words or ""),
+                                  "set_by": self.current_speaker()}
+            self._flush_locked()
+        self._log(f"ROUTINE {key} = {' -> '.join(stops)} (dwell {dwell_s:g} s)")
+        return {"accepted": True, "routine": key}
+
+    def routine(self, name: Any) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            r = self.routines.get(normalize_routine(name))
+            return dict(r) if r else None
+
+    def handover(self, outgoing: str, incoming: str) -> dict:
+        """The floor changes hands: `incoming` directs the work from now; the
+        outgoing person no longer directs work or lifts rules. What they set
+        stands until someone with authority changes it."""
+        out_n = str(outgoing or "").strip().split()[0].capitalize() if outgoing else ""
+        in_n = str(incoming or "").strip().split()[0].capitalize() if incoming else ""
+        with self._lock:
+            if in_n:
+                self.roles[in_n] = "supervisor"
+            if out_n and out_n != in_n:
+                self.roles[out_n] = "former"
+            self._flush_locked()
+        self._log(f"HANDOVER {out_n or '?'} -> {in_n or '?'}")
+        return {"accepted": True, "from": out_n, "to": in_n}
 
     def place_xy(self, name: Any) -> Optional[Tuple[float, float]]:
         key = normalize_place(name)
@@ -887,6 +1002,9 @@ class IntentStore:
                 if d >= self.ODO_DEADBAND_M:
                     self.odometer_m += d
                     self._odo_anchor = (x, y)
+                    if self.odometer_m - getattr(self, "_odo_saved", 0.0) >= 1.0:
+                        self._odo_saved = self.odometer_m
+                        self._flush_locked()
             if self._at_place is not None:
                 p = self.places.get(self._at_place)
                 if p is None or math.hypot(x - p["x"], y - p["y"]) > self.PLACE_EXIT_M:
@@ -896,6 +1014,7 @@ class IntentStore:
                 if math.hypot(x - p["x"], y - p["y"]) <= self.PLACE_RADIUS_M:
                     self._at_place = key
                     self.visits[key] = self.visits.get(key, 0) + 1
+                    self._flush_locked()
                     return key
         return None
 
@@ -933,6 +1052,10 @@ class IntentStore:
                     f"{v['name']} at ({v['x']:.2f}, {v['y']:.2f})" for v in self.places.values()))
                 lines.append("- Arrivals so far (measured): " + "; ".join(
                     f"{self.places[k]['name']} {n}" for k, n in self.visits.items()))
+            for rt in self.routines.values():
+                stops = " -> ".join(self.places.get(s, {}).get("name", s) for s in rt["stops"])
+                lines.append(f"- Routine '{rt['name']}': {stops}"
+                             + (f", {rt['dwell_s']:g} s at each stop" if rt.get("dwell_s") else ""))
             active = [c for c in self._constraints if c["status"] == "active"]
             for c in active:
                 lock = (" -- PERMANENT (locked for the whole shift): nobody may lift it"
@@ -1090,11 +1213,28 @@ class IntentStore:
         with self._lock:
             return [dict(a) for a in self._actions if a["status"] == "pending"]
 
+    def _sim_now(self) -> Optional[float]:
+        try:
+            return None if self.sim_clock is None else round(float(self.sim_clock()), 3)
+        except Exception:
+            return None
+
     def take_due_actions(self, now_sim: float) -> List[dict]:
         """Timed actions whose SIM time has come. Taken once: the caller runs them."""
         out = []
         with self._lock:
             for a in self._actions:
+                # A restored order whose sim clock has gone BACKWARDS came from
+                # another run of the world, not a controller restart inside
+                # this one: its due time means nothing here, so it never fires.
+                if a["status"] == "pending" and a.get("restored"):
+                    saved = a.get("saved_sim")
+                    if saved is None or now_sim + 1.0 < float(saved):
+                        a["status"] = "dropped"
+                        a["detail"] = ("restored without a sim time" if saved is None else
+                                       f"saved at sim {float(saved):.1f}, clock now {now_sim:.1f}: "
+                                       "the world was reloaded") + ", so the order was dropped"
+                        continue
                 if (a["status"] == "pending" and a["trigger"]["type"] == "after_s"
                         and now_sim >= a["trigger"]["due_sim"]):
                     a["status"] = "firing"; a["fired"] += 1
@@ -1117,6 +1257,21 @@ class IntentStore:
             self._log(f"DISTURBANCE ({detail}) fires "
                       + ", ".join(a["id"] for a in out))
         return out
+
+    def timed_orders(self) -> List[dict]:
+        """Every TIMED order this shift, pending or finished, with its
+        status as the robot recorded it -- for a deterministic answer to
+        "that job I gave you for later, still on?" (see route)."""
+        with self._lock:
+            seen, out = set(), []
+            for a in list(self._actions) + list(reversed(self._done)):
+                if "frames" not in a or a.get("trigger", {}).get("type") != "after_s" or a["id"] in seen:
+                    continue
+                seen.add(a["id"])
+                out.append({"id": a["id"], "status": a.get("status"), "means": self._describe_action(a),
+                            "last_result": a.get("last_result", ""), "detail": a.get("detail", ""),
+                            "words": a.get("words", "")})
+            return out
 
     def finish_action(self, aid: str, ok: bool, summary: str) -> None:
         """Record what a fired action actually did, and tell the operator."""
@@ -1226,7 +1381,10 @@ class IntentStore:
                     self.lifted.append({"means": c.get("means") or c.get("rule"),
                                         "name": c.get("name") or c.get("rule"),
                                         "by": speaker or "the operator",
-                                        "clock_s": round(self.shift_clock_s(), 1)})
+                                        "clock_s": round(self.shift_clock_s(), 1),
+                                        # the rectangle, so "shut again" can re-close it
+                                        **({k: c[k] for k in ("x_min", "x_max", "y_min", "y_max")
+                                            if k in c} if c["rule"] == "zone" else {})})
                     del self.lifted[:-20]
                     self._log(f"{c['id']} CONSTRAINT CLEARED ({c['rule']}) "
                               f"after {c['blocked']} block(s)")
@@ -1396,6 +1554,7 @@ class IntentStore:
         self.hold_until = now + float(ttl_s or self.hold_max_s)
         self.hold_words = str(words or "")
         self.hold_intent = intent_id
+        self.hold_speaker = self.current_speaker() if intent_id == "operator" else ""
 
     def hold_active(self) -> bool:
         """True while a "do not auto-resume" hold is in force.
@@ -1423,6 +1582,8 @@ class IntentStore:
                 "held_s": round(now - self.hold_since, 1),
                 "ceiling_in_s": round(max(0.0, self.hold_until - now), 1),
                 "by": self.hold_intent,
+                "speaker": self.hold_speaker,
+                "waiting_orders": list(self.hold_waiting),
                 "words": self.hold_words,
                 "clears_on": "resume_autonomy"}
 
@@ -1617,10 +1778,21 @@ class IntentStore:
             "seq": self._seq,
             "pending": [dict(r) for r in self._pending],
             "constraints": [dict(r) for r in self._constraints],
-            "site": {"places": self.places, "roles": self.roles},
+            "site": {"places": self.places, "roles": self.roles, "routines": self.routines,
+                     "visits": self.visits, "odometer_m": round(self.odometer_m, 3),
+                     "lifted": self.lifted, "shift_t0": self.shift_t0,
+                     # Where the robot is parked: a restart there is not a new
+                     # arrival (run 2, 2026-10-02: Ward 3 counted 9 for 8).
+                     "at_place": self._at_place},
+            # Timed orders survive a restart (2026-10-02: a 35-minute order due
+            # after the long-horizon shift's restart was simply gone).
+            "actions": [dict(a) for a in self._actions if a.get("status") == "pending"],
+            "saved_sim": self._sim_now(),
             "hold": bool(self.hold),
             "hold_since": self.hold_since,
             "hold_until": self.hold_until,
+            "hold_speaker": self.hold_speaker,
+            "hold_waiting": list(self.hold_waiting),
         }
 
     def _flush_locked(self) -> None:
@@ -1713,6 +1885,37 @@ class IntentStore:
             self.places.update({k: dict(v) for k, v in (site.get("places") or {}).items()
                                 if isinstance(v, dict)})
             self.roles.update({str(k): str(v) for k, v in (site.get("roles") or {}).items()})
+            # THE SHIFT CONTINUES ACROSS A RESTART (2026-10-02): its counts,
+            # its routines, what was lifted, its clock and its timed orders.
+            # "How many times did you go to Ward 3?" after a restart read a
+            # counter that had restarted at zero.
+            self.routines.update({str(k): dict(v) for k, v in (site.get("routines") or {}).items()
+                                  if isinstance(v, dict)})
+            for k, n in (site.get("visits") or {}).items():
+                try:
+                    self.visits[str(k)] = max(int(n), self.visits.get(str(k), 0))
+                except (TypeError, ValueError):
+                    pass
+            try:
+                self.odometer_m = max(self.odometer_m, float(site.get("odometer_m") or 0.0))
+                self._odo_saved = self.odometer_m
+            except (TypeError, ValueError):
+                pass
+            if site.get("at_place") in self.places:
+                self._at_place = site["at_place"]
+            if isinstance(site.get("lifted"), list):
+                self.lifted = [dict(x) for x in site["lifted"] if isinstance(x, dict)]
+            try:
+                if site.get("shift_t0"):
+                    self.shift_t0 = min(self.shift_t0, float(site["shift_t0"]))
+            except (TypeError, ValueError):
+                pass
+            for raw in data.get("actions") or []:
+                if isinstance(raw, dict) and raw.get("status") == "pending" and raw.get("frames"):
+                    rec = _Rec(dict(raw))
+                    rec["restored"] = True
+                    rec["saved_sim"] = data.get("saved_sim")
+                    self._actions.append(rec)
             for k in self.places:
                 self.visits.setdefault(k, 0)
             self._seq = max(int(data.get("seq") or 0), self._seq)
@@ -1723,6 +1926,9 @@ class IntentStore:
                 self.hold = True
                 self.hold_since = now
                 self.hold_until = now + self.hold_max_s
+                self.hold_intent = "operator"
+                self.hold_speaker = str(data.get("hold_speaker") or "")
+                self.hold_waiting = [dict(w) for w in (data.get("hold_waiting") or []) if isinstance(w, dict)]
         except Exception as exc:
             self._log(f"intent state partially restored ({exc})")
 
@@ -2066,11 +2272,19 @@ class IntentStore:
 
 
 ROLE_LABELS = {"supervisor": "shift supervisor", "worker": "floor worker",
-               "safety": "safety lead", "other": "colleague"}
+               "safety": "safety lead", "other": "colleague",
+               # Handed over and gone (2026-10-02): no longer directs work or
+               # lifts rules, but what they set still stands.
+               "former": "no longer on shift (handed over)"}
+# ORDER MATTERS: the first family whose word appears wins, and "lead" is a
+# supervisor word -- so "safety lead" read as SUPERVISOR until 2026-10-01
+# (found by the dev-loop probes), handing the safety lead's authority to the
+# wrong role. Safety is checked first.
 _ROLE_WORDS = (
-    ("supervisor", ("supervisor", "shift lead", "shift manager", "foreman", "manager", "boss",
-                    "in charge", "lead", "runs the shift", "running the shift")),
     ("safety", ("safety", "ehs", "hse")),
+    ("supervisor", ("supervisor", "shift lead", "shift manager", "foreman", "manager", "boss",
+                    "in charge", "charge nurse", "charge hand", "lead", "runs the shift", "running the shift",
+                    "running the floor", "runs the floor")),
     ("worker", ("worker", "picker", "packer", "operator", "associate", "floor", "loader",
                 "driver", "handler", "crew", "team member", "staff")),
 )
@@ -2089,10 +2303,49 @@ def normalize_role(role: Any) -> str:
 _SPEAKER = re.compile(r"^\s*([A-Z][A-Za-z'\-]{0,30})\s*(?:\([^)]{0,40}\))?\s*:\s")
 
 
+def _strip_speaker_text(text: Any) -> str:
+    """The words of a "Name: words" turn, without the name."""
+    t = str(text or "").strip()
+    who = speaker_of(t)
+    if who and ":" in t:
+        return t.split(":", 1)[1].strip()
+    return t
+
+
+# Names a model reaches for when it means "stay here N seconds". The tool
+# description says `wait {s}`; a model that wrote `hold` had that step refused
+# as an unknown tool at the moment it fired, so "head to the charger and hold
+# there a minute" went to the charger and then reported a failure (dev loop 2,
+# 2026-10-01, shift_dev_v1).
+_WAIT_ALIASES = {"hold", "hold_position", "pause", "stay", "dwell", "wait_s", "sleep", "idle"}
+_SECONDS_KEYS = ("s", "seconds", "secs", "duration_s", "duration", "time_s", "for_s")
+
+
+def _normalise_scheduled_frame(frame: Any) -> Any:
+    if not isinstance(frame, dict):
+        return frame
+    tool = str(frame.get("tool") or "").strip().lower()
+    if tool not in _WAIT_ALIASES and tool != "wait":
+        return frame
+    args = dict(frame.get("args") or {})
+    secs = next((args[k] for k in _SECONDS_KEYS if k in args), None)
+    if secs is None and "minutes" in args:
+        secs = float(args["minutes"]) * 60.0
+    return {"tool": "wait", "args": {"s": float(secs) if secs is not None else 0.0}}
+
+
 def speaker_of(text: Any) -> str:
     """The name in a radio-style "Dana: ..." prefix, or "" if there is none."""
     m = _SPEAKER.match(str(text or ""))
     return m.group(1).capitalize() if m else ""
+
+
+def normalize_routine(name: Any) -> str:
+    """'The usual run' / "the usual round" / 'usual' -> 'usual'."""
+    t = re.sub(r"[^a-z0-9 ]+", " ", str(name or "").lower())
+    words = [w for w in t.split() if w not in ("the", "a", "an", "run", "round", "loop", "route",
+                                                "circuit", "trip", "rounds", "my", "our")]
+    return " ".join(words).strip()
 
 
 def normalize_place(name: Any) -> str:
@@ -2451,7 +2704,7 @@ def build_intent_tools(tool_cls: Any, store: IntentStore) -> List[Any]:
         def _schedule(args: Dict[str, Any]) -> dict:
             on = str(args.get("on") or "").strip().lower()
             delay = args.get("delay_s")
-            frames = args.get("actions") or []
+            frames = [_normalise_scheduled_frame(f) for f in (args.get("actions") or [])]
             clock = getattr(store, "sim_clock", None)
             if on in ("bump", "disturbance", "contact"):
                 return store.schedule_action("on_disturbance", frames,

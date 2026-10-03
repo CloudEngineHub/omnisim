@@ -109,6 +109,7 @@ from omnisim_ros2.conversions import (
     finite_triplet,
     lidar_layer_ranges,
     matrix_to_quaternion,
+    scan_angles,
     select_lidar_layer,
     sim_time_ms_to_ros,
 )
@@ -491,9 +492,8 @@ class SensorNode(Node):
         msg = LaserScan()
         msg.header.stamp = self._stamp(body.get("sim_time"))
         msg.header.frame_id = self.frame_for(self._lidar_name, self.scan_frame)
-        msg.angle_min = -fov / 2.0
-        msg.angle_max = fov / 2.0
-        msg.angle_increment = fov / max(len(ranges) - 1, 1)
+        msg.angle_min, msg.angle_max, msg.angle_increment = scan_angles(
+            fov, len(ranges), reverse=self.reverse_ranges)
         # Left at zero: the bridge exposes no per-ray timing, and a fabricated
         # value would be used by consumers to de-skew a moving scan.
         msg.time_increment = 0.0

@@ -150,6 +150,7 @@ try:  # noqa: E402
         interrupts_motion as shared_interrupts_motion,
         with_halt_note as shared_with_halt,
         is_halt_order as shared_is_halt_order,
+        parser_will_act as shared_parser_will_act,
         parser_first_window as shared_parser_window,
         parser_stats as shared_parser_stats,
         reply_payload as shared_reply_payload,
@@ -161,6 +162,7 @@ except ImportError as _exc:  # the package is ABSENT -- not "it raised"
     shared_short_circuit = None
     shared_is_halt_order = None
     shared_interrupts_motion = None
+    shared_parser_will_act = None
 
     def shared_with_halt(halted, out):  # type: ignore[misc]
         return out
@@ -1360,6 +1362,9 @@ class MobileBridge:
         # cancel_inflight, so its model turn stops issuing steps too).
         self.halt_seq = 0
         self.on_operator_halt: List[Any] = []
+        # Called instead of on_operator_halt for the IMPLICIT halt (a new
+        # order mid-work): Relay.supersede_motion, not cancel_inflight.
+        self.on_operator_supersede: List[Any] = []
         # Only an EXPLICIT stop runs these (it cancels scheduled orders too);
         # the implicit halt before a new instruction keeps them.
         self.on_operator_stop: List[Any] = []
@@ -2064,9 +2069,15 @@ class MobileBridge:
         # clearing the marker above is not enough -- the hold has to be
         # released explicitly, here.
         released = False
+        waited: dict = {}
         if self.intents is not None:
-            released = bool(self.intents.release_hold("resume_autonomy")
-                            .get("released"))
+            rel = self.intents.release_hold("resume_autonomy")
+            released = bool(rel.get("released"))
+            # Orders other people gave while the hold stood were refused with
+            # "I'll do it once I'm cleared" -- now they are owed an answer.
+            if rel.get("waiting_orders"):
+                waited = {"waiting_orders": rel["waiting_orders"],
+                          "say_waiting": rel.get("say_waiting")}
         loop = self.idle_loop
         if loop is None:
             # No autonomy to hand back to: "carry on" means the operator's own
@@ -2077,13 +2088,13 @@ class MobileBridge:
                 x, y, _ = self._read_pose()
                 if math.hypot(gx - x, gy - y) > 0.15:
                     out = self.act_resume_last_order()
-                    out.update({"autonomy": "none", "hold_released": released})
+                    out.update({"autonomy": "none", "hold_released": released, **waited})
                     return out
             return {"accepted": True, "autonomy": "none",
-                    "hold_released": released,
+                    "hold_released": released, **waited,
                     "detail": "this robot has no idle loop to resume"}
         return {"accepted": True, "autonomy": "resumed",
-                "hold_released": released,
+                "hold_released": released, **waited,
                 "mode": getattr(loop, "mode", "?"),
                 "leg": getattr(loop, "leg", "idle"),
                 "cycles": getattr(loop, "cycles", 0)}
@@ -2468,8 +2479,12 @@ class MobileBridge:
                 tool, args = f.get("tool"), dict(f.get("args") or {})
                 if gate_check is None:
                     ok = False; done.append("refused: no safety gate"); break
-                rej = gate_check(rec.get("action_text") or "",
-                                 [{"tool": tool, "args": args}], surface="mobile")
+                # A wait moves nothing; the gate has no schema for it, and
+                # gating it refused every "...and hold there a minute" when it
+                # fired (dev loop 5, 2026-10-01).
+                rej = ([] if tool == "wait" else
+                       gate_check(rec.get("action_text") or "",
+                                  [{"tool": tool, "args": args}], surface="mobile"))
                 if rej:
                     ok = False; done.append(f"refused by the gate: {rej[0].detail}"); break
                 if tool == "stop":
@@ -2477,7 +2492,9 @@ class MobileBridge:
                 else:
                     # A motion in progress (the operator's, or the reaction to
                     # the bump itself) finishes first; this never clobbers it.
-                    deadline = time.time() + 15.0
+                    # Up to 10 minutes: at 15 s a timed order cut off the job
+                    # the operator gave after it (dev loop 5, 2026-10-01).
+                    deadline = time.time() + 600.0
                     while time.time() < deadline:
                         with self.lock:
                             if self.motion[0] == "idle":
@@ -3836,7 +3853,14 @@ class MobileBridge:
             # omnilink-after-fix-01). The hooks cancel the relay's turn for
             # the same reason: before its tool call can return and it plans on.
             self.halt_seq += 1
-            hooks = list(self.on_operator_halt)
+            # keep_scheduled is the IMPLICIT halt -- a new order said while
+            # the robot works (route.interrupts_motion). It ends the motion
+            # but must not cancel the conversation: the relay's prompts in
+            # flight keep running and answering, and only lose the right to
+            # start a motion (Relay.supersede_motion). An explicit stop
+            # cancels everything, as before.
+            hooks = list(self.on_operator_supersede if keep_scheduled
+                         else self.on_operator_halt)
             if not keep_scheduled:
                 hooks += list(self.on_operator_stop)
             for hook in hooks:
@@ -4497,7 +4521,26 @@ class MobileBridge:
             from omnisim_bridges.intents import speaker_of
         except ImportError:
             return False
-        who = speaker_of(text)
+        return self._order_stands_against(speaker_of(text), str(text or ""))
+
+    # A worker COUNTERMANDING the supervisor's order: "Nah, forget Ward 3,
+    # take them to the Sterile store instead."
+    _COUNTERMAND = re.compile(r"\b(?:instead|forget|nah|scratch that|belay|actually|change of plan|"
+                              r"never ?mind|rather)\b", re.IGNORECASE)
+    COUNTERMAND_WINDOW_S = 180.0
+
+    def _order_stands_against(self, who: str, text: str) -> bool:
+        """The supervisor's last motion order binds this speaker: they are a
+        worker, it was given by the supervisor or safety lead, and it is
+        either not yet reached or -- for an explicit countermand -- reached
+        only just now. Long-horizon dev shift, run 2 (2026-10-02): a porter's
+        "forget Ward 3, take them to the Sterile store instead" reached
+        motion after the robot had arrived at Ward 3, the order counted as
+        done, and the robot went where the porter said -- twice."""
+        store = self.intents
+        order = self._last_order
+        if store is None or not order or not hasattr(store, "roles"):
+            return False
         boss = order.get("by") or ""
         if not who or who == boss or store.roles.get(who) != "worker":
             return False
@@ -4505,7 +4548,10 @@ class MobileBridge:
             return False
         gx, gy = order["goal_xy"]
         x, y, _ = self._read_pose()
-        return math.hypot(gx - x, gy - y) > 0.3
+        if math.hypot(gx - x, gy - y) > 0.3:
+            return True
+        age = self.sim_time - float(order.get("sim_s") or 0.0)
+        return bool(self._COUNTERMAND.search(text)) and 0.0 <= age <= self.COUNTERMAND_WINDOW_S
 
     def _order_conflict(self) -> Optional[dict]:
         """A floor worker does not override the supervisor's CURRENT order.
@@ -4515,24 +4561,23 @@ class MobileBridge:
         binds the parser, the model and any /tool caller alike. A STOP is not
         an order and is never refused."""
         store = self.intents
+        # Someone's "don't move until I say" binds every other voice first
+        # (IntentStore.hold_conflict; ops-bench shift v2, 2026-09-30).
+        if store is not None and hasattr(store, "hold_conflict"):
+            held = store.hold_conflict()
+            if held is not None:
+                return held
         order = self._last_order
         if store is None or not order or not hasattr(store, "current_speaker"):
             return None
         who = store.current_speaker()
-        roles = getattr(store, "roles", {})
+        if not self._order_stands_against(who, getattr(store, "_turn_text", "") or ""):
+            return None
         boss = order.get("by") or ""
-        if not who or who == boss or roles.get(who) != "worker":
-            return None
-        if roles.get(boss) not in ("supervisor", "safety"):
-            return None
-        gx, gy = order["goal_xy"]
-        x, y, _ = self._read_pose()
-        if math.hypot(gx - x, gy - y) <= 0.3:
-            return None                              # that order is done
         return {"accepted": False, "refused": "authority",
-                "error": f"refused: {boss}'s order ({order['means']}) is still in progress",
-                "say": (f"Sorry {who}, I'm still on {boss}'s order ({order['means']}), and "
-                        f"it stands until {boss} changes it.")}
+                "error": f"refused: {boss}'s order ({order['means']}) stands",
+                "say": (f"Sorry {who}, {boss} asked for this ({order['means']}) and that order "
+                        f"stands until {boss} changes it, so I'm not changing destination.")}
 
     def act_resume_last_order(self) -> dict:
         """Finish the last motion order after a stop or a block: drive to the
@@ -8653,6 +8698,20 @@ def make_handler(bridge: MobileBridge, relay: Any = None):
                 # Questions, acknowledgements and orders for later do not.
                 self._halted_first = None
                 aside = False
+                takes_over = False
+                conversational = False
+                if (path == "/prompt" and relay is not None and not halt
+                        and shared_interrupts_motion is not None
+                        and not bridge.working(relay)):
+                    # Idle robot: a message that is not an order for the body
+                    # does not need the command lock either; it goes to the
+                    # relay's conversation lane (2026-10-01, slow-provider fix).
+                    try:
+                        conversational = not shared_interrupts_motion(
+                            body.get("text"), "mobile", bridge=bridge)
+                    except Exception:
+                        conversational = False
+                    aside = conversational
                 if (path == "/prompt" and relay is not None and not halt
                         and shared_interrupts_motion is not None
                         and bridge.working(relay)):
@@ -8663,6 +8722,12 @@ def make_handler(bridge: MobileBridge, relay: Any = None):
                             "pose": res.get("pose_at_halt"),
                             "stopped_motion": res.get("stopped_motion"),
                             "stationary": res.get("stationary")}
+                        # The superseded turn can no longer START a motion
+                        # (Relay.supersede_motion), so a confident parsed
+                        # order owns the robot now and does not queue behind
+                        # that turn's lock (dev-loop probe P3, 2026-10-01).
+                        takes_over = bool(shared_parser_will_act is not None
+                                          and shared_parser_will_act(bridge, body.get("text"), "mobile"))
                     else:
                         # A question, a "thanks" or an order for later, said
                         # while the robot works: answered NOW, beside the
@@ -8672,7 +8737,7 @@ def make_handler(bridge: MobileBridge, relay: Any = None):
                         aside = True
                 if (path in ("/stop_robot", "/read_sensor", "/list_sensors")
                         or (path == "/tool" and body.get("tool") == "stop_robot")
-                        or halt or aside):
+                        or halt or aside or takes_over):
                     self._route_post(body)
                 else:
                     with action_lock:
@@ -8923,6 +8988,11 @@ def make_handler(bridge: MobileBridge, relay: Any = None):
                             out = shared_reply_payload(
                                 _early.get("agent", ""),
                                 _early.get("tools") or [], via="parser")
+                            # The model must know what the parser did, or it
+                            # denies it later (dev loop 4, 2026-10-01).
+                            if hasattr(relay, "note_parser_turn"):
+                                relay.note_parser_turn(text, out.get("response", ""),
+                                                       out.get("actions"))
                             bridge.end_chat_turn(prev_pause_marker,
                                                  out.get("actions"))
                             _tx_end(_tx, reply=out.get("response", ""),
@@ -8934,7 +9004,19 @@ def make_handler(bridge: MobileBridge, relay: Any = None):
                         # relay's own auto-reads (which emit no "tool" event)
                         # can be reported below. See _auto_reads_since.
                         _n0 = _tx_journal_seq(relay)
-                        out = relay.dispatch_sync(text, timeout_s=prompt_timeout_s)
+                        # The conversation lane for a message that is not an
+                        # order for the body now (route.interrupts_motion);
+                        # orders keep the ordered main lane.
+                        _lane = "main"
+                        _im = globals().get("shared_interrupts_motion")
+                        _ho = globals().get("shared_is_halt_order")
+                        if _im is not None and not (_ho is not None and _ho(text, "mobile")):
+                            try:
+                                if not _im(text, "mobile", bridge=bridge):
+                                    _lane = "aside"
+                            except Exception:
+                                _lane = "main"
+                        out = relay.dispatch_sync(text, timeout_s=prompt_timeout_s, lane=_lane)
                         bridge.end_chat_turn(prev_pause_marker,
                                              out.get("actions"))
                         # AFTER end_chat_turn on purpose: the pause decision
@@ -10172,6 +10254,11 @@ def main() -> int:
     relay = setup_omnilink_relay(bridge, http_port=args.port)
     if relay is not None and hasattr(relay, "cancel_inflight"):
         bridge.on_operator_halt.append(relay.cancel_inflight)
+    if relay is not None and hasattr(relay, "supersede_motion"):
+        bridge.on_operator_supersede.append(relay.supersede_motion)
+    if relay is not None and bridge.intents is not None and hasattr(relay, "turn_hook"):
+        # Each relay turn, on its own worker thread, carries its own words.
+        relay.turn_hook = bridge.intents.set_turn_text
     start_http(bridge, args.port, relay)
 
     # Opt-in ambient idle loop (keeps the tug demo alive when nobody is

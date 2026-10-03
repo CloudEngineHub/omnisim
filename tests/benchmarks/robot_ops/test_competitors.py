@@ -188,3 +188,52 @@ def test_the_model_client_refuses_past_its_cap():
     client = C.ModelClient("k", "g3-engine", "", "OmniSim-husky", max_requests=0)
     with pytest.raises(C.InfrastructureError):
         client.complete("s", [])
+
+
+# ── the long-context tier (2026-10-01, long-horizon benchmark) ──────────────
+
+class _LCModel:
+    """Plans: say 'ok' and finish. Summaries: a fixed marker."""
+    def __init__(self):
+        self.summaries = 0
+
+    def complete(self, system, messages):
+        if system == C.LC_SUMMARY_SYSTEM:
+            self.summaries += 1
+            return f"SUMMARY-{self.summaries}"
+        return json.dumps({"actions": [], "say": "ok", "done": True})
+
+
+def _lc(tmp_path, monkeypatch, arm="plain_lc"):
+    session = FakeSession()
+    session.directory = tmp_path
+    monkeypatch.setattr(C.CompetitorAgent, "_tool_surface", lambda self: list(C.BASIC_TOOLS))
+    monkeypatch.setattr(C.CompetitorAgent, "_main_task", lambda self: "")
+    model = _LCModel()
+    return C.CompetitorAgent(session, clock, arm, model), model
+
+
+def test_long_context_tier_folds_old_messages_into_a_summary(tmp_path, monkeypatch):
+    a, model = _lc(tmp_path, monkeypatch)
+    for i in range(40):
+        a._handle(f"message {i}")
+    assert model.summaries >= 1 and a.summary.startswith("SUMMARY-")
+    assert len(a.history) <= C.LC_KEEP + C.LC_FOLD
+    # the summary rides at the front of every later model call
+    a._handle("one more")
+    assert (tmp_path / "plain_lc_memory.json").exists()
+    a.close()
+
+
+def test_long_context_tier_survives_a_restart_and_full_tier_does_not(tmp_path, monkeypatch):
+    a, _ = _lc(tmp_path, monkeypatch)
+    for i in range(40):
+        a._handle(f"message {i}")
+    kept = (a.summary, len(a.history))
+    a.on_restart()
+    assert (a.summary, len(a.history)) == kept          # reloaded from its checkpoint
+    a.close()
+    f = C.CompetitorAgent.__new__(C.CompetitorAgent)
+    f.tier, f.history, f.summary, f._memory_path = "full", [{"role": "user", "content": "x"}], "", None
+    f.on_restart()
+    assert f.history == [] and f.summary == ""          # a framework default keeps nothing

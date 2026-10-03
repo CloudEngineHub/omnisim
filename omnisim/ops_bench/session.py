@@ -210,6 +210,31 @@ class Session:
                                            "translation": [p[0] + dx, p[1] + dy, p[2]],
                                            "reset_physics": True})
 
+    def restart_robot(self, timeout_s=90.0):
+        """Restart the robot's controller -- the bridge, and an OmniLink relay
+        inside it -- and wait until it answers again. Returns the seconds it
+        was down. What survives is whatever each system persists itself."""
+        robot_def = {"husky": "HUSKY", "tb3_burger": "TB3_BURGER"}[self.robot]
+        t0 = time.monotonic()
+        self.sup("restart_controller", {"def": robot_def})
+        # First see the old process go (a state() right after the command can
+        # still reach it -- the smoke test measured a "2.0 s" gap that was just
+        # this sleep), then wait for the new one to answer.
+        gone_by = time.monotonic() + 15.0
+        while time.monotonic() < gone_by:
+            try:
+                self.state()
+                time.sleep(0.2)
+            except InfrastructureError:
+                break
+        while time.monotonic() - t0 < timeout_s:
+            try:
+                self.state()
+                return round(time.monotonic() - t0, 1)
+            except InfrastructureError:
+                time.sleep(1.0)
+        raise InfrastructureError(f"bridge did not come back within {timeout_s:.0f} s of a restart")
+
     def events(self, since=0):
         try:
             return request(f"{self.url}/events?since={since}", timeout=5)

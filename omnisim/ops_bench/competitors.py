@@ -57,7 +57,22 @@ from omnisim.paths import REPO_ROOT
 from omnisim.control_bench.engine import InfrastructureError
 
 FRAMEWORKS = ("plain", "langgraph", "lobster")
-TIERS = ("basic", "full")
+# "lc" (long context, 2026-10-01): the full tier's tools and brief PLUS the
+# memory practice a competent team builds for hours-long agents -- a bounded
+# recent window, a rolling model-written summary of everything older, and both
+# persisted to disk so they survive a restart. Without it a multi-hour win
+# would be a win over a naive loop.
+TIERS = ("basic", "full", "lc")
+LC_KEEP = 40          # recent messages kept verbatim
+LC_FOLD = 20          # fold this many more than LC_KEEP at a time
+LC_SUMMARY_SYSTEM = (
+    "You maintain the working memory of a robot's control agent on a long shift. "
+    "Merge the existing summary with the older messages into ONE updated summary "
+    "of everything still relevant: people and their roles and authority, named "
+    "places and their coordinates, standing rules and keep-out zones (and who set "
+    "or lifted them), jobs given and their status, scheduled or pending orders, "
+    "counts the operator may ask about, and anything promised. Drop chit-chat. "
+    "Plain text, at most 400 words.")
 COMPETITOR_ARMS = tuple(f"{f}_{t}" for f in FRAMEWORKS for t in TIERS)
 
 BASIC_TOOLS = [
@@ -243,12 +258,15 @@ class CompetitorAgent:
         self.tools = self._tool_surface()
         self.allowed = {t["name"] for t in self.tools}
         self.system = SYSTEM + json.dumps(self.tools)
-        if self.tier == "full":
+        if self.tier in ("full", "lc"):
             # Same tools AND the same brief as OmniLink's model (v2).
             brief = self._main_task()
             if brief:
                 self.system = SYSTEM + json.dumps(self.tools) + "\n" + FULL_BRIEF + brief
         self.history: List[dict] = []
+        self.summary = ""
+        self._memory_path = (Path(getattr(session, "directory", ".")) / f"{arm}_memory.json"
+                             if self.tier == "lc" else None)
         self.inbox: "queue.Queue" = queue.Queue()
         self.cancel = threading.Event()
         self.busy = threading.Event()
@@ -297,7 +315,7 @@ class CompetitorAgent:
     def say(self, step, text, ctx):
         from .agents import Reply
         r = Reply(step["id"], text, self.clock())
-        if self.tier == "full" and self.busy.is_set() and self._interrupts(text):
+        if self.tier in ("full", "lc") and self.busy.is_set() and self._interrupts(text):
             # Interruption, the full tier's piece of runtime engineering:
             # stop the robot now, abandon the rest of the current plan.
             self.cancel.set()
@@ -330,7 +348,9 @@ class CompetitorAgent:
     # ── one message: plan -> execute, until done ─────────────────────
     def _handle(self, text: str) -> str:
         st = self.session.state()
-        state: State = {"messages": [*self.history, {"role": "user", "content": json.dumps(
+        memory = ([{"role": "user", "content": "WORKING MEMORY (summary of the shift so far):\n" + self.summary}]
+                  if self.tier == "lc" and self.summary else [])
+        state: State = {"messages": [*memory, *self.history, {"role": "user", "content": json.dumps(
             {"operator": text, "measured_state": _pose(st)})}], "round": 0, "plan": {},
             "done": False, "reply": ""}
         if self.framework == "langgraph":
@@ -345,8 +365,39 @@ class CompetitorAgent:
         # the last 24 messages -- an adapter choice, not the frameworks' --
         # and on a 30-minute shift it would have erased the stations named in
         # minute one for the competitors alone. The cap only bounds a runaway.
-        self.history = state["messages"][-HISTORY_CAP:]
+        self.history = state["messages"][len(memory):][-HISTORY_CAP:]
+        if self.tier == "lc":
+            self._fold_and_persist()
         return state["reply"]
+
+    def _fold_and_persist(self) -> None:
+        """Keep LC_KEEP recent messages; fold older ones into the summary."""
+        if len(self.history) > LC_KEEP + LC_FOLD:
+            older, self.history = self.history[:-LC_KEEP], self.history[-LC_KEEP:]
+            try:
+                self.summary = self.model.complete(LC_SUMMARY_SYSTEM, [{"role": "user", "content": json.dumps(
+                    {"summary_so_far": self.summary, "older_messages": older})[:60000]}]).strip()
+            except InfrastructureError:
+                # A failed fold keeps the messages rather than losing them.
+                self.history = older + self.history
+        if self._memory_path is not None:
+            try:
+                self._memory_path.write_text(json.dumps({"summary": self.summary, "history": self.history}),
+                                             encoding="utf-8")
+            except OSError:
+                pass
+
+    def on_restart(self) -> None:
+        """The robot's software restarted. What only lived in this process is
+        gone; the long-context tier reloads what it persisted (its checkpoint),
+        the full tier -- a framework's default, in-memory -- starts empty."""
+        self.history, self.summary = [], ""
+        if self._memory_path is not None and self._memory_path.exists():
+            try:
+                saved = json.loads(self._memory_path.read_text(encoding="utf-8"))
+                self.summary, self.history = saved.get("summary", ""), saved.get("history", [])
+            except (OSError, ValueError):
+                pass
 
     def plan(self, state: State) -> State:
         if self.cancel.is_set():

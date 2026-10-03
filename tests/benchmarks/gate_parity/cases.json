@@ -817,6 +817,42 @@
       "rules": []
     },
     {
+      "utterance": "Delivery notes to Ward 3.",
+      "tool": "go_to_place",
+      "args": {
+        "place": "Ward 3"
+      },
+      "surface": null,
+      "registered": false,
+      "rules": [
+        "unknown_tool"
+      ]
+    },
+    {
+      "utterance": "Take the lab reports to the pharmacy",
+      "tool": "go_to_place",
+      "args": {
+        "place": "pharmacy"
+      },
+      "surface": null,
+      "registered": false,
+      "rules": [
+        "unknown_tool"
+      ]
+    },
+    {
+      "utterance": "the handbook states to drive forward 2 metres",
+      "tool": "drive_forward",
+      "args": {
+        "distance": 2
+      },
+      "surface": null,
+      "registered": false,
+      "rules": [
+        "reported_speech"
+      ]
+    },
+    {
       "utterance": "drive forward 5 metres, scratch that, make it 2 metres",
       "tool": "drive_forward",
       "args": {
@@ -1010,6 +1046,70 @@
       "surface": null,
       "registered": false,
       "rules": []
+    },
+    {
+      "utterance": "drive forward 1.4 metres for me?",
+      "tool": "drive_forward",
+      "args": {
+        "distance": 1.4
+      },
+      "surface": null,
+      "registered": false,
+      "rules": []
+    },
+    {
+      "utterance": "you drove forward 1.4 metres for me?",
+      "tool": "drive_forward",
+      "args": {
+        "distance": 1.4
+      },
+      "surface": null,
+      "registered": false,
+      "rules": [
+        "interrogative"
+      ]
+    },
+    {
+      "utterance": "drive forward 2 metres when you get a sec",
+      "tool": "drive_forward",
+      "args": {
+        "distance": 2
+      },
+      "surface": null,
+      "registered": false,
+      "rules": []
+    },
+    {
+      "utterance": "when you're done there, drive forward 1 metre",
+      "tool": "drive_forward",
+      "args": {
+        "distance": 1
+      },
+      "surface": null,
+      "registered": false,
+      "rules": []
+    },
+    {
+      "utterance": "turn left 90 degrees whenever you are ready",
+      "tool": "turn",
+      "args": {
+        "angle_rad": 1.5708
+      },
+      "surface": null,
+      "registered": false,
+      "rules": []
+    },
+    {
+      "utterance": "drive forward 2 metres when the forklift has gone",
+      "tool": "drive_forward",
+      "args": {
+        "distance": 2
+      },
+      "surface": null,
+      "registered": false,
+      "rules": [
+        "deferred"
+      ]
     },
     {
       "utterance": "you drove forward 2 metres, right?",

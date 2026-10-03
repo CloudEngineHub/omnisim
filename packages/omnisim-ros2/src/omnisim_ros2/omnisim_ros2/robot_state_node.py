@@ -65,6 +65,7 @@ from omnisim_ros2.conversions import (
     relative_transform,
     sanitize_frame_id,
     sim_time_ms_to_ros,
+    simulated_time_ms,
 )
 from omnisim_ros2.harness_client import HarnessClient, HarnessUnreachable
 from omnisim_ros2.node_support import guard_timer
@@ -150,7 +151,9 @@ class RobotStateNode(Node):
     def tick(self) -> None:
         try:
             state = self.client.sim_state()
-            sim_ms = state.body.get("sim_time_ms")
+            # The engine clock, as /clock publishes it -- not the supervisor's
+            # loop counter, which can lag it by minutes (simulated_time_ms).
+            sim_ms, _ = simulated_time_ms(state.body)
             if self.do_tf:
                 self._publish_tf(sim_ms)
             if self.do_joints:

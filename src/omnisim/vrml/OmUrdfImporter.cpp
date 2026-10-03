@@ -1201,11 +1201,17 @@ QString emitOneSensorAtRoot(const UrdfSensor &s, const QString &indent) {
       out += in + QString("  fieldOfView %1\n").arg(s.horizontalFov);
       out += in + QString("  minRange %1\n").arg(s.minRange);
       out += in + QString("  maxRange %1\n").arg(s.maxRange);
-      if (s.lidarNumberOfLayers > 1) {
-        out += in + QString("  numberOfLayers %1\n").arg(s.lidarNumberOfLayers);
-        if (s.lidarVerticalFov > 0.0)
-          out += in + QString("  verticalFieldOfView %1\n").arg(s.lidarVerticalFov);
-      }
+      // numberOfLayers is ALWAYS written (2026-09-30). The Lidar node's own
+      // default is 4 layers over a 0.2 rad vertical fan (Lidar.wrl), so a
+      // planar URDF <ray> -- no <vertical> block, lidarNumberOfLayers == 1 --
+      // used to arrive as a 4-layer device tilted +-5.7 / +-1.9 deg: measured
+      // on the TurtleBot3 LDS-01 (2026-09-30), the bottom layer read the
+      // FLOOR at ~1.8 m and the Jackal LMS1xx's at ~4 m, and a consumer
+      // picking "the layer with most returns" (omnisim_ros2's sensor_node)
+      // took the floor ring for obstacles.
+      out += in + QString("  numberOfLayers %1\n").arg(s.lidarNumberOfLayers);
+      if (s.lidarNumberOfLayers > 1 && s.lidarVerticalFov > 0.0)
+        out += in + QString("  verticalFieldOfView %1\n").arg(s.lidarVerticalFov);
       out += in + "}\n";
       break;
   }

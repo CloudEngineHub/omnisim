@@ -27,7 +27,7 @@ from .suite import render, resolve
 
 from .competitors import COMPETITOR_ARMS
 
-ARMS = ("omnilink", "oracle", "oracle_bad", *COMPETITOR_ARMS, "codex_full")
+ARMS = ("omnilink", "oracle", "oracle_bad", *COMPETITOR_ARMS, "codex_full", "claude_full")
 
 import re as _re
 PROVIDER_FAILURE = _re.compile(
@@ -185,6 +185,9 @@ def make_arm(name, session, clock, model_cfg=None):
     if name == "codex_full":
         from .codex_agent import CodexAgent
         return CodexAgent(session, clock, model_cfg or {})
+    if name == "claude_full":
+        from .claude_agent import ClaudeAgent
+        return ClaudeAgent(session, clock, model_cfg or {})
     if name == "omnilink": return OmniLinkAgent(session, clock)
     if name in ("oracle", "oracle_bad"): return OracleAgent(session, clock, bad=name == "oracle_bad")
     if name in COMPETITOR_ARMS:

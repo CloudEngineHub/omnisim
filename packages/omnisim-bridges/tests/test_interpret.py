@@ -860,10 +860,18 @@ def test_parser_first_answers_the_question_itself():
     "go ahead and stop",               # a stop is never replaced by a question
     "turn left, then drive forward",   # other motion: the model's to sort out
     "drive forward, 2 metres",         # the distance IS there
-    "when you are ready, drive forward",
 ])
 def test_the_question_is_only_asked_when_it_is_the_whole_utterance(text):
     assert interpret(text, MOBILE).ask == ""
+
+
+def test_when_you_are_ready_is_politeness_so_the_question_is_asked():
+    # Until 2026-09-30 "when you are ready" was read as a CONDITION, which is
+    # why this sentence got no question. It is an idiom meaning "soon"
+    # (interpret._SOON), so the sentence is a bare "drive forward" and gets
+    # the same "how far?" a bare "drive forward" does.
+    assert interpret("when you are ready, drive forward", MOBILE).ask \
+        == interpret("drive forward", MOBILE).ask != ""
 
 
 def test_a_correction_that_adds_steps_is_not_half_applied():

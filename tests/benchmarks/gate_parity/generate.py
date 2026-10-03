@@ -174,6 +174,10 @@ CASES = [
     ("never mind, stop", "stop_robot", {}),
     ("collect the reports from bay 3", "pick", {"object": "reports"}),
     ("grab the delivery notes off the counter", "pick", {"object": "notes"}),
+    # long-horizon dev shift 2026-10-02: "notes to" read as "notes that"
+    ("Delivery notes to Ward 3.", "go_to_place", {"place": "Ward 3"}),
+    ("Take the lab reports to the pharmacy", "go_to_place", {"place": "pharmacy"}),
+    ("the handbook states to drive forward 2 metres", "drive_forward", {"distance": 2}),
     ("drive forward 5 metres, scratch that, make it 2 metres", "drive_forward", {"distance": 2}),
     ("reverse 3 metres. never mind, go forward 1 metre", "drive_forward", {"distance": 1}),
     ("we'll find out later. square her up - 90 degrees right.", "turn", {"angle_rad": -1.5708}),
@@ -193,6 +197,14 @@ CASES = [
     ("back up fifteen centimetres", "drive_forward", {"distance": -0.15}),
     ("drive forward a millimetre", "drive_forward", {"distance": 0.001}),
     ("roll ahead 1.4 metres, would you?", "drive_forward", {"distance": 1.4}),
+    # 2026-10-01 (9f84436fc): "... for me?" is a request tag, and idioms about
+    # the robot's own availability are not deferrals; a real condition still is.
+    ("drive forward 1.4 metres for me?", "drive_forward", {"distance": 1.4}),
+    ("you drove forward 1.4 metres for me?", "drive_forward", {"distance": 1.4}),
+    ("drive forward 2 metres when you get a sec", "drive_forward", {"distance": 2}),
+    ("when you're done there, drive forward 1 metre", "drive_forward", {"distance": 1}),
+    ("turn left 90 degrees whenever you are ready", "turn", {"angle_rad": 1.5708}),
+    ("drive forward 2 metres when the forklift has gone", "drive_forward", {"distance": 2}),
     ("you drove forward 2 metres, right?", "drive_forward", {"distance": 2}),
     ("reverse 0.35 m and after that swivel 135 degrees clockwise", "turn", {"angle_rad": -2.356}),
     ("after that meeting ends, drive forward 2 metres", "drive_forward", {"distance": 2}),

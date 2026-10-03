@@ -1847,6 +1847,17 @@ def dispatch(supervisor: Supervisor, basic_step_ms: int, sim_time_ms: float,
             "advanced_to_ms": sim_after,
             "verification": delete_verification(removed, missing, still),
         }
+    if cmd == "restart_controller":
+        # ops-bench long-horizon "restart" fixture (2026-10-01): the robot's
+        # software restarts mid-shift, as after a crash or a reboot.
+        def_name = args.get("def")
+        if not isinstance(def_name, str) or not def_name:
+            raise CommandError("restart_controller requires a 'def' string")
+        node = find_node_by_def(supervisor, def_name)
+        if node is None:
+            raise CommandError(f"no node with DEF {def_name!r}")
+        node.restartController()
+        return {"restarted": def_name}
     if cmd == "scene_set_pose":
         def_name = args.get("def")
         if not isinstance(def_name, str) or not def_name:

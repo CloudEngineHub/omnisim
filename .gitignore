@@ -494,6 +494,8 @@ packages/*/dist/
 /social/launch/pilots/replies_*/bruce_bcadm/*/src/
 # Generated sweep worlds (109 files, 32 MB), rebuilt by that folder's run_sweep.
 /social/launch/pilots/replies_2026_09_29/prishita_curriculum/worlds/
+# Same for the 2026-10-02 bank (175 files, 81 MB), rebuilt by its bank.py.
+/social/launch/pilots/replies_2026_10_02/prishita_eval/worlds/
 
 # Company-pilot workspaces (social/launch/pilots/companies/*). The rig we
 # author is TRACKED -- probe scripts, generated worlds, evidence dumps,
@@ -524,6 +526,14 @@ packages/*/dist/
 /social/launch/pilots/replies_*/**/site-packages/
 /social/launch/pilots/replies_*/**/node_modules/
 /social/launch/pilots/replies_*/**/__pycache__/
+# 2026-10-03: a fourth set of clone names. The 2026-10-02 wave cloned
+# correspondents' repos as `clone/` and `rosa_clone/`, mujoco_menagerie as
+# `menagerie/` (all four nested git checkouts that would commit as gitlinks),
+# and copied TopicForge's own files into `upstream/`.
+/social/launch/pilots/replies_*/*/clone/
+/social/launch/pilots/replies_*/*/*_clone/
+/social/launch/pilots/replies_*/*/menagerie/
+/social/launch/pilots/replies_*/*/upstream/
 # Engine run residue: regenerable, and the reports quote what matters.
 /social/launch/pilots/replies_*/**/logs/
 #
@@ -639,3 +649,16 @@ social/launch/pilots/replies_2026_09_13/compass_repro/harness_probe_libcxx_emula
 social/launch/pilots/replies_2026_09_13/compass_repro/probe_include/
 social/launch/pilots/replies_2026_09_25/poom_eod/source/
 social/launch/pilots/replies_2026_09_25/malo_pusht/bundle/
+
+# Web pages saved at the repository root while researching (outreach, docs).
+# Nothing at the root is HTML on purpose; pages that belong to the repo live
+# under docs/, social/ or a project directory.
+/*.html
+
+# Dev-loop runs (tests/benchmarks/robot_ops/devloop): a development signal on
+# seen shifts, never published, and ~8 MB per loop. Each loop's loop.json and
+# report.json are kept as the record of what was measured; the episodes are not.
+/tests/benchmarks/robot_ops/evidence/devloop/**
+!/tests/benchmarks/robot_ops/evidence/devloop/*/
+!/tests/benchmarks/robot_ops/evidence/devloop/*/loop.json
+!/tests/benchmarks/robot_ops/evidence/devloop/*/report.json

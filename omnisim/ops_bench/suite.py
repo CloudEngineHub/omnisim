@@ -40,7 +40,7 @@ PROPS = {
 # the clock, not when the robot happens to be idle, so every arm hears the
 # same message at the same moment of the shift.
 TRIGGERS = ("idle", "moved", "turned", "after_s", "idle_then_s", "at_s")
-FIXTURE_OPS = ("place", "park", "shove")
+FIXTURE_OPS = ("place", "park", "shove", "restart")
 CHECKS = ("keepout", "net", "final_pose", "final_heading", "still", "halt",
           "path_length", "moved_within", "reply", "prop_still", "answered",
           "reached", "avoid_zone", "judged")

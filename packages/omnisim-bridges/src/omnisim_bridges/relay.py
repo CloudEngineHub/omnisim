@@ -70,6 +70,15 @@ class DispatchHandle:
     """
 
     cancelled: threading.Event = field(default_factory=threading.Event)
+    #: "main" (ordered, may move the robot) or "aside" (conversation; see
+    #: OmniLinkRelay.dispatch_async).
+    lane: str = "main"
+    #: An aside turn reached for a motion tool and was handed to the main
+    #: lane; the main lane answers it, so the aside worker stays silent.
+    promoted: threading.Event = field(default_factory=threading.Event)
+    #: A NEWER order replaced this prompt's motion (Relay.supersede_motion):
+    #: the prompt still runs and answers, but starts no motion tool.
+    motion_superseded: threading.Event = field(default_factory=threading.Event)
     execution_gate: threading.RLock = field(default_factory=threading.RLock)
     #: monotonic stamp taken when the prompt was enqueued — the worker
     #: subtracts it to report queue wait separately from work time.
@@ -1325,6 +1334,37 @@ class OmniLinkRelay:
         self._closed = False
         self._worker = threading.Thread(target=self._run, daemon=True)
         self._worker.start()
+        # THE CONVERSATION LANE (2026-10-01). Every turn used to queue behind
+        # every other, so with a slow model -- measured on the dev loop's
+        # confirm round: median 11-16 s a request, p90 55 s, peaks over 100 s
+        # -- a shift's questions and remarks piled up behind each other and
+        # behind jobs, 18 messages were never answered on one shift, and
+        # competitors whose loops are not serial held 0.77-0.88 where OmniLink
+        # fell to 0.5-0.78. Messages that cannot move the robot (the bridge
+        # decides: lane="aside") now run on their own small pool; orders keep
+        # the single ordered main lane. An aside turn that reaches for a
+        # motion tool is handed to the main lane, never dropped.
+        # OMNILINK_ASIDE_WORKERS=0 puts everything back on the main lane.
+        try:
+            n_aside = max(0, int(os.environ.get("OMNILINK_ASIDE_WORKERS", "2")))
+        except ValueError:
+            n_aside = 2
+        self._aside_queue: Queue = Queue(maxsize=32)
+        self._aside_workers = [threading.Thread(target=self._run_aside, daemon=True,
+                                                name=f"omnilink-aside-{i}") for i in range(n_aside)]
+        for w in self._aside_workers:
+            w.start()
+        # HISTORY OWNERSHIP. With turns in parallel (the conversation lane),
+        # a turn used to see the other turns' messages mid-flight and answer
+        # them too: "I have recorded two arrivals at the tool crib ... and I
+        # have now lifted the forklift lane restriction" (dev loop 4, 2026-10-01,
+        # two questions, one reply). id(entry) -> id(handle) while that turn
+        # runs; other turns skip those entries. Released when the turn ends.
+        self._owned: Dict[int, int] = {}
+        #: Called on the worker thread at the start of every turn with the
+        #: operator's words, so per-turn state (who is speaking) belongs to
+        #: THAT turn even when turns overlap. The bridge sets it.
+        self.turn_hook: Optional[Callable[[str], None]] = None
 
         # PRESENCE. Without this a robot that is running looks identical, from
         # the platform's side, to one whose process died an hour ago: the
@@ -1929,13 +1969,26 @@ class OmniLinkRelay:
         self,
         text: str,
         on_event: Callable[[str, Dict[str, Any]], None],
+        lane: str = "main",
     ) -> DispatchHandle:
-        """Enqueue a prompt and return a cancellation handle."""
+        """Enqueue a prompt and return a cancellation handle.
+
+        lane="aside" is for a message the caller judged cannot move the robot
+        (a question, a remark, a fact): it runs on the conversation pool, in
+        parallel with the main lane and with other asides. Anything else, and
+        any aside when the pool is disabled, takes the ordered main lane."""
         handle = DispatchHandle()
         if self._closed:
             on_event("error", {"text": "relay is closed"})
             handle.cancel()
             return handle
+        if lane == "aside" and self._aside_workers:
+            handle.lane = "aside"
+            try:
+                self._aside_queue.put_nowait((text, on_event, handle))
+                return handle
+            except Full:
+                handle.lane = "main"            # the pool is saturated: queue in order
         try:
             self._queue.put_nowait((text, on_event, handle))
         except Full:
@@ -1946,6 +1999,38 @@ class OmniLinkRelay:
     def turn_active(self) -> bool:
         """True while a model turn is running (its robot may be between steps)."""
         return self._active is not None
+
+    #: Tools that move the robot. A superseded prompt may not start one.
+    MOTION_TOOLS = frozenset({
+        "drive_forward", "drive_to", "turn", "set_velocity", "go_to_place",
+        "reset_to_home", "resume_last_order", "resume_autonomy",
+        "attach_trolley", "detach_trolley", "walk", "move_body", "takeoff",
+        "land", "hover", "pick", "place_object"})
+
+    def supersede_motion(self) -> Dict[str, Any]:
+        """A NEW ORDER, not a stop: end the motion, keep the conversation.
+
+        cancel_inflight is an operator STOP and drops everything, queued
+        prompts included, each answered "you told me to stop". It was also
+        what a new order said mid-work triggered (route.interrupts_motion),
+        and on a shift that is the wrong thing: "Stations today: ..." was
+        cancelled half-way by the next job, the two floor rules queued
+        behind it were dropped unread, and the robot spent the shift not
+        knowing where the tool crib was (ops-bench shift v2, 2026-09-30).
+        Now the running and queued prompts still run and still answer --
+        facts are saved, rules are set, questions are answered -- but none
+        of them may START a motion: the newer order owns the robot."""
+        marked = 0
+        active = self._active
+        if active is not None and threading.current_thread() is not self._worker:
+            active.motion_superseded.set()
+            marked += 1
+        with self._queue.mutex:
+            for item in list(self._queue.queue):
+                if item is not None and item[0] is not None:
+                    item[2].motion_superseded.set()
+                    marked += 1
+        return {"superseded_prompts": marked}
 
     def cancel_inflight(self) -> Dict[str, Any]:
         """An operator HALT: cancel the running turn and every queued one.
@@ -1996,7 +2081,7 @@ class OmniLinkRelay:
     #: reports "parser" from `route.py`.
     VIA = "relay"
 
-    def dispatch_sync(self, text: str, timeout_s: float = 90.0) -> Dict[str, Any]:
+    def dispatch_sync(self, text: str, timeout_s: float = 90.0, lane: str = "main") -> Dict[str, Any]:
         """Run dispatch_async and wait for it to finish.
 
         Returns `{via, response, actions: [{tool, result, summary, rule?}],
@@ -2036,7 +2121,10 @@ class OmniLinkRelay:
             elif kind == "status" and payload.get("state") == "idle":
                 done.set()
 
-        handle = self.dispatch_async(text, _cb)
+        # `lane` only when it is not the default, so an override of
+        # dispatch_async written before lanes existed keeps working.
+        handle = (self.dispatch_async(text, _cb) if lane == "main"
+                  else self.dispatch_async(text, _cb, lane=lane))
         if not done.wait(timeout=timeout_s):
             in_flight = handle.cancel()
             return {
@@ -2138,6 +2226,11 @@ class OmniLinkRelay:
             self._queue.put_nowait((None, None, None))
         except Full:
             pass
+        for _ in getattr(self, "_aside_workers", ()):
+            try:
+                self._aside_queue.put_nowait((None, None, None))
+            except Full:
+                pass
         # Hand the machine's edge slot back immediately rather than making
         # the next bridge wait out the staleness window. (A hard kill skips
         # this, which is exactly what the staleness window is for.)
@@ -2147,6 +2240,77 @@ class OmniLinkRelay:
             pass
 
     # ── Worker loop ───────────────────────────────────────────────
+
+    def _hist_add(self, entry: Dict[str, Any], handle: "DispatchHandle") -> None:
+        """Append to history, owned by `handle` until its turn ends. Caller holds _lock."""
+        self.history.append(entry)
+        self._owned[id(entry)] = id(handle)
+
+    def _release_history(self, handle: "DispatchHandle", drop: bool = False) -> None:
+        """A turn ended: its entries become everyone's -- or, for an aside
+        handed to the main lane (drop=True), are removed: the main lane
+        writes the same message again, and a tool request with no result
+        must not be left in the window."""
+        mine = id(handle)
+        with self._lock:
+            if drop:
+                self.history = [m for m in self.history if self._owned.get(id(m)) != mine]
+            self._owned = {k: v for k, v in self._owned.items() if v != mine}
+
+    def note_parser_turn(self, text: str, reply: str, actions: Any = None) -> None:
+        """A turn the deterministic parser answered, written where the model
+        will see it: the conversation history and the action journal.
+
+        Since 2026-10-01 most jobs never reach the model (place requests,
+        facts, holds, stops). Unrecorded, the model then denied them: asked
+        "anything in your way on that paint shop run?" it said the way was
+        clear, though the parser's own reply had said "something was
+        blocking my path, so I went around it"; asked "how did the tool crib
+        run go?" it said its history showed no such run (dev loop 4)."""
+        with self._lock:
+            self.history.append({"role": "user", "content": str(text or "")})
+            self.history.append({"role": "assistant", "content": str(reply or "")})
+            if len(self.history) > 4 * HISTORY_LIMIT:
+                del self.history[: len(self.history) - 4 * HISTORY_LIMIT]
+        for a in actions or ():
+            if not isinstance(a, dict) or not a.get("tool"):
+                continue
+            try:
+                self.journal.record(str(a["tool"]), {}, ok=a.get("result") in ("ok", None),
+                                    summary=f"[parser] {a.get('summary') or ''}"[:200])
+            except Exception:                   # pragma: no cover - never blocks a reply
+                pass
+
+    def _run_aside(self) -> None:
+        """A conversation-lane worker: same turn, no claim on the robot."""
+        while True:
+            try:
+                item = self._aside_queue.get(timeout=1.0)
+            except Empty:
+                if self._closed:
+                    return
+                continue
+            if item is None or item[0] is None:
+                return
+            text, on_event, handle = item
+            try:
+                self._dispatch_one(text, on_event, handle)
+            except Exception as e:
+                traceback.print_exc()
+                try:
+                    on_event("error", {"text": f"{type(e).__name__}: {e}"})
+                except Exception:
+                    pass
+            finally:
+                self._release_history(handle, drop=handle.promoted.is_set())
+            if handle.promoted.is_set():
+                continue                        # the main lane answers it
+            if handle.is_cancelled():
+                try:
+                    on_event("agent", {"text": CANCELLED_REPLY})
+                    on_event("status", {"state": "idle"})
+                except Exception:
+                    pass
 
     def _run(self) -> None:
         while True:
@@ -2171,6 +2335,7 @@ class OmniLinkRelay:
                     pass
             finally:
                 self._active = None
+                self._release_history(handle)
             if handle.is_cancelled():
                 # _dispatch_one returns SILENTLY on cancellation, at any of
                 # its checkpoints, so its waiter used to sit out the whole
@@ -2196,15 +2361,24 @@ class OmniLinkRelay:
         queued_ms = (t_start - handle.enqueued_at) * 1000.0
         rounds: List[Dict[str, Any]] = []
         tool_ms_total = 0.0
+        hook = getattr(self, "turn_hook", None)
+        if hook is not None:
+            try:
+                hook(text)
+            except Exception:                   # pragma: no cover - bridge code
+                pass
         on_event("status", {"state": "thinking"})
 
         with self._lock:
-            self.history.append({"role": "user", "content": text})
+            self._hist_add({"role": "user", "content": text}, handle)
             # The window is the last HISTORY_LIMIT messages, minus the
             # tool scaffolding of all but the most recent few exchanges
             # (see TOOL_HISTORY_EXCHANGES for why, and for what that
-            # deliberately does NOT cost).
-            messages = prune_tool_scaffolding(list(self.history[-HISTORY_LIMIT:]))
+            # deliberately does NOT cost). Entries another turn is still
+            # writing are not this turn's to see.
+            mine = id(handle)
+            messages = prune_tool_scaffolding(
+                [m for m in self.history[-HISTORY_LIMIT:] if self._owned.get(id(m), mine) == mine])
             # self.history is the local transcript, not the wire payload;
             # bound it so a long-lived bridge doesn't grow without limit.
             if len(self.history) > 4 * HISTORY_LIMIT:
@@ -2239,7 +2413,7 @@ class OmniLinkRelay:
                 assistant_msg["tool_calls"] = tool_calls
             messages.append(assistant_msg)
             with self._lock:
-                self.history.append(assistant_msg)
+                self._hist_add(assistant_msg, handle)
 
             for tc in tool_calls:
                 tool_name = tc.get("name", "")
@@ -2303,6 +2477,34 @@ class OmniLinkRelay:
                             "name": tool_name,
                             "content": json.dumps(result, default=str)})
                         continue
+                    if handle.lane == "aside" and tool_name in self.MOTION_TOOLS:
+                        # This message was judged unable to move the robot,
+                        # and the model wants to. Not refused, not dropped:
+                        # the whole message goes to the ordered main lane.
+                        handle.promoted.set()
+                        try:
+                            self._queue.put_nowait((text, on_event, DispatchHandle()))
+                        except Full:
+                            handle.promoted.clear()
+                            on_event("error", {"text": "relay queue is full; try again"})
+                        return
+                    if (handle.motion_superseded.is_set()
+                            and tool_name in self.MOTION_TOOLS):
+                        result = {"accepted": False, "refused": "superseded",
+                                  "error": "a newer order replaced this motion",
+                                  "say": ("I didn't make that move: a newer order came "
+                                          "in while I was working on this, and it takes "
+                                          "priority.")}
+                        self.journal.record(tool_name, args, ok=False,
+                                            summary="refused: superseded by a newer order",
+                                            result=result)
+                        called_tools.append(tool_name)
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.get("id") or tool_name,
+                            "name": tool_name,
+                            "content": json.dumps(result, default=str)})
+                        continue
                     _t_tool = time.perf_counter()
                     with handle.execution_gate:
                         if handle.is_cancelled():
@@ -2354,7 +2556,7 @@ class OmniLinkRelay:
                 }
                 messages.append(tool_msg)
                 with self._lock:
-                    self.history.append(tool_msg)
+                    self._hist_add(tool_msg, handle)
 
         if handle.is_cancelled():
             return
@@ -2380,10 +2582,25 @@ class OmniLinkRelay:
             if regrounded is not None:
                 last_text = regrounded
 
+        # AN ARRIVAL NOBODY DROVE. Long-horizon dev shift, run 2 (2026-10-02):
+        # "Blood tubes to Ward 3, thanks." -> "Arrived at ward 3: I'm at (4.20,
+        # -4.40), 0.00 m from the target." with no tool call at all -- the
+        # model copied an earlier parser reply out of its history, and the
+        # robot sat where it was. Only for an ORDER (a question about an
+        # earlier trip may say "arrived"), and only when this turn ran no
+        # motion tool.
+        if (last_text and "?" not in (text or "")
+                and _ARRIVAL_CLAIM.search(last_text)
+                and not any(t in self.MOTION_TOOLS for t in called_tools)):
+            print(f"[omnilink_relay] {self.agent_name}: withdrew an arrival claim "
+                  f"no motion tool backed: {last_text[:120]!r}", flush=True)
+            last_text = ("I haven't moved for that yet: no drive was started on this turn, so I am "
+                         "still where I was. Tell me again and I'll go.")
+
         if last_text:
             on_event("agent", {"text": last_text})
             with self._lock:
-                self.history.append({"role": "assistant", "content": last_text})
+                self._hist_add({"role": "assistant", "content": last_text}, handle)
             # Optional TTS: synthesize the agent text and emit an
             # audio_out event so the chat panel can play it. Best-effort;
             # a failed TTS doesn't break the chat path.
@@ -2668,6 +2885,15 @@ class OmniLinkRelay:
         rid = uuid.uuid4().hex
         if TRACE_PATH:
             _trace({"kind": "round_start", "round_id": rid})
+        # TEST HATCH: OMNILINK_TEST_MODEL_DELAY_S adds that many seconds to
+        # every model round, so a slow provider can be reproduced on demand
+        # (dev loop, 2026-10-01). Never set it in a real deployment.
+        try:
+            _delay = float(os.environ.get("OMNILINK_TEST_MODEL_DELAY_S") or 0.0)
+        except ValueError:
+            _delay = 0.0
+        if _delay > 0:
+            time.sleep(min(_delay, 120.0))
         data = self._post_chat_once(messages)
         if TRACE_PATH:
             _trace({"kind": "round", "round_id": rid,
@@ -2940,6 +3166,12 @@ def _to_memory_format(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 # invented: "how many carts have you parked", "anything I should be worried
 # about?" (asked while HELD and answered "everything looks normal"), "what is
 # your current job?" (answered with the wrong leg), "how far did you get".
+# A reply that says a drive has happened (see the arrival check in the turn).
+_ARRIVAL_CLAIM = re.compile(
+    r"^\s*(?:arrived at\b|i(?:'ve| have) (?:now )?(?:arrived|reached|delivered|driven|made it)\b|"
+    r"i(?:'m| am) (?:now )?(?:at|in) the\b.{0,40}\b(?:target|destination)\b)", re.IGNORECASE)
+
+
 _STATE_Q = re.compile(
     r"\b("
     r"how many|how much|how far|how long|how fast|"

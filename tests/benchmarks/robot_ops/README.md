@@ -78,3 +78,34 @@ grader do not remove that model/runtime difference. Conditions, the narrowly
 scoped transport amendment and retained attempts are documented in
 [shift/CODEX_EXTENSION.md](shift/CODEX_EXTENSION.md). See the
 [measured report](evidence/CODEX_SHIFT_V1_RESULTS.md) for results and evidence.
+
+## Native Claude Code comparison
+
+The `claude_full` arm is the Codex arm's counterpart. A signed-in, headless
+Claude Code process (stream-JSON) owns the conversation and tool loop. The
+robot tools reach it through a standard-library stdio MCP server
+(`omnisim/ops_bench/claude_mcp_stdio.py`) that forwards each call to the
+adapter, which applies the same gate, operator words, emergency stop,
+interruption classifier and cancellation as `codex_full`. Every built-in tool,
+setting source, skill, slash command and other MCP server is disabled. An
+episode is an infrastructure ERROR unless the session reports exactly the
+bridge tools, no memory files and no discoverable CLAUDE.md or AGENTS.md.
+
+```powershell
+python -m omnisim ops-bench run `
+  --suite tests/benchmarks/robot_ops/suites/shift_holdout_v1.json `
+  --arms claude_full --claude-model claude-opus-5-5 --claude-effort high `
+  --claude-binary <claude.exe 2.1.280 or newer> `
+  --claude-workspace C:/benchmark-workspaces/claude-new-run `
+  --repeat-base 0 --max-requests 1000 `
+  --out tests/benchmarks/robot_ops/evidence/claude-new-run `
+  --key-file <omnikey-file>
+```
+
+Opus 5.5 needs Claude Code 2.1.280 or newer; `--claude-binary` defaults to
+`claude` on PATH. Billed cost is unavailable, not zero, and the runner rejects
+rate assumptions for this arm. For tokens, use the final `result` event's
+`modelUsage` in `claude-events.jsonl`: the adapter's `claude_usage.tokens`
+reads partial stream snapshots and undercounts output. Conditions are in
+[shift/CLAUDE_EXTENSION.md](shift/CLAUDE_EXTENSION.md); results and evidence
+are in the [measured report](evidence/CLAUDE_SHIFT_V1_RESULTS.md).

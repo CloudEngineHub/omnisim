@@ -63,6 +63,9 @@ Conversational-control worlds, one per robot (see [OMNILINK_CHAT_DEMOS.md](chat/
 | [husky_rocks_traverse.omniworld](showcase/husky_rocks_traverse.omniworld) | Husky traversing a rock-strewn hill (terrain-nav controller). |
 | [jackal_drive.omniworld](showcase/jackal_drive.omniworld) | Jackal URDF drive demo. |
 | [turtlebot3_drive.omniworld](showcase/turtlebot3_drive.omniworld) | TurtleBot3 trio (URDF import). |
+| [tb3_lidar_walls.omniworld](showcase/tb3_lidar_walls.omniworld) | TurtleBot3 LDS-01 lidar against walls at known distances (needs `OMNISIM_URDF_USE_SENSORS=1`). |
+| [jackal_lidar_walls.omniworld](showcase/jackal_lidar_walls.omniworld) | Jackal front SICK LMS1xx lidar against walls at known distances (needs `OMNISIM_URDF_USE_SENSORS=1`). |
+| [husky_lidar_walls.omniworld](showcase/husky_lidar_walls.omniworld) | Husky SICK LMS111 lidar against walls at known distances (needs `OMNISIM_URDF_USE_SENSORS=1`). |
 | [warehouse_husky.omniworld](showcase/warehouse_husky.omniworld) | Warehouse Husky. |
 
 ## Environments (`environments/`)

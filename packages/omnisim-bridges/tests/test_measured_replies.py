@@ -104,7 +104,8 @@ def test_the_mobile_bridge_opts_in_and_lets_questions_past_its_lock():
     assert "    replies_after_motion = True" in src
     post = src[src.index("        def do_POST(self):"):]
     post = post[:post.index("            except RequestError as e:")]
-    assert "aside = True" in post and "or halt or aside):" in post
+    # `takes_over` (2026-10-01) joined the same bypass for a superseding parsed order.
+    assert "aside = True" in post and "or halt or aside or takes_over):" in post
     assert post.index("aside = True") < post.index("with action_lock")
 
 

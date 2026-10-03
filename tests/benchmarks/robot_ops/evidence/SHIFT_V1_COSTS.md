@@ -9,7 +9,7 @@ Codex wave are retained as separate overhead. Development pilots are excluded.
 OmniLink: **$0.9033 per scored shift**, the lowest among the original seven
 configurations. Its estimated cost was **32–59% below** those six comparisons,
 using the same Gemini 3.5 Flash model. **Codex's actual cost is unavailable and it
-is excluded from the cost ranking.** Its later GPT-6.1 Sol high-reasoning run
+is excluded from the cost ranking, as is Claude Code's.** Its later GPT-6.1 Sol high-reasoning run
 supports a **conditional recorded-token pricing scenario of $0.9126 per shift**,
 assuming Standard API rates and the native counters' recorded cache categories.
 This establishes neither a cost tie nor an advantage over Codex.
@@ -31,6 +31,16 @@ usage counters are best-effort; interrupted calls may lack final usage. Codex an
 the original seven used different models, builds and concurrency; this is a
 retrospective system comparison. These configurations do not establish a universal
 cheapest-agent claim.
+
+Claude Code's native cumulative `modelUsage` reports API list-price estimates
+of $1.221749, $1.262099 and $1.240484 for its three scored shifts: $3.724332
+total, averaging $1.241444. These are the CLI's own estimates, not a separate
+rate-card recalculation or a subscription invoice, and are **unranked**.
+Its frozen adapter's partial output snapshots undercount output; reporting uses
+the final native cumulative counters instead. The three Claude attempts had no
+infrastructure error or rerun. Its development pilot is excluded. See the
+[Claude report](CLAUDE_SHIFT_V1_RESULTS.md) and
+[published evidence](https://www.omnilink-agents.com/benchmarks/operations-shift/index.html#claude-extension).
 
 Original rates per million tokens: Gemini 3.5 Flash input $1.50, cached input
 $0.15, output including thinking $9.00. For Codex we checked the exact
@@ -88,7 +98,8 @@ machine fingerprint `9722d23d12a3`. Simulation only.
 
 ## Recompute offline
 
-Download `evidence.zip`, `codex-evidence.zip`, `results.json`, `codex-results.json`
+Download `evidence.zip`, `codex-evidence.zip`, `claude-evidence.zip`, `results.json`,
+`codex-results.json`, `claude-results.json`
 and `cost-estimates.json` from the [cost section](https://www.omnilink-agents.com/benchmarks/operations-shift/index.html#cost),
 put them in one folder, and run the standard-library-only calculator:
 
@@ -96,8 +107,10 @@ put them in one folder, and run the standard-library-only calculator:
 python -I -S tests/benchmarks/robot_ops/publish/cost_estimates.py <folder> --check
 ```
 
-The calculator reads all 34 archived attempts, validates the published records,
+The calculator reads all 37 archived attempts, validates the published records,
 checks Codex cumulative counters against both raw events and the score report,
 checks the observed context threshold, and recomputes the cost graph and overhead
-ledger. No network, simulator or paid call is needed. Per-attempt usage and archive
+ledger. It also checks Claude's final native cumulative usage and CLI list-price
+estimates against the published report, without ranking its unavailable actual cost.
+No network, simulator or paid call is needed. Per-attempt usage and archive
 hashes are in [SHIFT_V1_COSTS.json](SHIFT_V1_COSTS.json).

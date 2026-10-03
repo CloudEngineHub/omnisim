@@ -67,7 +67,7 @@ Sensors, `cmd_vel`, joint commands and odometry therefore go to the bridge.
 
 | Topic | Type | Node | Source |
 |---|---|---|---|
-| `/clock` | `rosgraph_msgs/Clock` | `clock_node` | `GET /sim/state` → `sim_time_ms` |
+| `/clock` | `rosgraph_msgs/Clock` | `clock_node` | bridge `POST /get_robot_state` → `sim_time` when `bridge:=true` (the robot controller's clock, the one sensor stamps use); else `GET /sim/state` → `engine_time_ms` (coarse: sampled only when the harness supervisor steps). Never `sim_time_ms`, the supervisor's loop counter — see below |
 | `/tf`, `/tf_static` | `tf2_msgs/TFMessage` | `robot_state_node` | `GET /scene/tree` |
 | `<robot>/joint_states` | `sensor_msgs/JointState` | `robot_state_node` | `GET /robot/<def>/joints` |
 | `/odom` | `nav_msgs/Odometry` | `odom_node` | bridge `POST /get_robot_state` |

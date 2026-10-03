@@ -194,6 +194,26 @@ def sim_time_ms_to_ros(sim_time_ms: float) -> tuple[int, int]:
     return int(sec), int(nanosec)
 
 
+def simulated_time_ms(state_body: dict) -> tuple[float | None, str]:
+    """The simulated time to publish on ``/clock`` and stamp with, from ``/sim/state``.
+
+    Returns ``(ms, field)``. Prefers ``engine_time_ms``, the engine's own clock --
+    the clock every robot controller reads with ``getTime()``, so it is what the
+    bridge's sensor stamps are in. ``sim_time_ms`` is the injected supervisor's
+    per-iteration counter, a different ruler: measured 2026-10-02 on the Husky
+    under ``--engine-mode realtime``, it advanced 23 s while ``engine_time_ms``
+    advanced 281 s, so a ``/clock`` built on it throttled every
+    ``use_sim_time:=true`` node to ~0.1 Hz and sat >100 s behind the sensor
+    stamps. Falls back to ``sim_time_ms`` only when the harness predates
+    ``engine_time_ms`` (the returned ``field`` says so).
+    """
+    ms = state_body.get("engine_time_ms")
+    if ms is not None:
+        return float(ms), "engine_time_ms"
+    ms = state_body.get("sim_time_ms")
+    return (None if ms is None else float(ms)), "sim_time_ms"
+
+
 def relative_transform(
     parent_position: Sequence[float],
     parent_matrix: Sequence[float],
@@ -306,6 +326,30 @@ def lidar_layer_ranges(
     if reverse:
         out.reverse()
     return out
+
+
+def scan_angles(fov: float, n: int, reverse: bool = True) -> tuple[float, float, float]:
+    """``(angle_min, angle_max, angle_increment)`` for an ``n``-beam scan over ``fov``.
+
+    The engine fires beam ``i`` at the CENTRE of its bin,
+    ``fov/2 - (i + 0.5) * fov / n`` (``OmLidar::updatePointCloud``), so the
+    step is ``fov / n`` and the end beams sit half a bin inside the FOV edges.
+    Spreading ``n`` beams edge-to-edge (``fov / (n - 1)``) misplaces them by up
+    to half a bin, and on a 360-degree scanner makes the first and last beam
+    claim the same direction. Measured 2026-10-02 through ROS 2 on the
+    TurtleBot3 LDS-01: the edge-to-edge angles put one wall-edge beam on the
+    wrong side of a box corner; the bin-centre angles do not.
+
+    With ``reverse`` (the node's default ordering) ``angle_min`` is the
+    rightmost beam and angles increase counter-clockwise, as ROS expects.
+    """
+    n = max(int(n), 1)
+    inc = fov / n
+    first = -fov / 2.0 + inc / 2.0
+    last = fov / 2.0 - inc / 2.0
+    if reverse:
+        return first, last, inc
+    return last, first, -inc
 
 
 def finite_triplet(value: Any) -> list[float] | None:

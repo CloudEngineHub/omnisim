@@ -367,4 +367,75 @@
        jackal.urdf.xacro. If a robot is being customized and requires
        additional URDF, set the JACKAL_URDF_EXTRAS environment variable
        to the full path of the file you would like included. -->
+
+  <!-- Primary 2D lidar: the SICK LMS1xx on the FRONT mount, upright bracket
+       (added 2026-09-30). This is upstream Clearpath's DEFAULT laser
+       accessory; jackal_description/urdf/accessories.urdf.xacro with
+       JACKAL_LASER=1 selects JACKAL_LASER_MODEL lms1xx, JACKAL_LASER_MOUNT
+       front, JACKAL_LASER_MOUNT_TYPE upright, topic front/scan; expanded by
+       hand here because the accessories xacro was never imported (see
+       ../../PROVENANCE.md section 4). Link and joint names and offsets are from
+       accessories/sick_lms1xx_upright_mount.urdf.xacro: the bracket sits on
+       front_mount at JACKAL_LASER_OFFSET 0 0 0, and front_laser_joint puts
+       the laser's focal point 0.149 m above the bracket base. The sensor
+       values are the defaults of Clearpath's lms1xx package macro
+       (LMS1xx/urdf/sick_lms1xx.urdf.xacro): 720 samples over +-2.35619 rad
+       (270 deg), range 0.1-30.0 m, update_rate 50, gaussian noise stddev
+       0.001. These are the Gazebo-parity values a lab gets from JACKAL_LASER=1,
+       not a datasheet transcription (the LMS111 datasheet quotes 0.5 deg
+       resolution and a 20 m range). No model of the SICK scanner body is
+       included: SICK owns that design, and Clearpath's grant does not reach it.
+       The OmniSim URDF importer turns the <sensor> into a Lidar device ONLY
+       when the world is loaded with OMNISIM_URDF_USE_SENSORS=1; it does not
+       read <noise>, so the simulated scan is noise-free. -->
+  <link name="front_laser_mount">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <!-- Origin of this mesh is the base of the bracket. -->
+        <mesh filename="package://jackal_description/meshes/sick-lms1xx-upright-bracket.stl"/>
+      </geometry>
+      <material name="dark_grey"/>
+    </visual>
+  </link>
+  <joint name="front_laser_mount_joint" type="fixed">
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <parent link="front_mount"/>
+    <child link="front_laser_mount"/>
+  </joint>
+  <link name="front_laser"/>
+  <joint name="front_laser_joint" type="fixed">
+    <!-- This offset is from the base of the bracket to the LIDAR's focal point. -->
+    <origin xyz="0 0 0.149" rpy="0 0 0"/>
+    <parent link="front_laser_mount"/>
+    <child link="front_laser"/>
+  </joint>
+  <gazebo reference="front_laser">
+    <sensor type="ray" name="front_laser">
+      <update_rate>50</update_rate>
+      <ray>
+        <scan>
+          <horizontal>
+            <samples>720</samples>
+            <resolution>1</resolution>
+            <min_angle>-2.35619</min_angle>
+            <max_angle>2.35619</max_angle>
+          </horizontal>
+        </scan>
+        <range>
+          <min>0.1</min>
+          <max>30.0</max>
+          <resolution>0.01</resolution>
+        </range>
+        <noise>
+          <type>gaussian</type>
+          <mean>0.0</mean>
+          <stddev>0.001</stddev>
+        </noise>
+      </ray>
+    </sensor>
+  </gazebo>
+  <gazebo reference="front_laser_mount">
+    <material>Gazebo/DarkGrey</material>
+  </gazebo>
 </robot>

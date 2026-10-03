@@ -11,9 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Recompute a cost addendum from the two immutable public evidence archives.
+"""Recompute a cost addendum from the three public evidence archives.
 
-python -I -S cost_estimates.py <folder containing evidence.zip and codex-evidence.zip>
+python -I -S cost_estimates.py <folder containing all three archives and result JSONs>
 python -I -S cost_estimates.py <folder> --check
 
 The graph ranks the original seven API-backed systems' three scored shifts,
@@ -48,9 +48,11 @@ def estimate(tokens):
 
 def calculate(folder):
     folder = Path(folder)
-    archives = {name: (folder / name).read_bytes() for name in ("evidence.zip", "codex-evidence.zip")}
+    archives = {name: (folder / name).read_bytes() for name in
+                ("evidence.zip", "codex-evidence.zip", "claude-evidence.zip")}
     original = json.loads((folder / "results.json").read_text(encoding="utf-8"))
     codex = json.loads((folder / "codex-results.json").read_text(encoding="utf-8"))
+    claude = json.loads((folder / "claude-results.json").read_text(encoding="utf-8"))
     if original["suite_sha256"] != codex["suite_sha256"] or original["repeats"] != 3 or codex["repeats"] != 3:
         raise ValueError("Unexpected suite or repeat count")
     if codex["model"] != "gpt-6.1-sol" or codex["usd_estimated"] is not None:
@@ -118,10 +120,39 @@ def calculate(folder):
                            "comparable_cost": False,
                            "dollar_basis": "Conditional recorded-token Standard API pricing scenario; excluded from cost ranking; actual signed-in cost unavailable",
                            "billed_usd": None}
+    if (claude["suite_sha256"] != original["suite_sha256"] or claude["repeats"] != 3
+            or claude["model"] != "claude-opus-5-5" or claude["usd_estimated"] is not None
+            or claude["initial_attempts"]):
+        raise ValueError("Unexpected Claude protocol or billing record")
+    claude_attempts = []
+    with zipfile.ZipFile(folder / "claude-evidence.zip") as z:
+        if json.loads(z.read("claude-results.json")) != claude:
+            raise ValueError("Claude results differ from archived evidence")
+        for ep, run in zip(claude["episodes"], claude["run_dirs"]):
+            prefix = "tests/benchmarks/robot_ops/evidence/" + run
+            row = json.loads(z.read(prefix + "/rows.jsonl"))
+            events = [json.loads(line) for line in z.read(prefix + "/episodes/" +
+                      row["episode_dir"] + "/claude-events.jsonl").decode().splitlines() if line]
+            final = [event for event in events if event.get("type") == "result"][-1]
+            usage = final["modelUsage"][claude["model"]]
+            tokens = {key: usage[key] for key in ep["tokens_cli_reported"]}
+            if (tokens != ep["tokens_cli_reported"] or usage["costUSD"] != ep["cli_list_price_estimate_usd"]
+                    or row["repeat"] != ep["repeat"] or row["outcome"] == "ERROR"):
+                raise ValueError("Claude native cumulative usage mismatch")
+            claude_attempts.append({"run": run, "primary": True, "outcome": row["outcome"],
+                                   "tokens_cli_reported": tokens, "elapsed_s": row["elapsed_s"],
+                                   "cli_list_price_estimate_usd": usage["costUSD"], "billed_usd": None})
+    cli_total = sum(attempt["cli_list_price_estimate_usd"] for attempt in claude_attempts)
+    arms["claude_full"] = {"model": claude["model"], "scored_shifts": 3, "attempts": 3,
+                          "scored_usd": None, "usd_per_scored_shift": None, "overhead_usd": None,
+                          "all_attempts_usd": None, "comparable_cost": False, "billed_usd": None,
+                          "cli_list_price_estimate_usd": cli_total,
+                          "cli_list_price_estimate_per_shift_usd": cli_total / 3,
+                          "dollar_basis": "Claude Code's own API list-price estimate, not a bill; actual signed-in cost unavailable; excluded from ranking"}
     return {"benchmark": "Warehouse shift v1 — cost addendum", "date": "2026-09-30",
             "suite_sha256": original["suite_sha256"],
             "metric": "Mean estimated model USD for the three primary scored shifts; includes failed checks; overhead reported separately",
-            "excluded_costs": ["OmniLink subscription", "Codex subscription or credits", "hosting", "local compute", "tax"],
+            "excluded_costs": ["OmniLink subscription", "Codex subscription or credits", "Claude subscription", "hosting", "local compute", "tax"],
             "codex_estimate_conditions": {"model": "gpt-6.1-sol", "reasoning_effort": "high",
                 "service_tier_assumption": "Standard API, no Fast/Ultrafast or regional premium",
                 "rates_usd_per_million": RATES, "pricing_checked": "2026-09-30",
@@ -133,8 +164,9 @@ def calculate(folder):
                             "https://learn.chatgpt.com/docs/pricing"]},
             "original_rates_usd_per_million": {"input": 1.5, "cached_input": 0.15, "output_including_thinking": 9.0},
             "source_archive_sha256": {name: sha(data) for name, data in archives.items()},
-            "arms": arms, "codex_attempts": codex_attempts,
-            "limits": "Retrospective cost analysis. Only the original seven metered API configurations are ranked. Codex's actual cost is unavailable; its conditional recorded-token pricing scenario does not establish a cost tie or advantage. Same workload, different models for Codex and original seven; later Codex build and concurrency differ. Superseded Codex wave and original error episodes are retained as overhead. Development pilots and this coding chat's work are excluded for all systems."}
+            "arms": arms, "codex_attempts": codex_attempts, "claude_attempts": claude_attempts,
+            "claude_usage_conditions": "Signed-in Claude subscription; billed cost unavailable. Report the final native modelUsage cumulative totals, not the frozen adapter's partial output snapshots or sums of repeated results. CLI costUSD is Claude Code's own list-price estimate, not an invoice or a comparable metered API charge. No separate API-rate recalculation was made. Development pilot excluded.",
+            "limits": "Retrospective cost analysis. Only the original seven metered API configurations are ranked. Codex and Claude Code actual costs are unavailable; neither native account is cost-ranked. The conditional Codex token-pricing scenario and Claude CLI list-price estimate do not establish a cost tie or advantage. Same workload, different models and timing conditions; later builds and concurrency differ from the original study. Superseded Codex wave and original error episodes are retained as overhead. Development pilots and this coding chat's work are excluded for all systems."}
 
 
 if __name__ == "__main__":
@@ -144,8 +176,11 @@ if __name__ == "__main__":
     if "--check" in sys.argv:
         if json.loads(path.read_text(encoding="utf-8")) != result:
             raise SystemExit("Cost addendum differs from archived evidence")
-        print("VERIFIED: costs, all 34 attempts, Codex tokens, cache categories and pricing threshold")
+        print("VERIFIED: all 37 attempts; seven ranked API configurations; unranked Codex and Claude native accounting")
     else:
         path.write_bytes((json.dumps(result, indent=2) + "\n").encode())
-    for key, value in sorted(result["arms"].items(), key=lambda pair: pair[1]["usd_per_scored_shift"]):
-        print(f"{key}: ${value['usd_per_scored_shift']:.4f}/scored shift; ${value['all_attempts_usd']:.4f} all attempts")
+    for key, value in result["arms"].items():
+        if value["comparable_cost"]:
+            print(f"{key}: ${value['usd_per_scored_shift']:.4f}/scored shift; ${value['all_attempts_usd']:.4f} all attempts")
+        else:
+            print(f"{key}: unranked; actual cost unavailable ({value['dollar_basis']})")

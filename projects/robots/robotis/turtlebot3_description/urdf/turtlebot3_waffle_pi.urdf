@@ -212,10 +212,27 @@
          envelope, so the visual and the collider now coincide. Nothing else in
          this link changed: the <collision> block, the parent scan_joint origin
          and the <inertial> are untouched. -->
+    <!-- 2026-09-30: the single shell above ENCLOSED this link's origin, which
+         is the LDS-01's focal point, and OmniSim's Lidar is render-based: from
+         inside, every ray hit the shell at 0.04-0.07 m, below the 0.12 m
+         min range, so all 360 beams read "no return" (measured with
+         OMNISIM_URDF_USE_SENSORS=1 on tb3_lidar_walls.omniworld: 0 of 1440
+         finite values; with the visual removed the walls read within 1 mm).
+         The same envelope is now drawn as two pieces with an 8 mm open band
+         (z -0.004 .. +0.004) around the scan plane, the way the real sensor's
+         window sits between its base and its turret top. Outer envelope,
+         radius and the <collision> below are unchanged. -->
     <visual>
-      <origin xyz="0.015 0 -0.0065" rpy="0 0 0"/>
+      <origin xyz="0.015 0 -0.013125" rpy="0 0 0"/>
       <geometry>
-        <cylinder length="0.0315" radius="0.055"/>
+        <cylinder length="0.01825" radius="0.055"/>
+      </geometry>
+      <material name="dark"/>
+    </visual>
+    <visual>
+      <origin xyz="0.015 0 0.006625" rpy="0 0 0"/>
+      <geometry>
+        <cylinder length="0.00525" radius="0.055"/>
       </geometry>
       <material name="dark"/>
     </visual>
@@ -264,5 +281,41 @@
     <child link="${namespace}camera_rgb_optical_frame"/>
   </joint>
   <link name="${namespace}camera_rgb_optical_frame"/>
+
+  <!-- LDS-01 360-degree planar lidar on base_scan (added 2026-09-30).
+       Values copied from ROBOTIS upstream turtlebot3_simulations,
+       turtlebot3_gazebo/models/turtlebot3_{burger,waffle,waffle_pi}/model.sdf,
+       sensor "hls_lfcd_lds": 360 samples, min_angle 0, max_angle 6.28,
+       range 0.12-3.5 m (resolution 0.015), update_rate 5, gaussian noise
+       stddev 0.01. The OmniSim URDF importer turns this block into a Lidar
+       device ONLY when the world is loaded with OMNISIM_URDF_USE_SENSORS=1.
+       It reads samples, the FOV (max_angle - min_angle) and range min/max;
+       it does NOT read <noise> or range <resolution>, so the simulated scan
+       is noise-free. See ../PROVENANCE.md section "LDS-01 sensor block". -->
+  <gazebo reference="${namespace}base_scan">
+    <sensor type="ray" name="lds_lfcd_sensor">
+      <update_rate>5</update_rate>
+      <ray>
+        <scan>
+          <horizontal>
+            <samples>360</samples>
+            <resolution>1</resolution>
+            <min_angle>0.0</min_angle>
+            <max_angle>6.28</max_angle>
+          </horizontal>
+        </scan>
+        <range>
+          <min>0.120</min>
+          <max>3.5</max>
+          <resolution>0.015</resolution>
+        </range>
+        <noise>
+          <type>gaussian</type>
+          <mean>0.0</mean>
+          <stddev>0.01</stddev>
+        </noise>
+      </ray>
+    </sensor>
+  </gazebo>
 
 </robot>

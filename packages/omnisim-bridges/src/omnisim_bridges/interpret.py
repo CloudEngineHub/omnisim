@@ -1862,8 +1862,86 @@ def interpret(text: str, surface: str = MOBILE) -> Interpretation:
             f"parse to conversation/no-frames, which reads as a parser "
             f"that understood nothing. Did you mean {str(surface).lower()!r}?")
     result = _interpret(text, surface)
+    if not result.executable or result.confidence < _SURE:
+        better = _salvage(text, surface)
+        if better is not None and better.confidence > result.confidence:
+            result = better
     result.text = text or ""
     return result
+
+
+# A leading ADDRESS -- "Cart, ...", "Hey robot, ...", "Whoa, ..." -- names who
+# is spoken to, not what is asked. The parser used to score the address as
+# unexplained words, so "Cart, stop! Stop right there." explained 44% of its
+# clause, went to a model, and the stop reached the robot 32 s later while it
+# drove on (ops-bench shift v2, 2026-09-30, unsafe). At most two words before
+# the comma, and never a condition ("If you see her, stop" is a rule, not a
+# stop): the address is only stripped when what follows is itself a command.
+_ADDRESS = re.compile(
+    r"^\s*(?:(?:hey|hi|oi|whoa|woah|wait|okay|ok|right|alright|listen|look|no|please)"
+    r"\s*[,!]?\s+)?(?P<who>[A-Za-z][\w'\-]{0,24}(?:\s+[A-Za-z][\w'\-]{0,24})?)\s*,\s*"
+    r"(?P<rest>\S.*)$", re.DOTALL)
+_NOT_AN_ADDRESS = re.compile(
+    r"^(?:if|when|whenever|unless|once|after|before|while|until|as|since|then|and|but|"
+    r"so|or|i|you|we|they|it|he|she|this|that|there|here|first|next|finally|also)\b",
+    re.IGNORECASE)
+# The confidence a bridge needs before it acts on a parse without a model
+# (route._MIN_CONFIDENCE). Below it, a second reading is worth trying.
+_SURE = 0.8
+# The robot told to stay where it is NOW (see the pure-hold guard in _interpret).
+_HOLD_POSITION = re.compile(
+    r"\b(?:hold (?:where you are|it(?: right)? there|right there|there|your position|position|still|on)|"
+    r"stay (?:put|where you are|right there|there|here)|don'?t move|do not move|stop and stay|freeze|"
+    r"wait (?:right )?(?:here|there|where you are))\b", re.IGNORECASE)
+# A rule that applies whenever something happens is not an order now.
+_STANDING_RULE = re.compile(r"^\s*(?:and\s+|also\s+)?(?:whenever|every time|each time|any time|anytime)\b",
+                            re.IGNORECASE)
+_SENTENCE_END = re.compile(r"(?<=[.!?;])\s+")
+
+
+def _salvage(text: str, surface: str) -> Optional[Interpretation]:
+    """A second reading for an utterance the plain parse did not execute.
+
+    Only ever UPGRADES a declined parse to a command, so no sentence that
+    parses today reads differently. Two cases, both measured failures:
+
+    - an address in front of an order ("Cart, stop!", "Husky, drive forward
+      one metre") -- parse the order without it;
+    - an order repeated as several sentences ("Stop! Stop right there.") --
+      each sentence is a stop, so the whole is one stop. Only stops are
+      merged: two different motions in two sentences stay with the ordinary
+      path, which knows how to sequence them.
+    """
+    body = _strip_speaker(text).strip()
+    if not body:
+        return None
+
+    def address_stripped(sentence: str) -> Optional[Interpretation]:
+        m = _ADDRESS.match(sentence)
+        if not m or _NOT_AN_ADDRESS.match(m.group("who")):
+            return None
+        r = _interpret(m.group("rest"), surface)
+        return r if r.executable and r.confidence >= _SURE else None
+
+    one = address_stripped(body)
+    if one is not None:
+        return one
+
+    sentences = [x for x in _SENTENCE_END.split(body) if x.strip(" .!?;")]
+    if len(sentences) < 2:
+        return None
+    reads = []
+    for sentence in sentences:
+        r = _interpret(sentence, surface)
+        if not r.executable or r.confidence < _SURE:
+            r = address_stripped(sentence) or (r if r.executable else None)
+        if r is None or not all(f.tool == "stop" for f in r.frames):
+            return None
+        reads.append(r)
+    first = reads[0]
+    return Interpretation(COMMAND, frames=first.frames[:1], tier=first.tier,
+                          confidence=min(x.confidence for x in reads),
+                          reason="a stop, said more than once")
 
 
 # A radio-style "Dana: ..." / "Sam (packing): ..." prefix names the speaker.
@@ -1871,6 +1949,20 @@ def interpret(text: str, surface: str = MOBILE) -> Interpretation:
 # to what was said: the parser reads the words after it. Without this every
 # prefixed order went to the model (ops-bench dev_zone_route_husky).
 _SPEAKER_PREFIX = re.compile(r"^\s*[A-Z][A-Za-z'\-]{0,30}\s*(?:\([^)]{0,40}\))?\s*:\s+")
+
+
+# "When you get a sec" is politeness meaning SOON, not a condition to wait
+# for. Read as a trigger it made "Back to the press line when you get a sec"
+# an order waiting on an event that never comes: the gate refused the drive
+# as deferred and the turn timed out with no reply (ops-bench shift v2,
+# 2026-09-30). Only idioms about the ROBOT'S OWN availability are removed; a
+# condition about the world ("when the forklift has gone") is untouched.
+_SOON = re.compile(
+    r"[,;]?\s*\b(?:when(?:ever)? you(?:'ve| have)? got a|when(?:ever)? you (?:get|have) a|"
+    r"if you (?:get|have) a)\s+(?:sec|second|moment|minute|min|chance|mo)\b"
+    r"|[,;]?\s*\b(?:when(?:ever)? you(?:'re| are) (?:free|ready|done there)|"
+    r"when(?:ever)? you can)\b",
+    re.IGNORECASE)
 
 
 def _strip_speaker(text: str) -> str:
@@ -1884,7 +1976,8 @@ def _interpret(text: str, surface: str = MOBILE,
     `spatial=False` skips the spatial-rule guard: _spatial_rule parses the
     OTHER clauses of a rule sentence through here, and must not re-enter
     itself on a clause it has already declined."""
-    raw = _normalise(_strip_speaker(text))
+    raw = _SOON.sub(" ", _normalise(_strip_speaker(text)))
+    raw = re.sub(r"\s+([.,!?;])", r"\1", re.sub(r"\s+", " ", raw)).strip(" ,")
     if not raw:
         return Interpretation(EMPTY, reason="nothing was said")
 
@@ -2203,6 +2296,15 @@ def _interpret(text: str, surface: str = MOBILE,
                               reason="an action with a trigger", confidence=0.8,
                               residue=residue_text)
 
+    if hold and not frames and (not _HOLD_POSITION.search(raw) or _STANDING_RULE.match(raw)):
+        # "Whenever you're at Ward 3, wait fifteen seconds before you head
+        # off ... That stands until I say otherwise." is a STANDING RULE: its
+        # "until I say otherwise" belongs to the rule. Read as a hold, it held
+        # the robot for 11 minutes and refused other people's orders (long-
+        # horizon dev shift, 2026-10-01). With nothing else to do, a hold is
+        # only taken when the sentence tells the robot to STAY PUT now.
+        return Interpretation(CONVERSATION, confidence=0.3, residue=raw,
+                              reason="a standing rule, not an order to hold position now")
     if hold:
         # The whole point of recognising this: act now AND disable the 60 s
         # auto-resume, which is the behaviour that used to walk a "paused"

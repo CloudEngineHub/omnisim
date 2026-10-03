@@ -132,6 +132,14 @@ def run_episode(task, arm_name, session, out_dir, model_cfg=None):
                 elif f["op"] == "shove":
                     res = session.shove(float(f.get("dx", 0)), float(f.get("dy", 0)))
                     notes.append({"step": step["id"], "shove": res.get("position")})
+                elif f["op"] == "restart":
+                    # The robot's software restarts. Every arm loses what it
+                    # keeps only in memory and keeps what it persists: the
+                    # agent is told, exactly as a process restart would.
+                    down = session.restart_robot()
+                    if hasattr(agent, "on_restart"):
+                        agent.on_restart()
+                    notes.append({"step": step["id"], "restart": {"down_s": down, "t": clock()}})
             elif "observe" in step:
                 time.sleep(float(step["observe"]))
         # Drain: every message answered (or timed out), robot at rest, then
@@ -241,6 +249,18 @@ def run_task(task, arm, key, directory, model_cfg=None):
                     "model_requests": sum(r.get("model_requests", 0) for r in cfg["records"]),
                     "tokens": usage, "cost_usd": None,
                     "billing": "signed-in Codex account; billed cost unavailable"}
+            if arm == "claude_full":
+                usage = next((r["usage_total"] for r in reversed(cfg["records"])
+                              if r.get("usage_total")), None)
+                reported = next((r["cli_reported_cost_usd"] for r in reversed(cfg["records"])
+                                 if r.get("cli_reported_cost_usd") is not None), None)
+                record["claude_usage"] = {"model": cfg.get("claude_model"),
+                    "effort": cfg.get("claude_effort"),
+                    "operator_turns": len(cfg["records"]),
+                    "model_requests": sum(r.get("model_requests", 0) for r in cfg["records"]),
+                    "tokens": usage, "cost_usd": None,
+                    "cli_reported_cost_usd": reported,
+                    "billing": "signed-in Claude account; billed cost unavailable"}
         record["bridge_events"] = session.events()
     except Exception as exc:
         record["error"] = f"{type(exc).__name__}: {exc}"
