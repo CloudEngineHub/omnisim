@@ -25,6 +25,8 @@ class OmWriter;
 
 namespace OmUrl {
   QString resolveUrl(const QString &rawUrl);
+  // "webots://" (upstream Webots' local scheme) -> "omnisim://"; anything else unchanged.
+  QString normalizeLegacyScheme(const QString &url);
   QString computePath(const OmNode *node, const QString &field, const QString &rawUrl, bool showWarning = false);
   QString computePath(const OmNode *node, const QString &field, const OmMFString *urlField, int index,
                       bool showWarning = false);

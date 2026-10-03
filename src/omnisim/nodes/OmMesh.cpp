@@ -27,6 +27,7 @@
 #include "OmNetwork.hpp"
 #include "OmNodeUtilities.hpp"
 #include "OmResizeManipulator.hpp"
+#include "OmSFVector3.hpp"
 #include "OmTriangleMesh.hpp"
 #include "OmUrl.hpp"
 #include "OmViewpoint.hpp"
@@ -37,6 +38,8 @@
 #include <assimp/scene.h>
 #include <assimp/Importer.hpp>
 
+#include <cmath>
+
 #include <QtCore/QEventLoop>
 #include <QtCore/QFile>
 #include <QtCore/QIODevice>
@@ -46,6 +49,9 @@ void OmMesh::init() {
   mCcw = findSFBool("ccw");
   mName = findSFString("name");
   mMaterialIndex = findSFInt("materialIndex");
+  // Older node models (a PROTO cache, a stale resources/nodes) may lack the
+  // field; every read below treats a null mScale as unit scale.
+  mScale = findSFVector3("scale");
   mIsCollada = false;
   mResizeConstraint = OmWrenAbstractResizeManipulator::UNIFORM;
   mDownloader = NULL;
@@ -103,6 +109,34 @@ void OmMesh::postFinalize() {
   connect(mCcw, &OmSFBool::changed, this, &OmMesh::updateCcw);
   connect(mName, &OmSFString::changed, this, &OmMesh::updateName);
   connect(mMaterialIndex, &OmSFInt::changed, this, &OmMesh::updateMaterialIndex);
+  if (mScale)
+    connect(mScale, &OmSFVector3::changed, this, &OmMesh::updateScale);
+}
+
+// Mesh.scale (2026-10-03). A per-axis factor applied to the decoded vertices,
+// so it reaches EVERY consumer of the triangle mesh -- the Newton collider
+// (OmSolid::attachNewtonShapeFromBoundingObject hands tm->coordinatesData()
+// straight to add_shape_mesh), the mesh AABB fallback, inertia from geometry
+// and the bounding sphere. It exists because a boundingObject cannot hold a
+// Transform (OmNodeUtilities refuses it, as Webots does), so a URDF
+// <collision><mesh scale="0.001 0.001 0.001"/> had no way to be expressed and
+// was loaded at UNIT scale: the Neobotix MP-400 body collider came out 1000x
+// too large (MP-400-BODY.dae is authored in millimetres). A zero component is
+// meaningless (it flattens the mesh) and is read as 1, with a warning.
+OmVector3 OmMesh::sanitizedScale() const {
+  if (mScale == NULL)
+    return OmVector3(1.0, 1.0, 1.0);
+  OmVector3 s = mScale->value();
+  if (s.x() == 0.0 || s.y() == 0.0 || s.z() == 0.0) {
+    warn(tr("All 'scale' coordinates must be non-zero; a zero component is read as 1."));
+    if (s.x() == 0.0)
+      s.setX(1.0);
+    if (s.y() == 0.0)
+      s.setY(1.0);
+    if (s.z() == 0.0)
+      s.setZ(1.0);
+  }
+  return s;
 }
 
 void OmMesh::createResizeManipulator() {
@@ -200,6 +234,14 @@ void OmMesh::updateTriangleMesh(bool issueWarnings) {
     totalFaces += mesh->mNumFaces;
   }
 
+  // Mesh.scale: vertices scale per axis; normals by the inverse (the
+  // inverse-transpose of a diagonal scale) and are re-normalised; a mirroring
+  // scale (odd number of negative components) flips the triangle winding so
+  // the faces keep pointing outwards.
+  const OmVector3 meshScale = sanitizedScale();
+  const bool scaled = meshScale.x() != 1.0 || meshScale.y() != 1.0 || meshScale.z() != 1.0;
+  const bool mirrored = meshScale.x() * meshScale.y() * meshScale.z() < 0.0;
+
   // create the arrays
   int currentCoordIndex = 0;
   double *const coordData = new double[3 * totalVertices];
@@ -260,14 +302,27 @@ void OmMesh::updateTriangleMesh(bool issueWarnings) {
       for (size_t j = 0; j < mesh->mNumVertices; ++j) {
         // extract the coordinate
         const aiVector3D vertice = transform * mesh->mVertices[j];
-        coordData[currentCoordIndex++] = vertice[0];
-        coordData[currentCoordIndex++] = vertice[1];
-        coordData[currentCoordIndex++] = vertice[2];
+        coordData[currentCoordIndex++] = vertice[0] * meshScale.x();
+        coordData[currentCoordIndex++] = vertice[1] * meshScale.y();
+        coordData[currentCoordIndex++] = vertice[2] * meshScale.z();
         // extract the normal
         const aiVector3D normal = transform * mesh->mNormals[j];
-        normalData[currentNormalIndex++] = normal[0];
-        normalData[currentNormalIndex++] = normal[1];
-        normalData[currentNormalIndex++] = normal[2];
+        if (scaled) {
+          double nx = normal[0] / meshScale.x(), ny = normal[1] / meshScale.y(), nz = normal[2] / meshScale.z();
+          const double len = std::sqrt(nx * nx + ny * ny + nz * nz);
+          if (len > 0.0) {
+            nx /= len;
+            ny /= len;
+            nz /= len;
+          }
+          normalData[currentNormalIndex++] = nx;
+          normalData[currentNormalIndex++] = ny;
+          normalData[currentNormalIndex++] = nz;
+        } else {
+          normalData[currentNormalIndex++] = normal[0];
+          normalData[currentNormalIndex++] = normal[1];
+          normalData[currentNormalIndex++] = normal[2];
+        }
         // extract the texture coordinate
         if (mesh->HasTextureCoords(0)) {
           texCoordData[currentTexCoordIndex++] = mesh->mTextureCoords[0][j].x;
@@ -285,8 +340,8 @@ void OmMesh::updateTriangleMesh(bool issueWarnings) {
           continue;
         assert(face.mNumIndices == 3);
         indexData[currentIndexIndex++] = face.mIndices[0] + indexOffset;
-        indexData[currentIndexIndex++] = face.mIndices[1] + indexOffset;
-        indexData[currentIndexIndex++] = face.mIndices[2] + indexOffset;
+        indexData[currentIndexIndex++] = face.mIndices[mirrored ? 2 : 1] + indexOffset;
+        indexData[currentIndexIndex++] = face.mIndices[mirrored ? 1 : 2] + indexOffset;
       }
 
       indexOffset += mesh->mNumVertices;
@@ -324,7 +379,14 @@ void OmMesh::updateTriangleMesh(bool issueWarnings) {
 
 uint64_t OmMesh::computeHash() const {
   const QString &completeUrl = OmUrl::computePath(this, "url", mUrl, 0);
-  const QString meshPathNameIndex = completeUrl + (mIsCollada ? mName->value() + QString::number(mMaterialIndex->value()) : "");
+  QString meshPathNameIndex = completeUrl + (mIsCollada ? mName->value() + QString::number(mMaterialIndex->value()) : "");
+  // A scaled copy is a different triangle mesh: key it apart, but leave the
+  // unit-scale key byte-identical so every existing cache entry still hits.
+  if (mScale) {
+    const OmVector3 &s = mScale->value();
+    if (s.x() != 1.0 || s.y() != 1.0 || s.z() != 1.0)
+      meshPathNameIndex += QString("|scale=%1,%2,%3").arg(s.x(), 0, 'g', 17).arg(s.y(), 0, 'g', 17).arg(s.z(), 0, 'g', 17);
+  }
   const QByteArray key = meshPathNameIndex.toUtf8();
   const uint64_t hash = OmTriangleMeshCache::sipHash13x(key.constData(), key.size());
   return hash;
@@ -420,6 +482,13 @@ void OmMesh::updateMaterialIndex() {
     emit changed();
 }
 
+void OmMesh::updateScale() {
+  // Same refresh as a url change: re-key the shared triangle mesh, then let
+  // the owning bounding object (and through it the physics body) re-read it.
+  mBoundingObjectNeedUpdate = true;
+  updateUrl();
+}
+
 void OmMesh::exportNodeFields(OmWriter &writer) const {
   OmGeometry::exportNodeFields(writer);
 
@@ -437,6 +506,7 @@ QStringList OmMesh::fieldsToSynchronizeWithW3d() const {
   fields << "url"
          << "ccw"
          << "name"
-         << "materialIndex";
+         << "materialIndex"
+         << "scale";
   return fields;
 }

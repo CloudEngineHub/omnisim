@@ -53,8 +53,8 @@ Built by agents, for agents: the HTTP harness, the Newton physics integration, t
 soft-body stack, the RL pipeline and the ROS 2 sidecar were written by an AI agent under human
 direction. And when the instruments cannot see, they say so instead of guessing: `GET /sim/contacts`
 returns its own `completeness` and `empty_set_reasons[]` rather than an empty list that reads as
-"nothing touched". What OmniSim does **not** do is control time inside a run — no pause, no
-breakpoints, no record/replay/diff, and snapshot is a pose teleport rather than a checkpoint. And
+"nothing touched". Time control is partial: v9 added a held pause and break-on-event, but there are
+no watch conditions, no record/replay/diff, and snapshot is a pose teleport rather than a checkpoint. And
 Windows has the only prebuilt package: Linux is a source build, macOS is not supported. Those gaps
 are itemised in [what OmniSim is worse at](#what-omnisim-is-worse-at).
 
@@ -338,19 +338,21 @@ vendor-claim: [docs/developer/simulator-comparison.md](docs/developer/simulator-
 - **Repeated motion can drift.** The earlier square-loop experiment accumulated
   position error. A short successful return to base does not establish reliable
   operation over a shift without localisation.
-- **You cannot control time inside a run.** OmniSim observes and certifies well; it does not stop the
-  clock. There is **no pause over HTTP** — the engine free-runs between calls, ~88–112 ms of sim time
-  per idle poll — and therefore **no breakpoints and no watch conditions**. There is **no record,
-  replay or run-diff** surface. And `POST /sim/snapshot` is **not a checkpoint**: it saves poses and
+- **Time control is partial.** Since v9 a client can hold the engine across calls (`POST /sim/pause`,
+  leased: 30 s by default, 300 s cap, so a dead client cannot freeze the sim) and arm a breakpoint on an
+  event (`POST /sim/break`); `POST /sim/step` then single-steps and stops early on a break. Detection is
+  never sub-step, and there are two latency regimes: held plus `/sim/step` costs at most one basic step
+  of engine time, but free-running costs one supervisor tick, which has measured 8 ms to ~600 ms of
+  engine time depending on load — so pause first, then step. Still missing: **watch conditions,
+  record, replay and run-diff**. And `POST /sim/snapshot` is **not a checkpoint**: it saves poses and
   joint angles only. Velocity is never captured (`OmSolid::saveHiddenFieldValues()` is an empty
   function) and solver state is never touched, so restore teleports bodies to the saved poses while
   they keep their live Newton velocities, and does not rewind the clock. Identical forward evolution
-  from a restore is not achievable, and we do not claim it. All four gaps are blocked by the same
-  missing primitive — the pause guard exists internally and every read path already uses it, but it
-  is not exposed.
-- **Light mode is the default, and it silences 5 of the 10 event types** (`contact.*`, `grip.*`,
-  `joint.limit_hit`). Load the world with `{"light": false}` for a debugging session; `/sim/contacts`
-  answers either way. Separately, controller logs and physics events **cannot be put on one
+  from a restore is not achievable, and we do not claim it.
+- **Light mode is the default, and it silences 5 of the 11 event types** (`contact.*`, `grip.*`,
+  `joint.limit_hit`); a breakpoint armed on a silenced type is refused rather than accepted and never
+  fired. Load the world with `{"light": false}` for a debugging session; `/sim/contacts` answers either
+  way. Separately, controller logs and physics events **cannot be put on one
   timeline**: log events carry a wall clock (`t_wall`), supervisor events carry sim milliseconds
   (`t_sim_ms`), and `seq` collides across the two sides.
 - **Sensors are not readable through the debug surface.** `GET /robot/<def>/sensor/<name>` is a

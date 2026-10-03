@@ -286,8 +286,12 @@ OmProtoModel::OmProtoModel(OmTokenizer *tokenizer, const QString &worldPath, con
 
   // Inject the prefix prior to tokenizing the content, replacing the
   // local "omnisim://" scheme.
-  if (!mPrefix.isEmpty() && mPrefix != "omnisim://")
+  if (!mPrefix.isEmpty() && mPrefix != "omnisim://") {
     mContent.replace(QString("omnisim://").toUtf8(), mPrefix.toUtf8());
+    // upstream's spelling of the same scheme (OmUrl::normalizeLegacyScheme)
+    if (OmUrl::normalizeLegacyScheme("webots://") == "omnisim://")
+      mContent.replace(QString("webots://").toUtf8(), mPrefix.toUtf8());
+  }
 
   // read the remaining tokens in order to
   // - determine if it's a template

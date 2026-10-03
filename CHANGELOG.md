@@ -25,6 +25,87 @@ top of that foundation.
 ---
 
 
+## [v9.2.0] — 2026-10-03
+
+URDF robots now arrive in the solver the way their files describe them, and a joint resting on
+its limit stops hiding load from the joints above it. These defects all showed up the same way:
+while we ran companies' and labs' own published robots, the importer, not their models, kept
+breaking the runs. Every change has a value-parsed hatch (`=0` restores the old behaviour, except
+where noted) and a pin test. This release changes the engine, so use the v9.2.0 installer; the
+physics runtime changes too (`doctor` must read `bundle == source`).
+
+### ⚠️ Behaviour changes — read before upgrading
+
+- **Fixed-joint offsets are kept on import.** When the importer skipped an empty root link such as
+  `base_footprint`, it dropped that fixed joint's offset, so every child joint moved by it (the
+  TurtleBot3 Burger's wheels sat at z 0.023 instead of 0.033 and the chassis rode ~1 cm high).
+  Hatch: `OMNISIM_URDF_REROOT_KEEP_OFFSET=0`. The ROSbot and ROSbot XL chat worlds spawned high to
+  compensate; their spawn heights are corrected (0.05 → 0.0075, 0.08 → 0.005).
+- **Merged bodies carry the real centre of mass and inertia.** Links joined by fixed joints were
+  merged with their summed mass placed at the leader's origin and only the leader's inertia. The
+  composite calculation is now on by default (`OMNISIM_NEWTON_COMPOSITE_INERTIA=0` reverts; that
+  variable used to switch on when merely present, it is now value-parsed). Turn ceilings of the
+  chat bases moved with it and the bridge table is re-measured: Husky 0.520 → 0.475, TurtleBot3
+  Burger 0.942 → 0.912, Waffle / Waffle Pi 0.955 → 0.933 (Jackal, ROSbot, ROSbot XL unchanged).
+- **Colliders on fixed child links are registered.** Casters, feet, gripper palms and sensor
+  housings attached by fixed joints never collided; a robot rested on whatever its first collider
+  was (the TurtleBot3 rocked about its axle indefinitely). They now attach to the merged body at
+  their relative pose, independent of `newtonRobotColliders`. Hatch:
+  `OMNISIM_NEWTON_FIXED_CHILD_COLLIDERS=0`. The OmniArm6 2F-85 pick-and-place was tuned around the
+  missing palm (its descent pressed the palm 20 mm into the block); its grasp height is now 0.275
+  (`PICK_GRASP_Z` overrides) and it passes its strict carried + pinched + placed check, which it
+  did not before.
+- **A joint resting on its limit transmits load.** A post-step clamp snapped joints back to exactly
+  the limit, where MuJoCo applies no limit force, so the links beyond a stop fell freely each step
+  and their weight never reached the parent joint (OpenArm elbow on its stop: the shoulder read
+  3.84 N·m against a true 11.68). A slack band (0.05 rad / 0.005 m) is now left to MuJoCo's soft
+  limit, and sensors still read the clamped value. Hatches: `OMNISIM_NEWTON_JOINT_CLAMP_SLACK=0`,
+  `OMNISIM_NEWTON_JOINT_CLAMP_SLACK_LINEAR=0`.
+- **Mobile-base import fixes.** Revolute wheels declared with huge limits (±1e16) are treated as
+  continuous and turn under a velocity command (`OMNISIM_NEWTON_UNBOUNDED_LIMIT_AS_CONTINUOUS=0`);
+  a collision mesh's `<mesh scale>` is honoured through a new `Mesh.scale` field
+  (`OMNISIM_URDF_COLLISION_MESH_SCALE=0`); the 1 mm placeholder sphere no longer collides once the
+  robot has real colliders, so robots whose origin sits below their wheels stop resting on it
+  (`OMNISIM_NEWTON_WRAPPER_PLACEHOLDER_COLLIDES=1` restores it); `webots://` URLs in upstream PROTOs
+  resolve like `omnisim://` (`OMNISIM_LEGACY_WEBOTS_SCHEME=0`); and `setAvailableTorque(0)` now
+  frees a joint (`OMNISIM_NEWTON_AVAILABLE_TORQUE=0`). Robotnik's own Webots demo world goes from 16
+  load errors to none.
+- **Joint damping and friction are wired through, but OFF by default.** `dampingConstant` /
+  `staticFriction` (and URDF `<dynamics>`) now reach the solver with
+  `OMNISIM_NEWTON_JOINT_DYNAMICS=1`. They ship off because a velocity servo's stall torque is still
+  capped by its gain clamp rather than the declared effort, so a declared wheel friction can stall
+  a robot whose real motor would drive it (a Raspberry Pi Mouse fell to 0.16 of commanded travel),
+  and worlds calibrated without damping drift (the metazoa reef roamed at half speed).
+
+### Known issues (not caused by this release, still open)
+
+- **The shipped walking demos fall on their documented deploy paths, in v9.1.3 as in v9.2.0.**
+  Go2 and OmniQuad: since the 2026-09-20 change that stopped clamping URDF joint ranges at ±π, a
+  thigh range that crosses +π starts the leg in the wrong pose. G1: since plain static colliders
+  moved onto Newton's world body (2026-09-07), every body index shifted and the deploy hook's
+  hard-coded harness body now lands on a leg. Clamped URDF copies and a by-name body lookup restore
+  them in testing; the fixes come in a follow-up release.
+- **The Go2 rough-terrain baseline policy trips on its new feet.** With fixed-child colliders it
+  stands on its foot spheres for the first time; trained on the footless model, it covers 6.1 m
+  before falling instead of 8.1 m. `OMNISIM_NEWTON_FIXED_CHILD_COLLIDERS=0` restores the trained
+  model until it is retrained.
+
+### Docs
+
+- The README's limits section and `SPONSORS.md` described pause and breakpoints as missing; both
+  shipped in v9. They now describe the held pause and break-on-event with their two latency regimes,
+  and keep the honest list of what is still missing (watch conditions, record, replay, run-diff, a
+  real checkpoint). Light mode silences 5 of 11 event types, not 5 of 10.
+
+### Tests
+
+New: `tests/test_newton_urdf_fixed_links.py` (engine), `tests/test_newton_joint_limit_load.py`,
+`tests/test_newton_joint_passive_dynamics.py`, `tests/test_newton_mobile_base_fixes.py`. Verified on
+this release candidate: the unit lane, the smoke worlds, the lidar and static-base engine pins, and
+old-versus-new runs (same binary, hatches off) across the wheeled chat demos, the Deep Robotics
+showroom, the X30 terrain crawl, the M20 + Piper arm and the OmniArm6 pick-and-place.
+
+
 ## [v9.1.3] — 2026-10-03
 
 A working planar lidar on TurtleBot3, Jackal and Husky, with ROS 2 `/scan` and

@@ -2628,38 +2628,46 @@ static void gatherFixedSolids(const OmNode *root, QList<const OmSolid *> &out) {
   }
 }
 
-// OMNISIM_NEWTON_COMPOSITE_INERTIA (opt-in): compose the PHYSICALLY CORRECT
+// OMNISIM_NEWTON_COMPOSITE_INERTIA (value-parsed, DEFAULT ON since 2026-10-03;
+// it was presence-gated opt-in before): compose the PHYSICALLY CORRECT
 // mass + center-of-mass + inertia over the leader Solid AND its fixed-child
 // descendants (parallel-axis theorem), so a merged Newton body carries the true
-// composite inertial properties instead of the LEADER LINK's only. The default
-// rollup sums MASS but keeps only the leader's inertia/COM -- that made the G1
-// torso body (torso+head+... merged) laterally ASYMMETRIC (whole-body CoM ~2cm
-// off-centre) and wrong-inertia, so the deploy tipped under SolverMuJoCo while
-// Newton's add_urdf (which welds the links with the correct composite) stood.
+// composite inertial properties instead of the LEADER LINK's only. The old
+// default rollup summed MASS but kept only the leader's inertia/COM -- that
+// made the G1 torso body (torso+head+... merged) laterally ASYMMETRIC
+// (whole-body CoM ~2cm off-centre) and wrong-inertia, so the deploy tipped
+// under SolverMuJoCo while Newton's add_urdf (which welds the links with the
+// correct composite) stood; and it put a TurtleBot3 Burger's 0.9447 kg chassis
+// (base_link + caster + a 0.114 kg lidar 172 mm up) at base_link's origin with
+// base_link's own tensor, where the composite COM is (-0.004, 0, 0.031) in
+// base_footprint.
+// `localInertia(D, m, c, I)` supplies each body's mass, its COM in ITS OWN
+// frame and its tensor about that COM (in its own frame) -- a callback so the
+// caller (an OmSolid member) can read the geometry-derived mirror
+// mNativeInertia for a body that declares no inertiaMatrix.
 // Outputs are in the LEADER BODY frame: outCom = composite COM,
 // Iout = {ixx, iyy, izz, ixy, ixz, iyz} about that COM. Returns false (caller
-// keeps the leader-only values) if there is nothing to compose.
-static bool rolledUpComInertia(const OmSolid *leader, double &outMass,
+// keeps the leader-only values) if there is nothing to compose -- i.e. no
+// FIXED CHILD with mass, so a lone body is registered byte-identically -- or
+// if the composite is not positive definite.
+typedef void (*OmLocalInertiaFn)(const OmSolid *, double &, OmVector3 &, OmMatrix3 &);
+static bool rolledUpComInertia(const OmSolid *leader, OmLocalInertiaFn localInertia, double &outMass,
                                OmVector3 &outCom, double Iout[6]) {
   QList<const OmSolid *> bodies;
   gatherFixedSolids(leader, bodies);
-  if (bodies.isEmpty())
+  bool anyFixedChild = false;
+  for (const OmSolid *const D : bodies)
+    anyFixedChild = anyFixedChild || D != leader;
+  if (!anyFixedChild)
     return false;
   // Per-body world-frame mass, COM and inertia-about-COM.
-  auto worldInertia = [](const OmSolid *D, double &m, OmVector3 &cW, OmMatrix3 &IW) {
-    const OmPhysics *const p = D->physics();
-    m = effectiveMass(D);
+  auto worldInertia = [localInertia](const OmSolid *D, double &m, OmVector3 &cW, OmMatrix3 &IW) {
     const OmMatrix3 R = D->rotationMatrix();
     const OmVector3 pD = D->matrix().translation();
     OmVector3 cl(0.0, 0.0, 0.0);
-    if (p->centerOfMass().size() >= 1)
-      cl = p->centerOfMass().item(0);
+    OmMatrix3 Il(0, 0, 0, 0, 0, 0, 0, 0, 0);
+    localInertia(D, m, cl, Il);
     cW = pD + R * cl;
-    double ixx = 0, iyy = 0, izz = 0, ixy = 0, ixz = 0, iyz = 0;
-    const OmMFVector3 &im = p->inertiaMatrix();
-    if (im.size() >= 1) { const OmVector3 &dd = im.item(0); ixx = dd.x(); iyy = dd.y(); izz = dd.z(); }
-    if (im.size() >= 2) { const OmVector3 &oo = im.item(1); ixy = oo.x(); ixz = oo.y(); iyz = oo.z(); }
-    const OmMatrix3 Il(ixx, ixy, ixz, ixy, iyy, iyz, ixz, iyz, izz);
     IW = R * Il * R.transposed();
   };
   double M = 0.0;
@@ -2691,12 +2699,52 @@ static bool rolledUpComInertia(const OmSolid *leader, double &outMass,
   const OmVector3 ps = leader->matrix().translation();
   const OmMatrix3 IWm(Iw[0], Iw[1], Iw[2], Iw[3], Iw[4], Iw[5], Iw[6], Iw[7], Iw[8]);
   const OmMatrix3 Il = Rs.transposed() * IWm * Rs;
+  // Sylvester: a composite built from point masses only (no tensor anywhere)
+  // can be singular; MuJoCo would refuse it, so keep the leader-only values.
+  const double d1 = Il(0, 0);
+  const double d2 = Il(0, 0) * Il(1, 1) - Il(0, 1) * Il(1, 0);
+  const double d3 = Il(0, 0) * (Il(1, 1) * Il(2, 2) - Il(1, 2) * Il(2, 1)) -
+                    Il(0, 1) * (Il(1, 0) * Il(2, 2) - Il(1, 2) * Il(2, 0)) +
+                    Il(0, 2) * (Il(1, 0) * Il(2, 1) - Il(1, 1) * Il(2, 0));
+  if (!(d1 > 0.0 && d2 > 0.0 && d3 > 0.0))
+    return false;
   outMass = M;
   outCom = Rs.transposed() * (cWtot - ps);
   Iout[0] = Il(0, 0); Iout[1] = Il(1, 1); Iout[2] = Il(2, 2);
   Iout[3] = Il(0, 1); Iout[4] = Il(0, 2); Iout[5] = Il(1, 2);
   return true;
 }
+
+// Fixed-child colliders of a DYNAMIC merge leader (2026-10-03). A fixed child
+// (a Solid with no joint between it and the leader -- every URDF fixed-joint
+// link) never gets a Newton body of its own; the registration below folds its
+// MASS into the leader (rolledUpMass) but used to drop its boundingObject: only
+// the leader's own registered. A TurtleBot3 Burger's caster (caster_back_link)
+// and lidar housing (base_scan), a Jackal's or a ROSbot's whole chassis box
+// (chassis_link / body_link sit on fixed joints), a Go2's feet ... none of them
+// collided, and the Burger rocked about its axle forever on two wheels.
+//
+// True when `sol` registers (or will register) a Newton body of its own and
+// therefore attaches its own collider: an un-folded contact device, or a
+// jointed physics-bearing Solid with no physics anywhere between it and the
+// leader (the "fold has nowhere to go" case of the registration loop). Mirrors
+// the staticBase root harvest below, which has always attached these.
+static bool fixedChildOwnsNewtonBody(const OmSolid *sol, const OmSolid *leader) {
+  if (sol->newtonBodyIndex() >= 0 || isUnfoldedContactDevice(sol))
+    return true;
+  if (sol->physics() == nullptr || sol->jointChildren().isEmpty())
+    return false;
+  for (const OmNode *n = sol->parentNode(); n != nullptr; n = n->parentNode()) {
+    if (const OmSolid *const as = dynamic_cast<const OmSolid *>(n)) {
+      if (as->physics() != nullptr)
+        return false;  // folds into a physics-bearing ancestor
+      if (as == leader)
+        break;
+    }
+  }
+  return true;
+}
+
 
 // Phase-D regression guard companion to rolledUpMass(): true iff this
 // Solid (or any of its fixed-child descendants -- same traversal as
@@ -3459,6 +3507,12 @@ void OmSolid::flushPendingNewtonRegistrations() {
   // many boundingObjects (root + merged fixed children) went onto them.
   int staticBaseRootsWithColliders = 0;
   int staticBaseColliderSources = 0;
+  // Dynamic merge leaders that received their fixed children's colliders, how
+  // many boundingObjects went onto them, and how many leaders took the
+  // composite (leader + fixed children) inertia (2026-10-03).
+  int leadersWithFixedChildColliders = 0;
+  int fixedChildColliderSources = 0;
+  int compositeInertiaBodies = 0;
   // Inertia provenance, reported in the registration census below. BOTH defects
   // of 2026-09-10 (a URDF <inertia> that never arrived; a Robot root whose
   // inertia was geometry-independent) were invisible from the log: the runtime's
@@ -4022,21 +4076,72 @@ void OmSolid::flushPendingNewtonRegistrations() {
     // is it still zeros at this point?
     const bool inertiaWasDeclared = ixx > 0.0 && iyy > 0.0 && izz > 0.0;
 
-    // OMNISIM_NEWTON_COMPOSITE_INERTIA (opt-in, default OFF): override the
-    // leader-only mass/inertia/COM with the PHYSICALLY CORRECT composite over
-    // the leader + its fixed-child descendants. The leader-only rollup made the
-    // merged G1 torso body laterally asymmetric + wrong-inertia, tipping the
-    // deploy stand; the composite matches Newton's add_urdf (which stands).
-    if (!qEnvironmentVariableIsEmpty("OMNISIM_NEWTON_COMPOSITE_INERTIA")) {
+    // OMNISIM_NEWTON_COMPOSITE_INERTIA (value-parsed, DEFAULT ON since
+    // 2026-10-03 -- it was presence-gated opt-in, so `=0` used to ARM it):
+    // override the leader-only mass/inertia/COM with the PHYSICALLY CORRECT
+    // composite over the leader + its fixed-child descendants. The leader-only
+    // rollup summed the children's MASS onto the leader's own COM and tensor:
+    // it made the merged G1 torso body laterally asymmetric + wrong-inertia
+    // (the composite matches Newton's add_urdf, which stands), and it gave a
+    // TurtleBot3 Burger chassis 0.9447 kg at ipos (0,0,0) with base_link's own
+    // tensor, its 0.114 kg lidar 172 mm up and its caster simply not placed.
+    // Only a leader WITH a massive fixed child is touched (rolledUpComInertia
+    // returns false otherwise), so a lone body registers byte-identically.
+    //
+    // Per-body source: the declared inertiaMatrix (about the declared
+    // centerOfMass) when there is one; else the geometry-derived mirror
+    // mNativeInertia (tensor about the Solid ORIGIN, COM c) shifted to its COM;
+    // else a point mass at the declared COM.
+    if (newtonEnvFlag("OMNISIM_NEWTON_COMPOSITE_INERTIA", true)) {
+      struct Local {
+        static void inertia(const OmSolid *D, double &m, OmVector3 &c, OmMatrix3 &I) {
+          const OmPhysics *const p = D->physics();
+          m = effectiveMass(D);
+          c = OmVector3(0.0, 0.0, 0.0);
+          I = OmMatrix3(0, 0, 0, 0, 0, 0, 0, 0, 0);
+          if (p == nullptr)
+            return;
+          const OmMFVector3 &im = p->inertiaMatrix();
+          const bool explicitTensor =
+            im.size() >= 1 && im.item(0).x() > 0.0 && im.item(0).y() > 0.0 && im.item(0).z() > 0.0;
+          if (explicitTensor) {
+            if (p->centerOfMass().size() >= 1)
+              c = p->centerOfMass().item(0);
+            const OmVector3 &dd = im.item(0);
+            double ixy = 0.0, ixz = 0.0, iyz = 0.0;
+            if (im.size() >= 2) {
+              const OmVector3 &oo = im.item(1);
+              ixy = oo.x(); ixz = oo.y(); iyz = oo.z();
+            }
+            I = OmMatrix3(dd.x(), ixy, ixz, ixy, dd.y(), iyz, ixz, iyz, dd.z());
+            return;
+          }
+          if (D->mNativeInertiaValid && D->mNativeInertia.mass() > 0.0) {
+            const OmInertia &n = D->mNativeInertia;
+            const double k = m / n.mass();
+            c = OmVector3(n.cx(), n.cy(), n.cz());
+            // I_com = k*I_origin - m*(|c|^2 E - c c^T)
+            const double cxx = c.x(), cyy = c.y(), czz = c.z();
+            const double c2 = cxx * cxx + cyy * cyy + czz * czz;
+            I = OmMatrix3(k * n.ixx() - m * (c2 - cxx * cxx), k * n.ixy() + m * cxx * cyy, k * n.ixz() + m * cxx * czz,
+                          k * n.ixy() + m * cxx * cyy, k * n.iyy() - m * (c2 - cyy * cyy), k * n.iyz() + m * cyy * czz,
+                          k * n.ixz() + m * cxx * czz, k * n.iyz() + m * cyy * czz, k * n.izz() - m * (c2 - czz * czz));
+            return;
+          }
+          if (p->centerOfMass().size() >= 1)
+            c = p->centerOfMass().item(0);
+        }
+      };
       double cMass = 0.0;
       OmVector3 cCom(0.0, 0.0, 0.0);
       double cI[6] = {0, 0, 0, 0, 0, 0};
-      if (rolledUpComInertia(s, cMass, cCom, cI) && cMass > 0.0) {
+      if (rolledUpComInertia(s, &Local::inertia, cMass, cCom, cI) && cMass > 0.0) {
         mass = cMass;
         ixx = cI[0]; iyy = cI[1]; izz = cI[2];
         ixy = cI[3]; ixz = cI[4]; iyz = cI[5];
         cx = cCom.x(); cy = cCom.y(); cz = cCom.z();
         hasCom = true;
+        ++compositeInertiaBodies;
       }
     }
 
@@ -4222,6 +4327,64 @@ void OmSolid::flushPendingNewtonRegistrations() {
             newtonFrictionForSolid(s->mNewtonFriction),
               newtonFrictionForSolid(s->mNewtonFrictionTorsional),
               newtonFrictionForSolid(s->mNewtonFrictionRolling));
+      }
+      // Fixed-child colliders (see fixedChildOwnsNewtonBody): attach the
+      // boundingObject of every joint-free descendant Solid that folds into
+      // this body, at its pose relative to the body -- the harvest the
+      // staticBase root branch above already does, now for dynamic leaders.
+      // Independent of the wrapper policy just applied: newtonRobotColliders
+      // FALSE keeps a Robot WRAPPER's own chassis envelope off the solver
+      // (it would short-circuit the wheels), but a collider authored on a
+      // separate fixed link -- a caster, a lidar housing, a bumper, a foot --
+      // is exactly the geometry that should carry contact. Default ON;
+      // OMNISIM_NEWTON_FIXED_CHILD_COLLIDERS=0 restores the drop (value-parsed).
+      if (newtonEnvFlag("OMNISIM_NEWTON_FIXED_CHILD_COLLIDERS", true)) {
+        const OmVector3 lt = t;
+        const OmQuaternion lqInv = q.conjugated();
+        QVector<OmNode *> fwalk;
+        fwalk.append(s);
+        int fixedChildSources = 0;
+        while (!fwalk.isEmpty()) {
+          OmNode *const node = fwalk.takeLast();
+          OmSolid *const sol = dynamic_cast<OmSolid *>(node);
+          if (sol != nullptr && sol != s && fixedChildOwnsNewtonBody(sol, s))
+            continue;  // owns (or will own) its body, its collider and its subtree
+          if (sol != nullptr && sol != s && sol->mBoundingObject != nullptr &&
+              sol->mBoundingObject->value() != nullptr) {
+            OmBaseNode *const bo = dynamic_cast<OmBaseNode *>(sol->mBoundingObject->value());
+            const double ke = newtonSoftKeForMaterial(sol->mContactMaterial);
+            const double mu = newtonFrictionForSolid(sol->mNewtonFriction);
+            const double muT = newtonFrictionForSolid(sol->mNewtonFrictionTorsional);
+            const double muR = newtonFrictionForSolid(sol->mNewtonFrictionRolling);
+            // The child's collider frame expressed in THIS body's frame.
+            OmNewtonShapeXform rel;
+            rel.t = lqInv * (sol->matrix().translation() - lt);
+            rel.q = lqInv * OmRotation(sol->rotationMatrix()).toQuaternion();
+            rel.q.normalize();
+            QString d;
+            if (newtonCompoundCollidersOn())
+              d = registerNewtonShapesRec(newton, idx, bo, rel, ke, mu, muT, muR);
+            if (d.isEmpty())
+              d = attachNewtonShapeFromBoundingObject(newton, idx, bo, ke, mu, muT, muR, &rel);
+            if (!d.isEmpty()) {
+              ++fixedChildSources;
+              shapeDesc += (shapeDesc.isEmpty() ? QString() : QStringLiteral("; ")) +
+                           QStringLiteral("fixed child '%1': %2").arg(sol->name(), d);
+            }
+          }
+          if (const OmGroup *const g = dynamic_cast<const OmGroup *>(node)) {
+            const OmMFNode &kids = g->children();
+            for (int i = 0; i < kids.size(); ++i) {
+              OmNode *const kid = kids.item(i);
+              if (kid != nullptr && dynamic_cast<OmBasicJoint *>(kid) == nullptr)
+                fwalk.append(kid);
+            }
+          }
+        }
+        if (fixedChildSources > 0) {
+          ++leadersWithFixedChildColliders;
+          fixedChildColliderSources += fixedChildSources;
+        }
       }
       if (shapeDesc.isEmpty() && !isRobotWrapper) {
         newton->addShapeSphere(idx, 0.12);
@@ -4462,6 +4625,14 @@ void OmSolid::flushPendingNewtonRegistrations() {
       OmLog::info(QString("[OmNewtonBackend] staticBase root colliders: %1 boundingObject(s) attached to %2 "
                           "fixed robot root(s); OMNISIM_NEWTON_STATIC_BASE_COLLIDERS=0 reverts")
                       .arg(staticBaseColliderSources).arg(staticBaseRootsWithColliders));
+    if (leadersWithFixedChildColliders > 0)
+      OmLog::info(QString("[OmNewtonBackend] fixed-child colliders: %1 boundingObject(s) of fixed child links "
+                          "attached to %2 dynamic body(ies); OMNISIM_NEWTON_FIXED_CHILD_COLLIDERS=0 reverts")
+                      .arg(fixedChildColliderSources).arg(leadersWithFixedChildColliders));
+    if (compositeInertiaBodies > 0)
+      OmLog::info(QString("[OmNewtonBackend] composite inertia: %1 body(ies) carry the mass, COM and inertia of "
+                          "their fixed child links; OMNISIM_NEWTON_COMPOSITE_INERTIA=0 reverts")
+                      .arg(compositeInertiaBodies));
 
     // Inertia provenance. `preset` is the one to read: those bodies have a
     // rotational inertia that no line of the world declares and no geometry

@@ -32,9 +32,9 @@ Similarly, when changing the `position` field of a [JointParameters](#jointparam
 - The `minStop` and `maxStop` fields specify the position of physical (or mechanical) stops.
 These fields are described in more detail in the [Joint Limits section](#joint-limits), see below.
 
-- ⚠️ The `springConstant` and `dampingConstant` fields are **not read on the current engine** and add no spring or damping behaviour. They are described in more detail in the "Springs and Dampers" section below, which carries the full explanation.
+- ⚠️ The `springConstant` field is **not read on the current engine** and adds no spring behaviour. It is described in more detail in the "Springs and Dampers" section below, which carries the full explanation.
 
-- ⚠️ The `staticFriction` field is **not read on the current engine**. It defined a simple static friction force opposed to the joint motion; its only consumer was `turnOffMotor()`, which dropped ODE's `FMax` to this value, and that is itself UNIMPLEMENTED (`OmRotationalMotor::turnOffMotor` / `OmLinearMotor::turnOffMotor`).
+- The `dampingConstant` (viscous, N·m·s/rad or N·s/m) and `staticFriction` (Coulomb, N·m or N) fields of a [HingeJoint](hingejoint.md) or [SliderJoint](sliderjoint.md) reach the solver since 2026-10-03, as MuJoCo `dof_damping` / `dof_frictionloss`; a URDF `<dynamics damping friction>` lands here. They are applied once, when the joint is registered with Newton -- editing either field on a running simulation changes nothing until the world is reloaded. `OMNISIM_NEWTON_JOINT_DYNAMICS=0` drops them again (the previous behaviour). They are still not applied on a [Hinge2Joint](hinge2joint.md) or a [BallJoint](balljoint.md).
 
 ### Units
 
@@ -85,7 +85,11 @@ Finally, note that when both soft (`minPosition` and `maxPosition`, see the [Mot
 
 ### Springs and Dampers
 
-> ⚠️ **NOTHING IN THIS SECTION HAPPENS ON THE CURRENT ENGINE.** Joint springs and dampers were
+> ⚠️ **Exception since 2026-10-03:** `dampingConstant` on a HingeJoint / SliderJoint DOES reach the
+> solver (as MuJoCo `dof_damping`, applied at registration; see the field list above). Everything
+> else below still holds for `springConstant` and Brake damping.
+>
+> ⚠️ **NOTHING ELSE IN THIS SECTION HAPPENS ON THE CURRENT ENGINE.** Joint springs and dampers were
 > realised as an ODE `AMotor` companion joint configured with a converted `(cfm, erp)` pair. ODE was
 > deleted on 2026-08-08 (commit `bdc02139`) and no Newton equivalent is wired:
 > `OmHingeJoint::applyToOdeSpringAndDampingConstants` records that `springConstant` /

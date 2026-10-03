@@ -1,8 +1,8 @@
 # Sponsors
 
-OmniSim is built in the open and funded by people and teams who use it. Thank you.
+OmniSim is an open-source robotics workshop for agents, built in the open and funded by people and teams who use it. Thank you.
 
-If your work depends on OmniSim — or if you just want to back the idea that robot software should be debuggable, not guessed at — [become a sponsor on GitHub](https://github.com/sponsors/omnilink-tech). Recurring sponsorships fund full-time engine work: the observability surface that reports what a robot actually did, time control inside a run (pause is the missing primitive that breakpoints, watch conditions and run-diff all wait on), the Newton physics work, the wgpu renderer, the agent-bridge maintenance burden, and the hosted demos that let people try OmniSim without compiling C++.
+If your work depends on OmniSim — or if you want robotics to be reachable for people who have an idea but no lab or hardware — [become a sponsor on GitHub](https://github.com/sponsors/omnilink-tech). Recurring sponsorships fund full-time engine work: the Newton physics integration, importing robots from their own URDF and CAD, the agent-facing harness and its debugger (held pause and break-on-event shipped in v9; watch conditions, record and replay are next), the wgpu renderer, and the upkeep of the robot bridges. Today the only prebuilt package is for Windows; Linux builds from source.
 
 What sponsorship does **not** buy: paid tiers of the simulator, sponsor-gated features, or any departure from the Apache 2.0 license. If something works for partners, it works for everyone.
 

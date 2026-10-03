@@ -64,6 +64,32 @@ separately -- no twin's number is carried across any more.
 `gain` is the fraction of the kinematic ceiling the base HOLDS AT FULL
 COMMAND, so `max_angular_rad_s` is a rate a caller can actually reach.
 
+RE-MEASURED 2026-10-03, same recipe (servo OFF, gain 1.0, a held
+set_velocity(0, kinematic ceiling), settled supervisor yaw differenced in SIM
+time over the last 3 s of a 5 s hold), 3 repeats per base, current engine
+defaults (composite inertia + fixed-child colliders ON, joint dynamics OFF),
+same laptop, CPU mujoco, each base on its own chat world. Rig + raw results:
+social/launch/recheck_2026-10-03/followup/rig (run_wheeled.py --gain).
+
+    base           real ceiling (3 runs)        gain (mean)  config
+    husky          1.6494 / 1.6522 / 1.6463     0.4752       0.520 -> 0.475
+    tb3_burger     2.2585 / 2.2585 / 2.2581     0.9125       0.942 -> 0.912
+    tb3_waffle     1.2834 / 1.2831 / 1.2831     0.9333       0.955 -> 0.933
+    jackal         1.5823 / 1.5822 / 1.5823     0.5033       0.490  (kept)
+    rosbot         3.4230 x3                    0.7048       0.720  (kept)
+    rosbot_xl      2.5025 x3                    0.5388       0.520  (kept)
+
+The three that moved moved because the URDF fixed children (Husky top plate
+and bumpers, TB3 scan/caster/plate links) now contribute their inertia to the
+wheel-carrying body (OMNISIM_NEWTON_COMPOSITE_INERTIA, default ON): a heavier
+yaw inertia pivots slower on the same wheel torque. With that hatch off the
+same binary gives the old figures (Husky 0.534, Burger 0.951), so the drop is
+the more complete model, not a regression. The other three bases are
+unchanged against the hatches-off engine to 0.3%, so their 2026-09-11 values
+were left alone; note the ROSbot's is 2.1% generous against today's 0.705 and
+the Jackal / XL are 2.7% / 3.5% conservative. tb3_waffle_pi shares the Waffle
+dict and was not re-swept separately.
+
 THE SHAPE IS NO LONGER A DEAD-BAND. That was the whole reason this number
 could not do the job alone, and it is gone:
 
@@ -199,7 +225,11 @@ HUSKY = {
     # response droops at the slowest commands (0.480 of command at
     # 0.3 rad/s) and is flat at 0.53 above ~1.5; the yaw servo closes that
     # remainder, this number sets the ceiling.
-    "yaw_rate_gain": 0.520,
+    # RE-MEASURED 2026-10-03: 1.649 rad/s held (3 runs, 1.6463-1.6522),
+    # gain 0.4752 -- down from 0.534 on the same binary because the fixed
+    # top plate / bumpers now add their inertia to the chassis (composite
+    # inertia, default ON). Table in the module docstring.
+    "yaw_rate_gain": 0.475,
     # Footprint for route planning: 0.99 m x 0.67 m (husky.urdf base_link),
     # so a 0.45 m clearance radius keeps the body off what it routes around.
     "body_radius_m": 0.45,
@@ -290,7 +320,10 @@ TB3_BURGER = {
     # it held before 69b4b024b. Its two wheels sit on one axle through the
     # centre, so a pivot scrubs nothing -- which is why it lost least to
     # the old defect and gains least from the fix.
-    "yaw_rate_gain": 0.942,
+    # RE-MEASURED 2026-10-03: 2.258 rad/s held (3 runs, 2.2581-2.2585),
+    # gain 0.9125 -- down from 0.951 with composite inertia off on the same
+    # binary. Table in the module docstring.
+    "yaw_rate_gain": 0.912,
 }
 
 TB3_WAFFLE = {
@@ -311,7 +344,10 @@ TB3_WAFFLE = {
     # tracker of the whole set. TB3_WAFFLE_PI measured BIT-IDENTICAL on
     # every sweep point, so sharing this dict is correct, not an
     # assumption.
-    "yaw_rate_gain": 0.955,
+    # RE-MEASURED 2026-10-03: 1.283 rad/s held (3 runs, 1.2831-1.2834),
+    # gain 0.9333 -- down from 0.975 hatches-off on the same binary
+    # (composite inertia). Table in the module docstring.
+    "yaw_rate_gain": 0.933,
 }
 
 TB3_WAFFLE_PI = dict(TB3_WAFFLE, model="TurtleBot3 Waffle Pi")

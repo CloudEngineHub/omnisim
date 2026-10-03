@@ -2296,6 +2296,37 @@ int OmNewtonBackend::addJointPrismatic(int parentIdx, int childIdx,
   return static_cast<int>(idx);
 }
 
+int OmNewtonBackend::setJointPassiveDynamics(int jointIdx, double damping, double friction) {
+  if (!mAvailable || mRuntime == nullptr || mRuntime->world == nullptr || !mRuntime->openForBuild || jointIdx < 0)
+    return -1;
+  PyGILState_STATE gstate = PyGILState_Ensure();
+  // A runtime that predates the verb (bundle not re-staged with this binary):
+  // say so ONCE and leave the joint registered without its dynamics, which is
+  // exactly the pre-2026-10-03 behaviour -- never a failed registration.
+  if (!PyObject_HasAttrString(mRuntime->world, "set_joint_passive_dynamics")) {
+    static bool warned = false;
+    if (!warned) {
+      warned = true;
+      newtonWarning(QStringLiteral("[OmNewtonBackend] the physics runtime has no set_joint_passive_dynamics -- joint "
+                                   "dampingConstant / staticFriction (URDF <dynamics>) are NOT applied. Re-stage the "
+                                   "runtime bundle (scripts/packaging/bundle_newton_runtime.py --mode vendor)."));
+    }
+    PyGILState_Release(gstate);
+    return -1;
+  }
+  PyObject *r = PyObject_CallMethod(mRuntime->world, "set_joint_passive_dynamics", "(idd)", jointIdx, damping,
+                                    friction);
+  if (r == nullptr) {
+    const int err = reportPyError("set_joint_passive_dynamics");
+    PyGILState_Release(gstate);
+    return err;
+  }
+  const long rc = PyLong_AsLong(r);
+  Py_DECREF(r);
+  PyGILState_Release(gstate);
+  return static_cast<int>(rc);
+}
+
 int OmNewtonBackend::setJointTargetVelocity(int jointIdx, double vel) {
   if (!mAvailable || mRuntime == nullptr || mRuntime->world == nullptr)
     return -1;
@@ -2373,6 +2404,28 @@ int OmNewtonBackend::setJointGains(int jointIdx, int dof, double ke, double kd) 
   PyObject *r = PyObject_CallMethod(mRuntime->world, "set_joint_gains", "(iidd)", jointIdx, dof, ke, kd);
   if (r == nullptr) {
     const int err = reportPyError("set_joint_gains");
+    PyGILState_Release(gstate);
+    return err;
+  }
+  const int rc = (int)PyLong_AsLong(r);
+  Py_DECREF(r);
+  PyGILState_Release(gstate);
+  return rc;
+}
+
+int OmNewtonBackend::setJointEffortLimit(int jointIdx, int dof, double effort) {
+  if (!mAvailable || mRuntime == nullptr || mRuntime->world == nullptr)
+    return -1;
+  PyGILState_STATE gstate = PyGILState_Ensure();
+  // A runtime that predates the method (a stale bundle) answers AttributeError:
+  // report -1 quietly rather than a Python traceback every time a motor changes.
+  if (!PyObject_HasAttrString(mRuntime->world, "set_joint_effort_limit")) {
+    PyGILState_Release(gstate);
+    return -1;
+  }
+  PyObject *r = PyObject_CallMethod(mRuntime->world, "set_joint_effort_limit", "(iid)", jointIdx, dof, effort);
+  if (r == nullptr) {
+    const int err = reportPyError("set_joint_effort_limit");
     PyGILState_Release(gstate);
     return err;
   }
@@ -3715,9 +3768,11 @@ int OmNewtonBackend::addJointPrismatic(int, int, double, double, double,
                                        double, double,
                                        double, double, double, double,
                                        double) { return -1; }
+int OmNewtonBackend::setJointPassiveDynamics(int, double, double) { return -1; }
 int OmNewtonBackend::setJointTargetVelocity(int, double) { return -1; }
 int OmNewtonBackend::setJointTargetPosition(int, double) { return -1; }
 int OmNewtonBackend::setJointGains(int, int, double, double) { return -1; }
+int OmNewtonBackend::setJointEffortLimit(int, int, double) { return -1; }
 int OmNewtonBackend::setJointForce(int, double) { return -1; }
 double OmNewtonBackend::getJointAngle(int) const { return 0.0; }
 void OmNewtonBackend::resetBodyPose(int, double, double, double, double, double, double, double) {}

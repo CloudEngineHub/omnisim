@@ -321,7 +321,7 @@ QString OmProtoManager::findExternProtoDeclarationInFile(const QString &url, con
     QRegularExpressionMatchIterator matches = re.globalMatch(QString::fromUtf8(file.readAll()));
     while (matches.hasNext()) {
       const QRegularExpressionMatch match = matches.next();
-      const QString declared = match.captured(1);
+      const QString declared = OmUrl::normalizeLegacyScheme(match.captured(1));
       const QString name = externProtoNameOf(declared);
       if (!name.isEmpty() && !table.urlByName.contains(name))
         table.urlByName.insert(name, declared);

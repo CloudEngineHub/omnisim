@@ -480,7 +480,7 @@ The acceleration is expressed in *radian per second squared* [rad/s²] for rotat
 Note that an infinite acceleration is obtained by passing -1 as the `acc` argument to this function.
 The specified acceleration overwrites the `acceleration` field value and can be retrieved using the `wb_motor_get_acceleration` function.
 
-⚠️ **Setting the available force to `0` no longer switches the motor off.** `turnOffMotor()` was ODE's zero-velocity + `FMax = staticFriction` write and is now UNIMPLEMENTED, so a motor "switched off" keeps whatever target the per-tick Newton push last wrote. To stop a joint, command it: set the velocity target to 0, or hold a position target.
+✅ **Setting the available force to `0` makes the joint passive** (engine built after 2026-10-03). The available force/torque is pushed to the solver as the joint's total actuator limit (MuJoCo `jnt_actfrcrange`); at `0` the runtime also zeroes the servo gains and removes the wheel armature, so the joint moves only under its authored damping, friction and the forces acting on it -- the way to make a URDF passive joint passive (every revolute/continuous URDF joint is imported with a motor). A non-zero value caps the motor at that torque; restoring it restores the servo. Before that build the value never reached the solver: a motor at `0` was a velocity servo targeting 0, i.e. a brake. `OMNISIM_NEWTON_AVAILABLE_TORQUE=0` restores that behaviour.
 
 The `wb_motor_set_available_force` (resp. `wb_motor_set_available_torque`) function specifies the maximum force (resp. torque) that will be available to the motor to carry out the requested motion.
 The force is expressed in *newton* [N].

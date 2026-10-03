@@ -639,6 +639,15 @@ public:
                         double childRotX = 0.0, double childRotY = 0.0,
                         double childRotZ = 0.0, double childRotW = 1.0,
                         double initialPosition = 0.0);
+  // PASSIVE dynamics of a joint returned by addJointRevolute / addJointPrismatic
+  // (2026-10-03): viscous `damping` (N*m*s/rad, N*s/m on a slider) and Coulomb
+  // `friction` (N*m / N) -- JointParameters.dampingConstant / staticFriction,
+  // i.e. a URDF <dynamics>. BUILD phase only (before finalizeWorld). A separate
+  // verb rather than two more positional arguments so a binary and a runtime of
+  // different vintages can never shift one: an older runtime without
+  // set_joint_passive_dynamics costs the joint its dynamics (warned once),
+  // never its registration. Returns 0, or -1 (not applied).
+  int setJointPassiveDynamics(int jointIdx, double damping, double friction);
   // childRot* (2026-09-27): the same R_child^T * R_parent quaternion the
   // revolute takes. A slider only translates, so the child's authored
   // orientation relative to its parent must be kept in child_xform or the
@@ -763,6 +772,11 @@ public:
   // 0 ok / -1 error / -2 unsupported (mujoco_warp bakes gains; the caller
   // warns once rather than silently no-opping).
   int setJointGains(int jointIdx, int dof, double ke, double kd);
+  // Motor.setAvailableTorque/Force(): caps the TOTAL actuator torque on one
+  // joint DoF (MuJoCo jnt_actfrcrange); 0 makes the joint passive (the
+  // runtime also zeroes its servo gains and wheel armature). 0 ok / -1 not
+  // applicable / -2 the device-model write failed (mujoco_warp).
+  int setJointEffortLimit(int jointIdx, int dof, double effort);
   // Sets a per-step raw joint TORQUE (Nm) via control.joint_f (applied
   // generalized force). Additive over the PD; for pure torque control build
   // the joint in EFFORT mode (OMNISIM_NEWTON_TORQUE_MODE). Re-send every tick.

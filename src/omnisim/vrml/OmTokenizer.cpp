@@ -397,8 +397,12 @@ int OmTokenizer::tokenize(const QString &fileName, const QString &prefix) {
   // Read file content. If a remote prefix is provided, splice it in
   // by rewriting the local "omnisim://" scheme.
   QByteArray contents = file.readAll();
-  if (!prefix.isEmpty() && prefix != "omnisim://")
+  if (!prefix.isEmpty() && prefix != "omnisim://") {
     contents.replace(QString("omnisim://").toUtf8(), prefix.toUtf8());
+    // upstream's spelling of the same scheme (OmUrl::normalizeLegacyScheme)
+    if (OmUrl::normalizeLegacyScheme("webots://") == "omnisim://")
+      contents.replace(QString("webots://").toUtf8(), prefix.toUtf8());
+  }
 
   // OmniSim extension: expand `#include "path/to/file.wbt"` directives
   // by splicing the referenced file's body inline. Done before URDF

@@ -94,6 +94,13 @@ robotiq_2f85_base_link's 60x80x60 mm collision box is DROPPED when the fixed
 joint merges it into link6 (the merged body carries the summed mass, 1.50264 kg
 = 0.577639 + 0.925, but only link6's cylinder). So the palm cannot collide with
 anything, in this world or any other URDF robot with a fixed-joint collider.
+
+⚠ FIXED ENGINE-SIDE 2026-10-03 (OMNISIM_NEWTON_FIXED_CHILD_COLLIDERS, default
+ON): the palm box now collides, attached to link6's merged body. That made the
+old grasp height (block mid-height, 0.245) physically impossible -- the palm
+face sat 20 mm inside the block top -- so GRASP_Z was raised to keep the palm
+clear (see GRASP_Z), and census() now counts a contact from ANY non-finger robot
+link as palm, because the merged palm reports as "link6", not "robotiq*".
 """
 import json
 import math
@@ -397,13 +404,23 @@ def census(tag):
                        for i in range(3) if r[i] > top - 0.02)
         who = owner.get(tuple(round(v, 9) for v in cp.point))
         pts.append({"link": _link_name(who) if who is not None else "world",
+                    "robot": who is not None,
                     "face": face, "world_y": cp.point[1],
                     "local": [round(v, 5) for v in loc],
                     "depth": cp.depth})
     left = [p for p in pts if "left_finger" in p["link"]]
     right = [p for p in pts if "right_finger" in p["link"]]
-    palm = [p for p in pts if p["link"].startswith("robotiq") and "finger" not in p["link"]]
-    other = [p for p in pts if not p["link"].startswith("robotiq")]
+    # ⚠ "PALM" = ANY ROBOT LINK THAT IS NOT A FINGER (widened 2026-10-03). The
+    # robotiq_2f85_base_link is a FIXED child of link6, so its palm box is
+    # merged into link6's body and its contacts are attributed to "link6" (or
+    # "link5"), never to a "robotiq*" name -- the old startswith("robotiq")
+    # filter could not see a palm contact at all and filed it under "other".
+    # Measured on the 0.245 grasp height: 4 palm-box contacts on the block top
+    # (2.9-4.0 mm deep) and a wrist contact 15 mm deep at the squeeze, all
+    # reported as palm=0. A contact owned by the robot that is not a pad is a
+    # wedge, whichever link carries it.
+    palm = [p for p in pts if p["robot"] and "finger" not in p["link"]]
+    other = [p for p in pts if not p["robot"]]
     # (b) a pad contact only counts if it is on the block's GRASP FACE (|y| near
     # the half-width) -- a pad touching the block's top or bottom edge is not a
     # pinch, it is a shelf.
@@ -453,7 +470,27 @@ def census(tag):
 
 
 PX, PY = 0.46, 0.0
-GRASP_Z = 0.245                 # block mid-height: pads clear the table by 20 mm
+# ⚠ GRASP HEIGHT IS SET BY THE PALM, NOT BY THE BLOCK'S MID-HEIGHT (retuned
+# 2026-10-03). GRASP_Z is the TCP = the pad CENTRE (OZ = 0.25 from link6 =
+# 0.1655 flange + 0.060 palm + 0.025 half-pad). The 2F-85 palm face sits 25 mm
+# ABOVE the TCP and the pads hang 50 mm below the palm face, so a part taller
+# than the pads can only be pinched with its top BELOW the palm face. The old
+# 0.245 (block mid-height) put the palm face at 0.270, 20 mm INSIDE the 0.290
+# block top; it only "worked" because the palm box did not collide (the fixed
+# child's collider was dropped on merge -- see the docstring). With the palm
+# colliding (OMNISIM_NEWTON_FIXED_CHILD_COLLIDERS default ON) the descent
+# stalled on the block top at -17 mm, the palm pressed the block into the
+# table through the squeeze, and the block fell out mid-carry (FAIL, measured
+# 2026-10-03). Even before that, link6's capsule-cap collider stalled the
+# descent at -9.2 mm on the same block top. 0.275 puts the palm face at 0.300
+# (10 mm clear of the 0.290 block top by FK) and the pads over 0.250-0.300,
+# i.e. the block's upper 40 mm, with the pad bottoms 50 mm above the table.
+# Swept 2026-10-03 (3 engine runs each where noted, census palm = any non-pad
+# robot link): 0.270 PASSES but the palm still touches the block top (the arm
+# lands ~2 mm low and ~3 deg off vertical; 1 palm contact, 0.3-2.2 mm deep, at
+# squeeze, lift AND carry); 0.275 and 0.280 PASS with ZERO palm contacts.
+# Overridable for sweeps (PICK_GRASP_Z).
+GRASP_Z = float(os.environ.get("PICK_GRASP_Z", "0.275"))
 PLACE_X, PLACE_Y = 0.24, -0.42
 # One-shot lateral aim bias, in metres, folded into the SAME goto calls the
 # demo already makes -- so it changes where the gripper ends up without

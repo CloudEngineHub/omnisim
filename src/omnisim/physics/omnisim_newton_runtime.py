@@ -1447,11 +1447,21 @@ class World:
     def add_shape_sphere(self, body_idx, radius, cx=0.0, cy=0.0, cz=0.0, mu=-1.0,
                          mu_t=-1.0, mu_r=-1.0):
         _b, _xf, _loc = self._shape_target(body_idx, cx, cy, cz)
-        return self._note_shape(body_idx, self._builder_add(_b, self.builder.add_shape_sphere,
+        sid = self._note_shape(body_idx, self._builder_add(_b, self.builder.add_shape_sphere,
                         xform=_xf,
             radius=float(radius),
             cfg=self._shape_cfg_override(mu=mu, mu_t=mu_t, mu_r=mu_r),
         ), _loc)
+        # The exact call OmSolid.cpp makes for a Robot wrapper that registers
+        # no collider of its own ("sphere r=0.001 (Robot wrapper placeholder)"):
+        # remembered so finalize() can stop it carrying contact -- see
+        # _quiet_wrapper_placeholders.
+        if (_b >= 0 and float(radius) == 0.001 and float(cx) == 0.0 and float(cy) == 0.0
+                and float(cz) == 0.0 and float(mu) < 0.0 and float(mu_t) < 0.0
+                and float(mu_r) < 0.0 and sid is not None and int(sid) >= 0):
+            ph = self.__dict__.setdefault("_placeholder_shapes", {})
+            ph[int(_b)] = int(sid)
+        return sid
 
     def add_shape_box(self, body_idx, hx, hy, hz, cx=0.0, cy=0.0, cz=0.0, ke=-1.0,
                       qx=0.0, qy=0.0, qz=0.0, qw=1.0, mu=-1.0, mu_t=-1.0, mu_r=-1.0):
@@ -3507,6 +3517,56 @@ class World:
         ))
         return slot
 
+    def set_joint_passive_dynamics(self, slot, damping, friction):
+        """Attach PASSIVE joint dynamics to a queued revolute / prismatic joint.
+
+        ``damping``  viscous damping, N*m*s/rad (N*s/m on a slider) -- a
+                     JointParameters.dampingConstant, which is where a URDF
+                     ``<dynamics damping>`` lands (OmUrdfImporter).
+        ``friction`` Coulomb (dry) joint friction, N*m (N) -- a
+                     JointParameters.staticFriction, i.e. URDF ``<dynamics
+                     friction>``.
+
+        Both reach newton's builder as the joint's ``damping`` / ``friction``
+        and its MuJoCo conversion as ``dof_damping`` / ``dof_frictionloss``.
+        Until 2026-10-03 neither reached the solver at all: the engine's
+        updateSpringAndDampingConstants() was an empty ODE-era sink, and a
+        published Raspberry Pi Mouse URDF declaring damping="1.0"
+        friction="1.0" on both wheels compiled to ``dof damping=0.00
+        frictionloss=0.000`` (rtcorp rig, pimouse_square_rcF_dt2_mu1p0
+        .mjmodel.txt). A SEPARATE verb, not two more add_joint_revolute
+        arguments, so an engine binary and a runtime of different vintages
+        cannot shift a positional argument: the engine calls it only for a
+        joint that declares a non-zero value, and an older runtime without
+        it costs that joint its dynamics (logged), never its registration.
+
+        The queued values reach the builder only with OMNISIM_NEWTON_JOINT_DYNAMICS=1
+        (value-parsed, default OFF -- see _joint_passive_dynamics_enabled). Returns 0, or -1
+        for a slot that is not a queued 1-DoF joint."""
+        try:
+            j = self.pending_revolutes[int(slot)]
+        except (IndexError, TypeError, ValueError):
+            return -1
+        if j.get("kind") not in ("revolute", "prismatic"):
+            return -1
+        j["damping"] = max(0.0, float(damping))
+        j["friction"] = max(0.0, float(friction))
+        return 0
+
+    @staticmethod
+    def _joint_passive_dynamics_enabled():
+        # OMNISIM_NEWTON_JOINT_DYNAMICS (value-parsed, default OFF since the
+        # 2026-10-03 integration re-check): =1 applies the dampingConstant /
+        # staticFriction queued by set_joint_passive_dynamics. It ships OFF because
+        # a velocity servo's stall torque is still capped by the gain clamp rather
+        # than the declared effort, so a declared wheel friction can stall a robot
+        # the real motor would drive (RT Raspberry Pi Mouse: 0.97 -> 0.16 of
+        # commanded travel), and worlds calibrated without damping drift (metazoa
+        # reef roams at half speed). Turn the default on once the servo honours
+        # the declared effort.
+        v = _os.environ.get("OMNISIM_NEWTON_JOINT_DYNAMICS", "").strip().lower()
+        return v in ("1", "true", "on", "yes")
+
     def add_joint_hinge2(self, parent_idx, child_idx,
                          ax1, ay1, az1, ax2, ay2, az2,
                          parent_anchor_x, parent_anchor_y, parent_anchor_z,
@@ -4354,6 +4414,7 @@ class World:
                 parent=j["parent"], child=j["child"],
                 parent_xform=wp.transform(j["p_anchor"], j["p_quat"]),
                 child_xform=wp.transform((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)))
+        self._normalise_unbounded_limits(j)
         is_motor = j["target_kd"] > 0.0
         j["_is_motor"] = is_motor   # recorded for the finalize() joint diag
         mode = (newton.JointTargetMode.POSITION_VELOCITY if is_motor
@@ -4525,6 +4586,14 @@ class World:
             joint_kwargs["effort_limit"] = j["effort_limit"]
         if j["velocity_limit"] > 0.0:
             joint_kwargs["velocity_limit"] = j["velocity_limit"]
+        # Passive dynamics (set_joint_passive_dynamics, 2026-10-03): only a
+        # joint that DECLARED them carries the keys, so every other joint
+        # keeps newton's defaults byte-for-byte.
+        if self._joint_passive_dynamics_enabled():
+            if float(j.get("damping", 0.0) or 0.0) > 0.0:
+                joint_kwargs["damping"] = float(j["damping"])
+            if float(j.get("friction", 0.0) or 0.0) > 0.0:
+                joint_kwargs["friction"] = float(j["friction"])
         # Prismatic (slider) joints -- gripper fingers -- share the entire
         # queue/topo-sort/gain path; only the builder call differs.
         if j.get("kind") == "prismatic":
@@ -4533,6 +4602,165 @@ class World:
             jid = self.builder.add_joint_revolute(**joint_kwargs)
         self._seed_initial_q(jid, j)
         return jid
+
+    # A revolute/prismatic range at or beyond this many rad (m) at BOTH ends is
+    # the ROS/Gazebo spelling of "no limit" (`lower="-1e+16" upper="1e+16"`,
+    # SDF's own sentinel), not a travel range anyone can reach.
+    _UNBOUNDED_LIMIT = 1.0e6
+
+    def _normalise_unbounded_limits(self, j):
+        """Treat a +-1e16-style "limit" as no limit (2026-10-03).
+
+        ⚠ WHY. URDF has no way to say "continuous" for a joint that is also
+        meant to carry an effort/velocity <limit>, so ROS descriptions spell a
+        wheel `type="revolute"` with `lower="-1e+16" upper="1e+16"` (Neobotix
+        ROX diff and MP-400 both do; Gazebo reads the 1e16 as unlimited). The
+        engine classifies a motorised hinge as a POSITION servo whenever its
+        limits differ (OmBasicJoint: ``limitLower != limitUpper``), so such a
+        wheel arrives here with ke = effort*10 and a position target of 0 that
+        nothing ever moves in velocity mode (setPosition(inf) sends velocity
+        targets only). The spring then pins the wheel to its start angle.
+        MEASURED on both Neobotix bases: wheel spin 0.0015 of the commanded
+        rate (MP-400 0.0001) while Andino's `continuous` wheels in the same
+        session tracked 0.94-1.0; engine-free on a ROX-like rover, 0.0167 vs
+        0.9973. (Not the 2026-09-20 importer change: a +-1e16 range was
+        already "full range" and emitted as minPosition/maxPosition since
+        2026-05-29.)
+
+        WHAT. Such a range is dropped (no MuJoCo joint limit), and a motorised
+        REVOLUTE gets the exact velocity-wheel config a `continuous` joint gets
+        (ke=0, kd=500), so the velocity-servo clamp and wheel armature treat it
+        as the wheel it is. A slider keeps its gains (OmBasicJoint classifies
+        every slider as position-controlled on purpose) and only loses the
+        sentinel range.
+
+        ⚠ KNOWN LIMIT until the engine half ships: the engine's W1.4 servo
+        promotion (a controller's finite setPosition() re-gains a limit-less
+        wheel) keys on OmBasicJoint's own "limitless" set, which this joint is
+        not in, so a finite setPosition() on it is ignored -- exactly as it is
+        on a `continuous` joint on the GPU path. The engine half applies the
+        same threshold in OmBasicJoint's ``positionControlled`` test
+        (isUnboundedLimitRange); a binary carrying it sends ke=0 itself, and
+        this method then only drops the sentinel range.
+
+        OMNISIM_NEWTON_UNBOUNDED_LIMIT_AS_CONTINUOUS=0 reverts (value-parsed).
+        """
+        if j.get("kind") not in ("revolute", "prismatic"):
+            return
+        lo = float(j.get("limit_lower", 0.0))
+        hi = float(j.get("limit_upper", 0.0))
+        big = self._UNBOUNDED_LIMIT
+        if not (lo <= -big and hi >= big):
+            return
+        v = (_os.environ.get("OMNISIM_NEWTON_UNBOUNDED_LIMIT_AS_CONTINUOUS")
+             or "1").strip().lower()
+        if v in ("0", "false", "off", "no"):
+            return
+        j["limit_lower"] = 0.0
+        j["limit_upper"] = 0.0
+        j["_unbounded_limit"] = (lo, hi)
+        demoted = (j.get("kind") == "revolute" and float(j.get("target_kd", 0.0)) > 0.0
+                   and float(j.get("target_ke", 0.0)) > 0.0)
+        if demoted:
+            j["target_ke"] = 0.0
+            j["target_kd"] = 500.0
+        n = getattr(self, "_n_unbounded_limits", 0) + 1
+        self._n_unbounded_limits = n
+        nd = getattr(self, "_n_unbounded_demoted", 0) + (1 if demoted else 0)
+        self._n_unbounded_demoted = nd
+        self._set_engine_note(
+            "unbounded_limits",
+            "%d joint(s) declared a +-%.3g-style limit (>= %.0g at both ends) and were "
+            "registered as limit-less; %d motorised revolute(s) among them use the "
+            "velocity-wheel config (ke=0, kd=500) like a `continuous` joint. "
+            "OMNISIM_NEWTON_UNBOUNDED_LIMIT_AS_CONTINUOUS=0 reverts."
+            % (n, max(abs(lo), abs(hi)), big, nd))
+
+    def _quiet_wrapper_placeholders(self):
+        """Stop the 1 mm Robot-wrapper placeholder from carrying contact
+        when the robot's own links collide (2026-10-03).
+
+        ⚠ WHY. OmSolid.cpp gives a Robot wrapper that registers no collider
+        (the default: its descendants are the load-bearing colliders) a 1 mm
+        sphere AT ITS ORIGIN "just to keep the body well-formed -- physically
+        negligible". It is not negligible wherever the origin sits at or below
+        the wheel contact plane: a URDF rooted at base_footprint (ground level)
+        or a PROTO whose origin is under the axles puts that sphere ON the
+        floor, where it is a frictional skid point -- or the only support.
+        MEASURED: Robotnik RB-ROBOUT / RB-KAIROS (origin ~5 cm below the wheel
+        contact plane) rest on it with every wheel in the air and move
+        0.0005-0.0096 m per commanded metre while their wheels track 0.997;
+        engine-free, a ROX-like rover rooted at ground level moves 0.000 m per
+        commanded metre with the placeholder and 0.992 without it.
+
+        WHAT. Each placeholder whose body has at least one DESCENDANT link
+        (through any joint) owning a colliding shape loses its collision flag:
+        it stays on the body (so nothing that counts shapes changes) but it no
+        longer touches anything. A wrapper with no colliding descendants keeps
+        it -- there it is the only thing between the robot and the floor.
+        MuJoCo needs no geom on a body that carries its own mass and inertia,
+        and the XPBD reason the placeholder was added for (hinges decoupling
+        from a shapeless body) left with XPBD on 2026-08-07.
+
+        OMNISIM_NEWTON_WRAPPER_PLACEHOLDER_COLLIDES=1 restores the colliding
+        placeholder (value-parsed; default 0 = quiet).
+        """
+        ph = getattr(self, "_placeholder_shapes", None)
+        if not ph:
+            return
+        v = (_os.environ.get("OMNISIM_NEWTON_WRAPPER_PLACEHOLDER_COLLIDES") or "0").strip().lower()
+        if v not in ("0", "false", "off", "no"):
+            return
+        try:
+            collide = int(newton.ShapeFlags.COLLIDE_SHAPES)
+        except Exception:                                   # noqa: BLE001
+            from newton.geometry import ShapeFlags as _SF
+            collide = int(_SF.COLLIDE_SHAPES)
+        flags = self.builder.shape_flags
+        body_shapes = getattr(self.builder, "body_shapes", {}) or {}
+        children = {}
+        for j in getattr(self, "pending_revolutes", ()) or ():
+            try:
+                children.setdefault(int(j["parent"]), []).append(int(j["child"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+
+        def _collides(body):
+            for s in body_shapes.get(body, ()) or ():
+                if ph.get(body) == int(s):
+                    continue
+                if int(flags[int(s)]) & collide:
+                    return True
+            return False
+
+        quieted = []
+        for body, sid in sorted(ph.items()):
+            seen, stack, found = {body}, list(children.get(body, ())), False
+            while stack and not found:
+                b = stack.pop()
+                if b in seen:
+                    continue
+                seen.add(b)
+                found = _collides(b)
+                stack.extend(children.get(b, ()))
+            if found and 0 <= sid < len(flags):
+                flags[sid] = int(flags[sid]) & ~collide
+                quieted.append(body)
+        if quieted:
+            self._set_engine_note(
+                "wrapper_placeholder",
+                "%d Robot wrapper placeholder sphere(s) (r=1 mm at the robot origin) made "
+                "non-colliding: their robots' links carry the contact. "
+                "OMNISIM_NEWTON_WRAPPER_PLACEHOLDER_COLLIDES=1 restores them." % len(quieted))
+
+    def _set_engine_note(self, key, text):
+        """One keyed line for the engine log, emitted after finalize via
+        _fin_report() (the runtime's only finalize-time channel into OmLog;
+        _newton_log() writes a side file nobody reads)."""
+        notes = getattr(self, "_engine_notes", None)
+        if notes is None:
+            notes = self._engine_notes = {}
+        notes[key] = text
 
     def _seed_initial_q(self, jid, j):
         """Start a 1-DoF joint at its authored `position` (2026-09-08).
@@ -6008,14 +6236,20 @@ class World:
         marks.append((label, _t - self._fin_t0))
 
     def _fin_report(self):
+        # The engine logs this string once after finalize, prefixed with
+        # "[OmNewtonBackend] ". Keyed notes (_set_engine_note) ride along on
+        # their own lines so a substitution the runtime made is visible in the
+        # engine log without a C++ change.
+        lines = ["%s" % t for _k, t in sorted((getattr(self, "_engine_notes", None) or {}).items())]
         marks = getattr(self, "_fin_marks", None)
-        if not marks:
-            return ""
-        out, prev = [], 0.0
-        for label, t in marks:
-            out.append("%s %.0fms" % (label, (t - prev) * 1000.0))
-            prev = t
-        return "finalize phases: " + " + ".join(out) + (" = %.0fms total" % (marks[-1][1] * 1000.0))
+        if marks:
+            out, prev = [], 0.0
+            for label, t in marks:
+                out.append("%s %.0fms" % (label, (t - prev) * 1000.0))
+                prev = t
+            lines.insert(0, "finalize phases: " + " + ".join(out)
+                         + (" = %.0fms total" % (marks[-1][1] * 1000.0)))
+        return "\n[OmNewtonBackend] ".join(lines)
 
     def finalize(self):
         self._fin_mark("enter")
@@ -6353,6 +6587,7 @@ class World:
             self._newton_log("[OmNewtonBackend] %d joint(s) start at their authored position "
                              "(HingeJointParameters/JointParameters.position); "
                              "OMNISIM_NEWTON_SPAWN_AT_POSITION=0 reverts" % self._n_seeded_q)
+        self._quiet_wrapper_placeholders()
         self._fin_mark("topology")
         # newton raises "Cannot create an articulation with no joints" on an
         # empty list (builder.py:3062). Every world with a body has at least the
@@ -8268,6 +8503,34 @@ class World:
             return
         _s1(m, d)
 
+    @staticmethod
+    def _joint_clamp_slack_from_env():
+        """(revolute rad, slider m) overshoot the post-step clamp leaves to
+        MuJoCo's own limit row before it touches the joint STATE.
+
+        Value-parsed; `=0` restores the pre-2026-10-03 exact state clamp
+        (which hid a stop-resting joint's distal load -- see step()). A
+        malformed or negative value falls back to the default.
+        """
+        import os as _jcos
+
+        def _read(key, default):
+            raw = _jcos.environ.get(key)
+            if raw in (None, ""):
+                return default
+            try:
+                v = float(raw)
+            except ValueError:
+                return default
+            return v if v >= 0.0 else default
+
+        # Post-step joint-limit clamp slack: overshoot past a stop that is left
+        # to MuJoCo's own (soft) limit row; only the readback reports the stop.
+        # Revolute rad / slider m; =0 restores the old exact state clamp, which
+        # hid the distal load of a joint resting on its stop.
+        return (_read("OMNISIM_NEWTON_JOINT_CLAMP_SLACK", 0.05),
+                _read("OMNISIM_NEWTON_JOINT_CLAMP_SLACK_LINEAR", 0.005))
+
     def _mjc_clamp_needed(self):
         """Is any clampable joint actually outside its limits right now?
 
@@ -9036,6 +9299,12 @@ class World:
                         "model (%r) -- reverted to the gain-only clamp; this "
                         "world's wheels keep the low stall torque." % (_ae,))
                     armed = []
+            # Remembered so set_joint_effort_limit(0) can take it back off: the
+            # armature exists only to carry the servo's gain, and a joint whose
+            # motor has been switched off must not keep a flywheel.
+            self._wheel_armature_added = {int(_d): float(_a) for _d, _a, _o in armed}
+            self._sync_passive_armature(
+                m, getattr(sv, "mjw_model", None) if getattr(self, "_kv_target_warp", False) else None)
             if clamped and getattr(self, "_kv_target_warp", False):
                 wm = getattr(sv, "mjw_model", None)
                 if wm is None:
@@ -10310,10 +10579,37 @@ class World:
         #
         # Off-switch: OMNISIM_NEWTON_DISABLE_JOINT_CLAMP=1 (for legacy
         # studies; defaults to ENFORCEMENT ON).
+        #
+        # ⚠ A JOINT RESTING ON ITS STOP MUST KEEP ITS LIMIT CONSTRAINT (fixed
+        # 2026-10-03). MuJoCo enforces every finite range itself (the model
+        # carries jnt_limited=1) as a SOFT constraint: a joint loaded into its
+        # stop settles a hair past it (5e-4 rad under 2.5 N.m at the default
+        # limit_ke). The old clamp then snapped q back to EXACTLY the limit and
+        # zeroed the inward velocity -- and MuJoCo instantiates a limit row only
+        # when dist < margin (0), so at dist == 0 the row is NOT active. Every
+        # step the distal links therefore fell freely about the stop, unsupported,
+        # and the clamp threw that motion away afterwards. Nothing above the stop
+        # ever carried their weight: OpenArm v2 arm straight out, elbow on its
+        # lower stop, a stiff servo held the shoulder with 3.84 N.m against a true
+        # static requirement of 11.68 (0.15 rad off the stop: 11.655 vs 11.646).
+        # Engine-free repro: tests/test_newton_joint_limit_load.py (2-link
+        # pendulum: 6.50 vs 12.26 N.m before, 12.26 after).
+        #
+        # So a small overshoot is now left to MuJoCo's own limit row (the STATE
+        # is untouched) and only the READBACK is clamped into range -- sensors
+        # keep reporting the stop, exactly as before. The state is clamped only
+        # past a SLACK (default 0.05 rad / 0.005 m), and then onto the slack
+        # boundary rather than onto the limit, so the limit row stays active
+        # while the gross overshoot is removed. OMNISIM_NEWTON_JOINT_CLAMP_SLACK
+        # (rad, revolute) and OMNISIM_NEWTON_JOINT_CLAMP_SLACK_LINEAR (m, slider)
+        # are value-parsed; =0 restores the old exact state clamp byte-for-byte.
+        # A static load past slack * limit stiffness (~250 N.m at the defaults)
+        # is still partly hidden -- raise OMNISIM_NEWTON_LIMIT_KE or the slack.
         if not hasattr(self, "_joint_clamp_on"):
             import os as _bnos
             self._joint_clamp_on = (_bnos.environ.get(
                 "OMNISIM_NEWTON_DISABLE_JOINT_CLAMP", "0") == "0")
+            self._joint_clamp_slack = self._joint_clamp_slack_from_env()
         # ⚠ SKIPPED ON MAXIMAL-COORDINATE SOLVERS. There the clamp is dead for
         # dynamics -- VBD never reads state.joint_q, and enforces limits itself
         # through its own limit slot -- but it is NOT harmless: it costs two
@@ -10356,6 +10652,8 @@ class World:
                 _q_changed = False
                 _qd_changed = False
                 _bh2_clamp = self.ball_hinge2_enabled()
+                _slack_rot, _slack_lin = self._joint_clamp_slack
+                _rb_fix = []          # (q index, value) the READBACK reports
                 for _slot, _real in self.slot_to_real_idx.items():
                     _spec = self.pending_revolutes[_slot]
                     # Multi-DoF (ball / hinge2) and 0-DoF (fixed) specs carry no
@@ -10392,21 +10690,32 @@ class World:
                     # back toward the valid range passes through, so a
                     # joint sitting at q=lo with an actuator pulling it
                     # up isn't frozen on the stop.
+                    #
+                    # Within the slack the STATE is left to MuJoCo's own limit
+                    # row and only the readback reports the stop (see the
+                    # header above: snapping the state onto the limit
+                    # deactivates that row and hides the distal links' weight).
                     _lo, _hi = _spec["limit_lower"], _spec["limit_upper"]
                     if _lo != _hi and 0 <= _qi < len(_q_arr):
                         _q = float(_q_arr[_qi])
+                        _slk = (_slack_lin if _spec.get("kind") == "prismatic"
+                                else _slack_rot)
                         if _q < _lo:
-                            _q_arr[_qi] = _lo
-                            _q_changed = True
-                            if 0 <= _qdi < len(_qd_arr) and _qd_arr[_qdi] < 0.0:
-                                _qd_arr[_qdi] = 0.0
-                                _qd_changed = True
+                            _rb_fix.append((_qi, _lo))
+                            if _q < _lo - _slk:
+                                _q_arr[_qi] = _lo - _slk
+                                _q_changed = True
+                                if 0 <= _qdi < len(_qd_arr) and _qd_arr[_qdi] < 0.0:
+                                    _qd_arr[_qdi] = 0.0
+                                    _qd_changed = True
                         elif _q > _hi:
-                            _q_arr[_qi] = _hi
-                            _q_changed = True
-                            if 0 <= _qdi < len(_qd_arr) and _qd_arr[_qdi] > 0.0:
-                                _qd_arr[_qdi] = 0.0
-                                _qd_changed = True
+                            _rb_fix.append((_qi, _hi))
+                            if _q > _hi + _slk:
+                                _q_arr[_qi] = _hi + _slk
+                                _q_changed = True
+                                if 0 <= _qdi < len(_qd_arr) and _qd_arr[_qdi] > 0.0:
+                                    _qd_arr[_qdi] = 0.0
+                                    _qd_changed = True
                 if _q_changed:
                     self.state_a.joint_q.assign(_q_arr)
                 if _qd_changed:
@@ -10420,6 +10729,13 @@ class World:
                 # paying another GPU sync in get_joint_angle(). (Safe on
                 # MuJoCo, which maintains joint_q itself; the XPBD caveat
                 # that used to gate this went with the solver.)
+                # A joint inside the slack reads back AT its stop: the cache is
+                # then a COPY with those entries clamped, never the state array
+                # itself (on CPU, warp's numpy() is a view of the live state).
+                if _rb_fix:
+                    _q_arr = _q_arr.copy()
+                    for _rbi, _rbv in _rb_fix:
+                        _q_arr[_rbi] = _rbv
                 self._joint_q_cache = _q_arr
                 self._joint_q_cache_fresh = True
                 # body_q stays one tick stale (still reflects pre-clamp
@@ -10878,6 +11194,163 @@ class World:
             m.actuator_gainprm[a_vel, 0] = float(kd)
             m.actuator_biasprm[a_vel, 2] = -float(kd)
         return 0
+
+    def set_joint_effort_limit(self, slot_id, dof, effort):
+        """Motor.setAvailableTorque/Force(): cap the TOTAL actuator torque on
+        one joint DoF at |effort| from now on (2026-10-03).
+
+        ⚠ WHY. The available force never reached the solver: newton bakes the
+        URDF effort into the joint's ``jnt_actfrcrange`` (MuJoCo's joint-level
+        clamp on the P+D actuator SUM) at conversion and nothing wrote it
+        afterwards, so setAvailableTorque(0) -- the Webots idiom for "make this
+        joint passive" -- left a full-strength velocity servo targeting 0, i.e.
+        a brake. MEASURED (Ekumen Andino, 2023 description, swivel caster):
+        with and without setAvailableTorque(0) on the caster joints the run
+        was identical to 9 significant figures, and the caster wheel turned
+        1.18 rad over ~1.6 m of travel where free rolling is ~100 rad. Every
+        URDF revolute/continuous joint is imported WITH a motor, so this was
+        the only way to make a passive URDF joint passive.
+
+        WHAT. Writes ``jnt_actfrcrange = (-|effort|, |effort|)`` and sets
+        ``jnt_actfrclimited`` on the CPU ``mj_model`` and, on mujoco_warp, the
+        device copy. effort 0 -> the actuators deliver nothing: the joint is
+        free (its authored damping / friction / armature still act).
+        Returns 0 ok, -1 not applicable (no solver yet, unknown slot, joint
+        without actuators), -2 the GPU write failed.
+        """
+        sv = self._mjc_solver()
+        if sv is None:
+            return -1
+        m = getattr(sv, "mj_model", None)
+        if m is None or self.model is None:
+            return -1
+        real = self.slot_to_real_idx.get(int(slot_id))
+        if real is None:
+            return -1
+        qd_cache = getattr(self, "_qd_start_cache_sjg", None)
+        if qd_cache is None:
+            qd_cache = self.model.joint_qd_start.numpy()
+            self._qd_start_cache_sjg = qd_cache
+        a_pos, a_vel = self._actuator_pair(int(qd_cache[real]) + int(dof))
+        a = a_pos if a_pos is not None else a_vel
+        if a is None:
+            return -1
+        jid = int(m.actuator_trnid[a][0])
+        if not (0 <= jid < m.njnt):
+            return -1
+        e = abs(float(effort))
+        m.jnt_actfrcrange[jid, 0] = -e
+        m.jnt_actfrcrange[jid, 1] = e
+        m.jnt_actfrclimited[jid] = 1
+        # The wheel armature (_clamp_velocity_servo_gains) exists only to carry
+        # the servo's gain; a switched-off motor must not leave a flywheel on
+        # the joint (measured: a passive pendulum swung 0.32 rad in 1 s with it,
+        # where gravity alone swings it through ~1 rad). Taken off at effort 0,
+        # put back when torque returns.
+        dof_m = int(m.jnt_dofadr[jid]) + int(dof)
+        zero = self.__dict__.setdefault("_effort_zero_dofs", set())
+        if e == 0.0:
+            zero.add(dof_m)
+        else:
+            zero.discard(dof_m)
+        self._sync_passive_armature(m, None)
+        # ⚠ THE FORCE CLAMP ALONE IS NOT PASSIVE. MuJoCo's implicit integrators
+        # put the velocity actuator's d(force)/d(qvel) = -kv into the
+        # acceleration solve as (M + dt*kv) whether or not the force is then
+        # clamped, so a joint with kv=500 at dt=2 ms still moves like one
+        # ~12x heavier (measured: the pendulum below covered 0.52 rad in 1 s
+        # instead of swinging through ~1 rad). At effort 0 the two actuators'
+        # gains are therefore zeroed too, and restored when torque returns.
+        stash = self.__dict__.setdefault("_passive_gain_stash", {})
+        acts = [x for x in (a_pos, a_vel) if x is not None]
+        gain_changed = []
+        if e == 0.0:
+            for x in acts:
+                if x not in stash:
+                    stash[x] = (float(m.actuator_gainprm[x, 0]), float(m.actuator_biasprm[x, 1]),
+                                float(m.actuator_biasprm[x, 2]))
+                    m.actuator_gainprm[x, 0] = 0.0
+                    m.actuator_biasprm[x, 1] = 0.0
+                    m.actuator_biasprm[x, 2] = 0.0
+                    gain_changed.append(x)
+        else:
+            for x in acts:
+                g = stash.pop(x, None)
+                if g is not None:
+                    m.actuator_gainprm[x, 0] = g[0]
+                    m.actuator_biasprm[x, 1] = g[1]
+                    m.actuator_biasprm[x, 2] = g[2]
+                    gain_changed.append(x)
+        # The device copy too: on mujoco_warp it is the model that steps, and
+        # on the CPU path newton's notify_model_changed(JOINT_DOF_PROPERTIES)
+        # copies it back over mj_model, which would silently undo this write.
+        on_gpu = not getattr(sv, "use_mujoco_cpu", False)
+        wm = getattr(sv, "mjw_model", None)
+        if wm is not None and hasattr(wm, "jnt_actfrcrange"):
+            try:
+                r = wm.jnt_actfrcrange.numpy()
+                if r.ndim == 2:
+                    r[jid] = (-e, e)
+                else:
+                    r[:, jid] = (-e, e)
+                wm.jnt_actfrcrange.assign(r)
+                lim = getattr(wm, "jnt_actfrclimited", None)
+                if lim is not None:
+                    ln = lim.numpy()
+                    ln[..., jid] = 1
+                    lim.assign(ln)
+                if on_gpu:   # armature and gains live in the device model there
+                    self._sync_passive_armature(None, wm)
+                    if gain_changed:
+                        g = wm.actuator_gainprm.numpy()
+                        b = wm.actuator_biasprm.numpy()
+                        for x in gain_changed:
+                            g[:, x, 0] = m.actuator_gainprm[x, 0]
+                            b[:, x, 1] = m.actuator_biasprm[x, 1]
+                            b[:, x, 2] = m.actuator_biasprm[x, 2]
+                        wm.actuator_gainprm.assign(g)
+                        wm.actuator_biasprm.assign(b)
+            except Exception as exc:                        # noqa: BLE001
+                self._newton_log("[OmNewtonBackend] set_joint_effort_limit: device-model "
+                                 "write failed for joint %d: %r" % (jid, exc))
+                if on_gpu:
+                    return -2
+        elif on_gpu:
+            return -2
+        return 0
+
+    def _sync_passive_armature(self, m, wm):
+        """Wheel armature off for every DoF whose motor torque is 0, back on
+        otherwise. Called from set_joint_effort_limit and, because the armature
+        is only added on the first step, from _clamp_velocity_servo_gains too.
+        ``m`` / ``wm``: the CPU / device model to write (None skips one);
+        the applied state is tracked per model so each is written once."""
+        added = getattr(self, "_wheel_armature_added", None) or {}
+        if not added:
+            return
+        zero = getattr(self, "_effort_zero_dofs", None) or set()
+        for model, key in ((m, "_armature_off_cpu"), (wm, "_armature_off_dev")):
+            if model is None or not hasattr(model, "dof_armature"):
+                continue
+            off = self.__dict__.setdefault(key, set())
+            deltas = {}
+            for d, a in added.items():
+                if d in zero and d not in off:
+                    deltas[d] = -a
+                    off.add(d)
+                elif d not in zero and d in off:
+                    deltas[d] = a
+                    off.discard(d)
+            if not deltas:
+                continue
+            if model is m:
+                for d, dl in deltas.items():
+                    m.dof_armature[d] = float(m.dof_armature[d]) + dl
+            else:
+                da = wm.dof_armature.numpy()
+                for d, dl in deltas.items():
+                    da[..., d] += dl
+                wm.dof_armature.assign(da)
 
     def particle_stats_packed(self, particle_start=-1, particle_end=-1):
         # Node-scoped particle STATS for the supervisor readback verb

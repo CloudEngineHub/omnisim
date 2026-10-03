@@ -109,6 +109,10 @@ DEF PLACE_TABLE Solid {
 # it at mid-height while still clearing the table top by 20 mm. A 50 mm cube
 # grasped at its centre drives the fingertips into the table and the arm stalls
 # against it -- measured, 14.8 mm of unrecoverable aim error.
+# 2026-10-03: the 2F-85 palm box now collides (fixed-child colliders), and the
+# palm face is 25 mm above the pad centre, so the block is no longer pinched at
+# mid-height: the controller grasps at z=0.275 (palm ~10 mm clear of the block
+# top, pads over its upper 40 mm). See GRASP_Z in omniarm6_real_pick_place.py.
 DEF BLOCK Solid {
   translation 0.46 0 0.245
   children [

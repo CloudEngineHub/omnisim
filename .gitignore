@@ -662,3 +662,18 @@ social/launch/pilots/replies_2026_09_25/malo_pusht/bundle/
 !/tests/benchmarks/robot_ops/evidence/devloop/*/
 !/tests/benchmarks/robot_ops/evidence/devloop/*/loop.json
 !/tests/benchmarks/robot_ops/evidence/devloop/*/report.json
+
+# 2026-10-03 outreach/recheck rigs: keep rigs, worlds, scripts and results; drop re-fetchable
+# third-party mesh copies and raw engine stdout/stderr dumps (bulk, not evidence).
+/social/launch/company_outreach_*/**/*.stl
+/social/launch/company_outreach_*/**/*.STL
+/social/launch/company_outreach_*/**/*.obj
+/social/launch/company_outreach_*/**/*.dae
+/social/launch/recheck_*/**/*.stl
+/social/launch/recheck_*/**/*.STL
+/social/launch/recheck_*/**/*.obj
+/social/launch/recheck_*/**/*.dae
+/social/launch/company_outreach_*/**/*.stderr
+/social/launch/company_outreach_*/**/*.stdout
+/social/launch/recheck_*/**/*.stderr
+/social/launch/recheck_*/**/*.stdout

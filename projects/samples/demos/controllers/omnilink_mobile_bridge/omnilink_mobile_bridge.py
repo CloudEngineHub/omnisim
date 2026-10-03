@@ -1773,8 +1773,8 @@ class MobileBridge:
         `angular` is a BODY yaw rate the caller wants to SEE, not a number to
         feed the mixing. The two are not the same on a skid-steer base under
         this solver: the differential the ideal kinematics asks for delivers
-        `yaw_rate_gain` of it (0.942 on the Burger, 0.520 on the Husky --
-        measured 2026-09-11, see _mobile_configs). So the request is divided
+        `yaw_rate_gain` of it (0.912 on the Burger, 0.475 on the Husky --
+        re-measured 2026-10-03, see _mobile_configs). So the request is divided
         by the gain before it reaches the wheels, and clamped FIRST against
         the rate the base can really hold, so the correction can never ask
         for more wheel speed than exists.

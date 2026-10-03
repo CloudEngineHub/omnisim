@@ -950,6 +950,68 @@ void rpyToAxisAngle(double r, double p, double y, double &ax, double &ay, double
   az = (m10 - m01) / s;
 }
 
+// URDF rpy of a rotation matrix (the inverse of rpyToMatrix: R = Rz(y) Ry(p) Rx(r)).
+void matrixToRpy(double m00, double m10, double m20, double m21, double m22, double m01, double m11,
+                 double &r, double &p, double &y) {
+  const double sp = std::max(-1.0, std::min(1.0, -m20));
+  p = std::asin(sp);
+  if (std::abs(sp) < 1.0 - 1e-12) {
+    r = std::atan2(m21, m22);
+    y = std::atan2(m10, m00);
+  } else {
+    // Gimbal lock (pitch = +-90 deg): roll and yaw share one axis; put it all in yaw.
+    r = 0.0;
+    y = std::atan2(-m01, m11);
+  }
+}
+
+// T_a * T_b for two URDF origins: the frame b is expressed in, followed by b.
+UrdfOrigin composeUrdfOrigins(const UrdfOrigin &a, const UrdfOrigin &b) {
+  double a00, a01, a02, a10, a11, a12, a20, a21, a22;
+  double b00, b01, b02, b10, b11, b12, b20, b21, b22;
+  rpyToMatrix(a.roll, a.pitch, a.yaw, a00, a01, a02, a10, a11, a12, a20, a21, a22);
+  rpyToMatrix(b.roll, b.pitch, b.yaw, b00, b01, b02, b10, b11, b12, b20, b21, b22);
+  UrdfOrigin out;
+  out.x = a.x + a00 * b.x + a01 * b.y + a02 * b.z;
+  out.y = a.y + a10 * b.x + a11 * b.y + a12 * b.z;
+  out.z = a.z + a20 * b.x + a21 * b.y + a22 * b.z;
+  const bool aRot = a.roll != 0.0 || a.pitch != 0.0 || a.yaw != 0.0;
+  const bool bRot = b.roll != 0.0 || b.pitch != 0.0 || b.yaw != 0.0;
+  if (!aRot) {
+    out.roll = b.roll; out.pitch = b.pitch; out.yaw = b.yaw;  // exact: no re-extraction round trip
+  } else if (!bRot) {
+    out.roll = a.roll; out.pitch = a.pitch; out.yaw = a.yaw;
+  } else {
+    const double c00 = a00 * b00 + a01 * b10 + a02 * b20, c01 = a00 * b01 + a01 * b11 + a02 * b21;
+    const double c10 = a10 * b00 + a11 * b10 + a12 * b20, c11 = a10 * b01 + a11 * b11 + a12 * b21;
+    const double c20 = a20 * b00 + a21 * b10 + a22 * b20, c21 = a20 * b01 + a21 * b11 + a22 * b21;
+    const double c22 = a20 * b02 + a21 * b12 + a22 * b22;
+    matrixToRpy(c00, c10, c20, c21, c22, c01, c11, out.roll, out.pitch, out.yaw);
+  }
+  return out;
+}
+
+bool isIdentityUrdfOrigin(const UrdfOrigin &o) {
+  return o.x == 0.0 && o.y == 0.0 && o.z == 0.0 && o.roll == 0.0 && o.pitch == 0.0 && o.yaw == 0.0;
+}
+
+// OMNISIM_URDF_REROOT_KEEP_OFFSET (value-parsed, default ON since 2026-10-03).
+// When the importer re-roots past an empty frame link (base_footprint ->
+// base_link, see emitRobot), the fixed joint's offset is KEPT: the Robot's
+// frame stays the URDF root's (base_footprint, on the floor) and the promoted
+// link's visuals, collisions, inertial and child joints are emitted at that
+// offset. Until then the offset was dropped, so every child joint of the
+// promoted link moved by it -- a TurtleBot3 Burger's wheel axles landed at
+// z 0.023 in the Robot frame instead of 0.033 and the chassis rode the 10 mm
+// base_joint offset high relative to its `translation` (Pi Mouse: 1.85 mm).
+// =0 restores the dropped offset.
+bool urdfRerootKeepOffsetEnabled() {
+  const QString value = QString::fromUtf8(qgetenv("OMNISIM_URDF_REROOT_KEEP_OFFSET")).trimmed().toLower();
+  if (value.isEmpty())
+    return true;
+  return value != "0" && value != "false" && value != "off" && value != "no";
+}
+
 QString emitGeometry(const UrdfGeometry &g, const QString &indent) {
   if (g.kind == "box")
     return QString("%1geometry Box { size %2 %3 %4 }\n").arg(indent).arg(g.sx).arg(g.sy).arg(g.sz);
@@ -1055,7 +1117,29 @@ QString emitVisual(const UrdfVisual &v, const QString &indent, const QString &li
   return out;
 }
 
+// A URDF <collision><mesh scale="..."> is written as Mesh.scale (2026-10-03).
+// A boundingObject cannot hold a Transform, so before Mesh had a scale field the
+// importer could only warn and load the collider at UNIT scale -- the Neobotix
+// MP-400 body (MP-400-BODY.dae, authored in millimetres, scale 0.001) collided
+// 1000x too large, and the ROX frame, nanoscan and Argo casters likewise.
+// OMNISIM_URDF_COLLISION_MESH_SCALE=0 restores the unit-scale import and its
+// warning (value-parsed).
+bool urdfCollisionMeshScaleEnabled() {
+  const QString value = QString::fromUtf8(qgetenv("OMNISIM_URDF_COLLISION_MESH_SCALE")).trimmed().toLower();
+  if (value.isEmpty())
+    return true;
+  return value != "0" && value != "false" && value != "off" && value != "no";
+}
+
+QString meshScaleField(const UrdfGeometry &g) {
+  if (!meshHasNonUnitScale(g) || !urdfCollisionMeshScaleEnabled())
+    return QString();
+  return QString(" scale %1 %2 %3").arg(g.meshScaleX, 0, 'g', 17).arg(g.meshScaleY, 0, 'g', 17).arg(g.meshScaleZ, 0, 'g', 17);
+}
+
 // Emit the raw geometry primitive (Box, Cylinder, Sphere, Mesh) with the given indent.
+// Only collision paths call this (visuals go through emitGeometry, whose Transform
+// carries the scale), so a mesh's URDF scale rides on Mesh.scale here.
 QString emitRawGeometry(const UrdfGeometry &g, const QString &indent) {
   if (g.kind == "box")
     return indent + QString("Box { size %1 %2 %3 }\n").arg(g.sx).arg(g.sy).arg(g.sz);
@@ -1064,15 +1148,15 @@ QString emitRawGeometry(const UrdfGeometry &g, const QString &indent) {
   if (g.kind == "sphere")
     return indent + QString("Sphere { radius %1 }\n").arg(g.radius);
   if (g.kind == "mesh" && !g.meshPath.isEmpty())
-    return indent + QString("Mesh { url \"%1\" }\n").arg(g.meshPath);
+    return indent + QString("Mesh { url \"%1\"%2 }\n").arg(g.meshPath, meshScaleField(g));
   return QString();
 }
 
-// OmniSim does not honour scale on a Transform inside a boundingObject. If a
-// URDF collision mesh has non-unit scale we warn once per link; the mesh is
-// still emitted at unit scale so the robot at least has collision volume.
+// A boundingObject cannot hold a Transform, so the scale travels as Mesh.scale
+// (meshScaleField above). Only with that disabled is the mesh emitted at unit
+// scale, and then we warn once per link so the substitution is visible.
 void warnMeshCollisionScale(const QString &linkName, const UrdfGeometry &g) {
-  if (meshHasNonUnitScale(g)) {
+  if (meshHasNonUnitScale(g) && !urdfCollisionMeshScaleEnabled()) {
     OmLog::warning(QObject::tr("URDF link '%1': collision mesh '%2' has scale %3 %4 %5 which cannot be applied "
                                "inside a boundingObject; it will be loaded at unit scale.")
                      .arg(linkName, g.detail)
@@ -1134,7 +1218,7 @@ QString emitBoundingObject(const UrdfCollision &c, const QString &indent, const 
     if (c.geometry.kind == "sphere")
       return indent + QString("boundingObject Sphere { radius %1 }\n").arg(c.geometry.radius);
     if (c.geometry.kind == "mesh")
-      return indent + QString("boundingObject Mesh { url \"%1\" }\n").arg(c.geometry.meshPath);
+      return indent + QString("boundingObject Mesh { url \"%1\"%2 }\n").arg(c.geometry.meshPath, meshScaleField(c.geometry));
     return QString();
   }
 
@@ -1223,7 +1307,8 @@ QString emitOneSensorAtRoot(const UrdfSensor &s, const QString &indent) {
 }
 
 QString emitSensorsForLink(const QString &linkName, const QString &indent,
-                           const QHash<QString, QList<UrdfSensor>> &sensorsByLink) {
+                           const QHash<QString, QList<UrdfSensor>> &sensorsByLink,
+                           const UrdfOrigin *linkOffset = nullptr) {
   if (!urdfUseSensorsEnabled())
     return QString();
   if (!sensorsByLink.contains(linkName))
@@ -1236,24 +1321,29 @@ QString emitSensorsForLink(const QString &linkName, const QString &indent,
   QString out;
   for (const UrdfSensor &s : sensorsByLink.value(linkName)) {
     UrdfSensor local = s;
-    local.translationX = 0.0;
-    local.translationY = 0.0;
-    local.translationZ = 0.0;
+    // linkOffset: the link's frame in its Solid's frame -- non-null only for a
+    // re-rooted Robot link whose dropped-frame offset is kept (emitRobot).
+    // Translation only, like every other carrier placement in this file.
+    local.translationX = linkOffset ? linkOffset->x : 0.0;
+    local.translationY = linkOffset ? linkOffset->y : 0.0;
+    local.translationZ = linkOffset ? linkOffset->z : 0.0;
     out += emitOneSensorAtRoot(local, indent);
   }
   return out;
 }
 
 QString emitLinkChildren(const UrdfLink &link, const QString &indent,
-                        const QHash<QString, QList<UrdfSensor>> &sensorsByLink) {
+                        const QHash<QString, QList<UrdfSensor>> &sensorsByLink,
+                        const UrdfOrigin *linkOffset = nullptr) {
   QString out;
   for (const UrdfVisual &v : link.visuals)
     out += emitVisual(v, indent, link.name);
-  out += emitSensorsForLink(link.name, indent, sensorsByLink);
+  out += emitSensorsForLink(link.name, indent, sensorsByLink, linkOffset);
   return out;
 }
 
-QString emitLinkPhysics(const UrdfLink &link, const QString &indent, bool allowSyntheticPhysics = true) {
+QString emitLinkPhysics(const UrdfLink &link, const QString &indent, bool allowSyntheticPhysics = true,
+                        const UrdfOrigin *linkOffset = nullptr) {
   QString out;
 
   // Collect collisions with emittable geometry (supported primitives or resolved meshes).
@@ -1274,7 +1364,13 @@ QString emitLinkPhysics(const UrdfLink &link, const QString &indent, bool allowS
     // that the auto-derived inertia tensor isn't degenerate (1 mm sphere
     // produced ~1e-10 inertia, which appears to leave the merged root body
     // unable to receive friction-induced acceleration on small robots).
-    out += indent + "boundingObject Sphere { radius 0.01 }\n";
+    // linkOffset (a re-rooted Robot link, emitRobot): keep the placeholder at
+    // the LINK origin, not at the Robot's base_footprint frame on the floor.
+    if (linkOffset != nullptr && !isIdentityUrdfOrigin(*linkOffset))
+      out += indent + QString("boundingObject Pose { translation %1 %2 %3 children [ Sphere { radius 0.01 } ] }\n")
+                        .arg(linkOffset->x).arg(linkOffset->y).arg(linkOffset->z);
+    else
+      out += indent + "boundingObject Sphere { radius 0.01 }\n";
   }
   // OmniSim treats a Solid with boundingObject but no Physics as unable to
   // participate in collisions ("collisions will have no effect"). Many ROS
@@ -1768,11 +1864,20 @@ QString emitRobot(const UrdfRobot &robot) {
   // forces (verified on TurtleBot3 burger: wheels rotated at commanded
   // speed but the chassis stayed at (0,0,0)). Promoting the first real
   // child to the Robot's root puts the chassis body directly under the
-  // Robot node, no merger gymnastics required. Any fixed-joint offset is
-  // dropped -- the new root sits at the original Robot's `translation`,
-  // which usually shifts the robot a few cm relative to where the URDF
-  // author intended; small price for getting motion to work.
+  // Robot node, no merger gymnastics required.
+  //
+  // The skipped fixed joints' offset (`rerootOffset`, composed down the chain)
+  // used to be DROPPED here, which moved every child joint of the promoted link
+  // by it: on a TurtleBot3 Burger the wheel axles landed at z 0.023 in the Robot
+  // frame instead of 0.033 (base_joint is +0.010), so a robot placed at
+  // `translation ... 0` spawned with its wheels 10 mm into the floor and its
+  // frame then rode 10 mm above the `translation` it was given (Raspberry Pi
+  // Mouse: 1.85 mm). The offset is now KEPT (OMNISIM_URDF_REROOT_KEEP_OFFSET,
+  // default ON): the Robot frame stays the URDF root's (base_footprint), and
+  // the promoted link's visuals, collisions, inertial and child joints are
+  // emitted AT the offset, so the composed URDF kinematics are exact.
   bool rerooted = false;
+  UrdfOrigin rerootOffset;  // URDF root frame -> promoted link frame
   while (true) {
     const UrdfLink &candidate = robot.links.value(rootName);
     if (candidate.visuals.isEmpty() && candidate.collisions.isEmpty() && !candidate.inertial.present) {
@@ -1782,6 +1887,7 @@ QString emitRobot(const UrdfRobot &robot) {
           outJoints.append(j);
       }
       if (outJoints.size() == 1 && outJoints.first().type == "fixed") {
+        rerootOffset = composeUrdfOrigins(rerootOffset, outJoints.first().origin);
         rootName = outJoints.first().child;
         rerooted = true;
         continue;
@@ -1789,9 +1895,14 @@ QString emitRobot(const UrdfRobot &robot) {
     }
     break;
   }
+  const bool keepRerootOffset = rerooted && !isIdentityUrdfOrigin(rerootOffset) && urdfRerootKeepOffsetEnabled();
   if (rerooted && urdfDebugEnabled()) {
-    OmLog::info(QObject::tr("URDF_DEBUG robot '%1': re-rooted to '%2' (skipping empty frame links)")
-                  .arg(robot.name, rootName),
+    OmLog::info(QObject::tr("URDF_DEBUG robot '%1': re-rooted to '%2' (skipping empty frame links), offset "
+                            "xyz=[%3] rpy=[%4] %5")
+                  .arg(robot.name, rootName)
+                  .arg(vectorString(rerootOffset.x, rerootOffset.y, rerootOffset.z))
+                  .arg(vectorString(rerootOffset.roll, rerootOffset.pitch, rerootOffset.yaw))
+                  .arg(keepRerootOffset ? "kept" : "dropped"),
                 false, OmLog::PARSING);
   }
 
@@ -1842,6 +1953,51 @@ QString emitRobot(const UrdfRobot &robot) {
   QHash<QString, QList<UrdfJoint>> jointsByParent;
   for (const UrdfJoint &j : robot.joints)
     jointsByParent[j.parent].append(j);
+
+  // Keep the re-root offset (see the loop above): express everything the
+  // promoted link carries in the URDF root's frame. `rootLink` is already a
+  // copy; only the promoted link's own joints are re-expressed -- deeper links
+  // hang off them and inherit the shift through the emitted hierarchy.
+  if (keepRerootOffset) {
+    for (UrdfVisual &v : rootLink.visuals)
+      v.origin = composeUrdfOrigins(rerootOffset, v.origin);
+    for (UrdfCollision &c : rootLink.collisions)
+      c.origin = composeUrdfOrigins(rerootOffset, c.origin);
+    if (rootLink.inertial.present) {
+      // Only the inertial origin's xyz is emitted (centerOfMass); its rpy is
+      // not consumed by emitLinkPhysics, so it is left as authored. A rotated
+      // offset re-expresses the tensor itself: I' = R I R^T.
+      UrdfOrigin com = rootLink.inertial.origin;
+      com.roll = com.pitch = com.yaw = 0.0;
+      com = composeUrdfOrigins(rerootOffset, com);
+      rootLink.inertial.origin.x = com.x;
+      rootLink.inertial.origin.y = com.y;
+      rootLink.inertial.origin.z = com.z;
+      if (rootLink.inertial.hasInertiaMatrix &&
+          (rerootOffset.roll != 0.0 || rerootOffset.pitch != 0.0 || rerootOffset.yaw != 0.0)) {
+        double R[3][3];
+        rpyToMatrix(rerootOffset.roll, rerootOffset.pitch, rerootOffset.yaw, R[0][0], R[0][1], R[0][2], R[1][0],
+                    R[1][1], R[1][2], R[2][0], R[2][1], R[2][2]);
+        UrdfInertial &in = rootLink.inertial;
+        const double I[3][3] = {{in.ixx, in.ixy, in.ixz}, {in.ixy, in.iyy, in.iyz}, {in.ixz, in.iyz, in.izz}};
+        double RI[3][3], Out[3][3];
+        for (int r = 0; r < 3; ++r)
+          for (int c = 0; c < 3; ++c)
+            RI[r][c] = R[r][0] * I[0][c] + R[r][1] * I[1][c] + R[r][2] * I[2][c];
+        for (int r = 0; r < 3; ++r)
+          for (int c = 0; c < 3; ++c)
+            Out[r][c] = RI[r][0] * R[c][0] + RI[r][1] * R[c][1] + RI[r][2] * R[c][2];
+        in.ixx = Out[0][0]; in.iyy = Out[1][1]; in.izz = Out[2][2];
+        in.ixy = Out[0][1]; in.ixz = Out[0][2]; in.iyz = Out[1][2];
+      }
+    }
+    if (jointsByParent.contains(rootName)) {
+      QList<UrdfJoint> &rootJoints = jointsByParent[rootName];
+      for (UrdfJoint &j : rootJoints)
+        j.origin = composeUrdfOrigins(rerootOffset, j.origin);
+    }
+  }
+  const UrdfOrigin *const rootLinkOffset = keepRerootOffset ? &rerootOffset : nullptr;
 
   // Walk fixed-joint chain from each link back to the (possibly re-rooted)
   // root and accumulate translations. Used to relocate sensor emission from
@@ -1922,7 +2078,7 @@ QString emitRobot(const UrdfRobot &robot) {
   out += "  rotation 0 0 1 0\n";
   out += QString("  name \"%1\"\n").arg(robot.name);
   out += "  children [\n";
-  out += emitLinkChildren(rootLink, "    ", sensorsByLink);
+  out += emitLinkChildren(rootLink, "    ", sensorsByLink, rootLinkOffset);
   if (jointsByParent.contains(rootName)) {
     for (const UrdfJoint &j : jointsByParent.value(rootName))
       out += emitJoint(j, "    ", jointsByParent, robot.links, sensorsByLink);
@@ -1932,7 +2088,7 @@ QString emitRobot(const UrdfRobot &robot) {
   // recursive tree walk). Root-level emission is no longer needed.
   (void)sensorsAtRoot;
   out += "  ]\n";
-  out += emitLinkPhysics(rootLink, "  ");
+  out += emitLinkPhysics(rootLink, "  ", true, rootLinkOffset);
   out += "}\n";
   return out;
 }

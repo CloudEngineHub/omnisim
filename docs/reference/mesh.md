@@ -6,6 +6,7 @@ Mesh {
   field SFBool ccw TRUE
   field SFString name ""
   field SFInt32 materialIndex -1
+  field SFVec3f scale 1 1 1
 }
 ```
 
@@ -37,3 +38,8 @@ Note that the `name` field is applied only for Collada files.
 The `materialIndex` field applies only to Collada files.
 It defines a material for which all the geometries associated with this material will be included.
 If `materialIndex` is strictly negative then all the geometries of the Collada file are included.
+
+The `scale` field multiplies the decoded vertices per axis (normals follow, and a mirroring scale with an odd number of negative components keeps the faces pointing outwards).
+It is the way to scale a mesh used as a collision primitive: a `boundingObject` cannot contain a [Transform](transform.md), so a `Transform.scale` around a collision mesh is refused.
+The URDF importer writes it for a `<collision><mesh scale="...">` (before 2026-10-03 that scale was dropped and the collider loaded at unit scale -- a mesh authored in millimetres collided 1000 times too large).
+A zero component is read as 1, with a warning.

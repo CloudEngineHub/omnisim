@@ -21,6 +21,7 @@
 
 class OmDownloader;
 class OmMFString;
+class OmSFVector3;
 struct aiScene;
 
 class OmMesh : public OmTriangleMeshGeometry {
@@ -58,6 +59,7 @@ private:
   OmSFBool *mCcw;
   OmSFString *mName;
   OmSFInt *mMaterialIndex;
+  OmSFVector3 *mScale;  // per-axis vertex scale (2026-10-03; URDF <mesh scale> on a collider)
   bool mIsCollada;
   OmDownloader *mDownloader;
   bool mBoundingObjectNeedUpdate;
@@ -66,12 +68,14 @@ private:
   OmNode *clone() const override { return new OmMesh(*this); }
   void init();
   bool checkIfNameExists(const aiScene *scene, const QString &name) const;
+  OmVector3 sanitizedScale() const;
 
 private slots:
   void updateUrl();
   void updateCcw();
   void updateName();
   void updateMaterialIndex();
+  void updateScale();
   void downloadUpdate();
 };
 

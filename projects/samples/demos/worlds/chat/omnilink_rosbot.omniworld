@@ -28,7 +28,7 @@ OmniLinkStage {
 
 DEF ROSBOT URDFRobot {
   url "../../../../robots/husarion/rosbot_description/urdf/rosbot.urdf"
-  translation 0 0 0.05
+  translation 0 0 0.0075
   name "rosbot"
   supervisor TRUE
   controller "omnilink_mobile_bridge"

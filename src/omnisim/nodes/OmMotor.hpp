@@ -44,6 +44,8 @@ public:
   double acceleration() const { return mAcceleration->value(); }
   const OmVector3 &controlPID() const { return mControlPID->value(); }
   double maxForceOrTorque() const { return mMaxForceOrTorque->value(); }
+  // What setAvailableForce/Torque() (or an empty battery) left the motor with; 0 = switched off.
+  double availableForceOrTorque() const { return mMotorForceOrTorque; }
   double maxVelocity() const { return mMaxVelocity->value(); }
   double minPosition() const { return mMinPosition->value(); }
   double maxPosition() const { return mMaxPosition->value(); }

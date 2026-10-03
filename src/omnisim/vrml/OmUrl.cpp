@@ -131,11 +131,32 @@ QString OmUrl::computePath(const OmNode *node, const QString &field, const QStri
   return missing(rawUrl);
 }
 
+// UPSTREAM'S LOCAL SCHEME (2026-10-03). Webots names its install "webots://";
+// the rebrand renamed ours "omnisim://" and nothing kept the old spelling, so a
+// PROTO fetched from upstream (every R2023b+ cyberbotics PROTO declares its
+// dependencies as EXTERNPROTO "webots://projects/...") had each nested
+// declaration rejected as "not available at: webots://...". MEASURED on
+// Robotnik's own robotnik_webots demo.wbt: RectangleArena (fetched from the
+// R2023b URL) lost Parquetry, BrushedAluminium, SolidBox and Roughcast -- 16
+// load errors and no arena walls. Treat it as an alias of "omnisim://", which
+// is then resolved exactly as ours is (against the parent's remote prefix when
+// the parent is remote, else the local install).
+// OMNISIM_LEGACY_WEBOTS_SCHEME=0 disables the alias (value-parsed).
+QString OmUrl::normalizeLegacyScheme(const QString &url) {
+  static const bool enabled = []() {
+    const QString v = QString::fromUtf8(qgetenv("OMNISIM_LEGACY_WEBOTS_SCHEME")).trimmed().toLower();
+    return !(v == "0" || v == "false" || v == "off" || v == "no");
+  }();
+  if (enabled && url.startsWith("webots://"))
+    return QStringLiteral("omnisim://") + url.mid(9);
+  return url;
+}
+
 QString OmUrl::resolveUrl(const QString &rawUrl) {
   if (rawUrl.isEmpty())
     return rawUrl;
 
-  QString url = rawUrl;
+  QString url = normalizeLegacyScheme(rawUrl);
   url.replace("\\", "/");
 
   if (isWeb(url))
@@ -270,7 +291,7 @@ const QRegularExpression &OmUrl::vrmlResourceRegex() {
 
 QString OmUrl::combinePaths(const QString &rawUrl, const QString &rawParentUrl) {
   // use cross-platform forward slashes
-  QString url = rawUrl;
+  QString url = normalizeLegacyScheme(rawUrl);
   url.replace("\\", "/");
   QString parentUrl = rawParentUrl;
   parentUrl.replace("\\", "/");

@@ -92,6 +92,46 @@ namespace {
     return s;
   }
 
+  // A range at or beyond +-1e6 at BOTH ends is the ROS/Gazebo spelling of "no
+  // limit" (`<limit lower="-1e+16" upper="1e+16">` on a type="revolute" wheel --
+  // Neobotix ROX diff and MP-400), not a travel range. Classifying it as a
+  // position servo (ke = effort*10 held at the motor's start angle) pinned those
+  // wheels at 0.15 % of their commanded rate under setPosition(inf) +
+  // setVelocity(). Same threshold and hatch as the runtime's
+  // _normalise_unbounded_limits (omnisim_newton_runtime.py), which drops the
+  // range on the solver side. OMNISIM_NEWTON_UNBOUNDED_LIMIT_AS_CONTINUOUS=0
+  // reverts (value-parsed).
+  bool isUnboundedLimitRange(double lower, double upper) {
+    // OMNISIM_NEWTON_UNBOUNDED_LIMIT_AS_CONTINUOUS=0 keeps a +-1e16 hinge a position servo (pre-2026-10-03).
+    static const bool on = []() {
+      const QString v = QString::fromUtf8(qgetenv("OMNISIM_NEWTON_UNBOUNDED_LIMIT_AS_CONTINUOUS")).trimmed().toLower();
+      return !(v == "0" || v == "false" || v == "off" || v == "no");
+    }();
+    return on && lower <= -1.0e6 && upper >= 1.0e6;
+  }
+
+  // setAvailableTorque/Force() reaching the solver (2026-10-03). Until then the
+  // available torque only gated OmMotor's own bookkeeping: isPIDPositionControl()
+  // went false and the push below sent a velocity target of 0 to a full-strength
+  // servo -- a BRAKE, not a passive joint. Measured on Ekumen's Andino (a URDF
+  // swivel caster, imported with a motor like every revolute/continuous joint):
+  // identical to 9 significant figures with and without setAvailableTorque(0).
+  // OMNISIM_NEWTON_AVAILABLE_TORQUE=0 restores that (value-parsed).
+  bool newtonAvailableTorqueEnabled() {
+    static const bool on = []() {
+      const QString v = QString::fromUtf8(qgetenv("OMNISIM_NEWTON_AVAILABLE_TORQUE")).trimmed().toLower();
+      return !(v == "0" || v == "false" || v == "off" || v == "no");
+    }();
+    return on;
+  }
+
+  // Last available torque pushed per Newton joint index; absent = never pushed
+  // (the joint still carries the effort it was registered with).
+  QHash<int, double> &pushedAvailableTorque() {
+    static QHash<int, double> sPushed;
+    return sPushed;
+  }
+
   // OMNISIM_NEWTON_PROMOTE_SERVO -- value-parsed, default ON. "0/false/off/no"
   // restores the pre-2026-09-01 behaviour (setPosition() on a limit-less
   // motor is ignored for ever).
@@ -440,6 +480,7 @@ void OmBasicJoint::requeueAllNewtonJointsForRebuild() {
   loggedNonZeroJointIndices().clear();
   limitlessNewtonJointIndices().clear();
   promotedServoJointIndices().clear();
+  pushedAvailableTorque().clear();  // the rebuilt joints carry their registered effort again
   for (const OmSolid *solid : OmSolid::solids()) {
     for (OmBasicJoint *const j : solid->jointChildren()) {
       if (j == nullptr)
@@ -813,8 +854,12 @@ void OmBasicJoint::flushPendingNewtonRegistrations() {
     // controlled even when the URDF recorded no finite travel limit, so it
     // gets a position spring (ke>0) instead of the ke=0/kd=500 velocity-wheel
     // config that left the gripper fingers limp and unable to close.
+    // An unbounded (+-1e16-style) range on a HINGE is limit-less for this
+    // purpose: it joins the velocity-wheel branch, and with it the W1.4 servo
+    // promotion, exactly as a `continuous` joint does (isUnboundedLimitRange).
+    const bool unboundedHinge = slider == nullptr && isUnboundedLimitRange(limitLower, limitUpper);
     const bool positionControlled =
-        (motor != nullptr) && (limitLower != limitUpper || slider != nullptr);
+        (motor != nullptr) && ((limitLower != limitUpper && !unboundedHinge) || slider != nullptr);
     if (motor != nullptr) {
       if (positionControlled) {
         // Position-spring stiffness scaled to the joint's torque capacity.
@@ -931,6 +976,28 @@ void OmBasicJoint::flushPendingNewtonRegistrations() {
     p->mNewtonJointIndex = idx;
     if (idx >= 0 && motor != nullptr && limitlessWheel)
       limitlessNewtonJointIndices().insert(idx);
+    // PASSIVE joint dynamics (2026-10-03). JointParameters.dampingConstant
+    // (viscous, N*m*s/rad) and .staticFriction (Coulomb, N*m) -- where
+    // OmUrdfImporter puts a URDF <dynamics damping friction> -- used to stop at
+    // updateSpringAndDampingConstants(), an empty ODE-era sink, so they never
+    // reached the solver: a published Raspberry Pi Mouse declaring
+    // damping="1.0" friction="1.0" on both wheels compiled to dof_damping 0 and
+    // dof_frictionloss 0. They now ride a separate runtime verb (so a binary and
+    // a runtime of different vintages cannot shift a positional argument),
+    // called only for a joint that declares a non-zero value -- every other
+    // joint is registered exactly as before. The runtime applies them unless
+    // OMNISIM_NEWTON_JOINT_DYNAMICS=0 (value-parsed, read there).
+    if (idx >= 0) {
+      if (const OmJointParameters *const jp = hinge ? hinge->parameters() : slider->parameters()) {
+        const double damping = jp->dampingConstant();
+        const double friction = jp->staticFriction();
+        if (damping > 0.0 || friction > 0.0) {
+          if (newton->setJointPassiveDynamics(idx, damping, friction) == 0)
+            OmLog::info(QString("[OmNewtonBackend] joint %1 '%2': passive damping %3, Coulomb friction %4")
+                            .arg(idx).arg(p->endPointName()).arg(damping).arg(friction));
+        }
+      }
+    }
     // Name every joint the 2026-09-27 frame fixes register differently from the
     // code before them, so a changed behaviour is attributable from the log:
     //  * an axis re-expressed into a merged leader whose frame is rotated;
@@ -1048,6 +1115,17 @@ void OmBasicJoint::pushNewtonMotorTargets() {
     // (a gripper that will not open) looks nothing like its cause.
     if (sForceModeJointIndices.remove(p->mNewtonJointIndex))
       newton->setJointForce(p->mNewtonJointIndex, 0.0);
+    // Available torque: push only CHANGES. The first push is skipped while the
+    // motor still has its full maxTorque (the joint was registered with it), so
+    // a world that never calls setAvailableTorque() never reaches the runtime.
+    if (newtonAvailableTorqueEnabled()) {
+      const double avail = motor->availableForceOrTorque();
+      QHash<int, double> &pushed = pushedAvailableTorque();
+      const auto it = pushed.constFind(p->mNewtonJointIndex);
+      const bool changed = (it == pushed.constEnd()) ? (avail != motor->maxForceOrTorque()) : (it.value() != avail);
+      if (changed && newton->setJointEffortLimit(p->mNewtonJointIndex, 0, avail) == 0)
+        pushed.insert(p->mNewtonJointIndex, avail);
+    }
     // P3.10g: Newton's helper module drives every motorized revolute via
     // a velocity actuator (POSITION_VELOCITY mode w/ kd=500). When the
     // controller uses position control (setPosition() instead of
@@ -1235,9 +1313,12 @@ void OmBasicJoint::updateEndPointPosition() {
 }
 
 void OmBasicJoint::updateSpringAndDampingConstants() {
-  // JointParameters.springConstant / dampingConstant and Brake damping were
-  // realised as an ODE AMotor companion joint; no Newton equivalent is wired,
-  // so they are UNIMPLEMENTED and this signal sink does nothing.
+  // JointParameters.springConstant and Brake damping were realised as an ODE
+  // AMotor companion joint; no Newton equivalent is wired, so they are
+  // UNIMPLEMENTED and this signal sink does nothing. dampingConstant and
+  // staticFriction DO reach Newton since 2026-10-03, but only at registration
+  // (flushPendingNewtonRegistrations -> setJointPassiveDynamics): a runtime
+  // edit of either field is still not pushed into a finalized model.
 }
 
 // Utility functions
