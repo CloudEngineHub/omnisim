@@ -324,6 +324,18 @@ now measures as harmful.
   a capsule, so the collider is not the shape the file draws and the part rests
   at a height the geometry does not explain. `Box`, `Sphere` and `Capsule` are
   exact. Prefer them for anything a gripper touches.
+- **Mesh pads now get full hulls and several contact points (since 2026-10-06).**
+  Until then every mesh collider reached MuJoCo as a convex hull capped at
+  **64 vertices**, with **one** contact point per convex pair (newton's
+  SolverMuJoCo disables MuJoCo's multi-CCD, which stock MuJoCo has on). A pad held
+  a part at a single point it could pivot about: an Elephant F100 grasp that plain
+  MuJoCo lifts 9.2 cm slipped on the lift, and a 23 g flat-ended battery rocked
+  and sank. Both now match plain MuJoCo (9.07 cm; the battery rests within
+  0.5 mm). Over the 56 catalogued mesh-collider worlds the change cost no
+  measurable step time. `OMNISIM_NEWTON_MULTICCD=0` and
+  `OMNISIM_NEWTON_MESH_MAXHULLVERT=0` restore the old contact (a positive
+  `OMNISIM_NEWTON_MESH_MAXHULLVERT` sets a cap). If you compare against an
+  `OMNISIM_NEWTON_SAVE_MJCF` export, note the export omits `maxhullvert`.
 - A **single-link body imported from a URDF** used to rest on its own frame
   rather than its geometry (fixed 2026-08-03); if you see a part sunk half its
   height, check you are on a current build.

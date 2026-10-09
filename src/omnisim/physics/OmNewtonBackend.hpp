@@ -207,6 +207,21 @@ public:
   int addShapeSphere(int bodyIdx, double radius,
                      double cx = 0.0, double cy = 0.0, double cz = 0.0, double solidMu = -1.0,
                      double solidMuT = -1.0, double solidMuR = -1.0);
+  // The shape registered LAST (by any addShape* call) stays on its body but stops
+  // colliding: its mass/inertia role is untouched (shapes carry density 0). Used for
+  // the URDF importer's inertia placeholder sphere (DEF URDF_INERTIA_PLACEHOLDER).
+  // Must be called before finalizeWorld(). Returns 0, or -1 (also on a runtime
+  // bundle too old to offer it).
+  int quietLastShape();
+  // URDF <mimic>: q[followerJoint] = offset + multiplier * q[leaderJoint], both the
+  // indices addJointRevolute/addJointPrismatic returned. Applied at finalize as a MuJoCo
+  // joint-equality constraint. BUILD phase only. Returns 0 or -1.
+  int addJointMimic(int followerJoint, int leaderJoint, double multiplier, double offset);
+  // Pins DYNAMIC body bodyIdx to the world at its spawn pose with a fixed joint,
+  // keeping its real mass and inertia (Webots: a Solid with Physics under
+  // physics-less ancestors is attached to the static environment). BUILD phase
+  // only. Returns 0, or -1 (also on a runtime bundle too old to offer it).
+  int weldBodyToWorld(int bodyIdx);
   // Attaches a box collision/visual shape to bodyIdx. (hx, hy, hz) are
   // half-extents along each local axis (Newton's convention -- OmBox
   // uses full size, so callers must divide by 2). (cx, cy, cz) is the

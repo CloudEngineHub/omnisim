@@ -10,6 +10,9 @@ RotationalMotor {
   field SFFloat  maxPosition       0                                                               # ignored if maxPosition = minPosition (rad)
   field SFFloat  maxTorque         10                                                              # max torque (N*m)
   field SFFloat  multiplier        1                                                               # multiplicative factor applied to position, velocity and torque commands
+  field SFString mimicMotor        ""                                                              # name of the motor this joint MIRRORS (URDF <mimic>): position = mimicOffset + mimicMultiplier * that motor's joint position, enforced as a physics constraint; commands to this motor are ignored
+  field SFFloat  mimicMultiplier   1                                                               # URDF <mimic multiplier>
+  field SFFloat  mimicOffset       0                                                               # URDF <mimic offset> (rad)
   field SFString sound             "omnisim://projects/default/worlds/sounds/rotational_motor.wav"  # wave file of the motor sound
   field MFNode   muscles           []                                                              # graphical representation of artificial muscles
 }

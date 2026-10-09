@@ -1259,6 +1259,7 @@ def emit_joint(joint: Joint, indent: str, joints_by_parent: dict, links: dict,
             out.append(f"{indent}      maxVelocity {joint.velocity}\n")
         else:
             out.append(f"{indent}      maxVelocity 10\n")
+        append_mimic_fields(out, joint, indent + "      ")
         out.append(f"{indent}    }}\n")
         out.append(f"{indent}  ]\n")
         out.append(emit_solid_for_link(child_link, joint, indent + "  ", joints_by_parent, links, sensors_by_link))
@@ -1273,12 +1274,24 @@ def emit_joint(joint: Joint, indent: str, joints_by_parent: dict, links: dict,
         out.append(f"{indent}  device [\n")
         out.append(f"{indent}    LinearMotor {{\n")
         out.append(f"{indent}      name \"{joint.name}_motor\"\n")
+        append_mimic_fields(out, joint, indent + "      ")
         out.append(f"{indent}    }}\n")
         out.append(f"{indent}  ]\n")
         out.append(emit_solid_for_link(child_link, joint, indent + "  ", joints_by_parent, links, sensors_by_link))
         out.append(f"{indent}}}\n")
 
     return "".join(out)
+
+
+def append_mimic_fields(out: list[str], joint: UrdfJoint, indent: str) -> None:
+    """URDF <mimic> -> the follower motor's mimicMotor / mimicMultiplier / mimicOffset
+    (2026-10-06), the same fields the engine's own URDFRobot importer writes; the
+    engine enforces them as a MuJoCo joint-equality constraint."""
+    if joint.mimic_joint is None:
+        return
+    out.append(f"{indent}mimicMotor \"{joint.mimic_joint}_motor\"\n")
+    out.append(f"{indent}mimicMultiplier {joint.mimic_multiplier!r}\n")
+    out.append(f"{indent}mimicOffset {joint.mimic_offset!r}\n")
 
 
 def emit_robot(robot: UrdfRobot, controller: str = "<none>") -> str:
@@ -1516,20 +1529,16 @@ def build_report(robot: UrdfRobot) -> dict:
             joint_notes.append(joint_warning)
             joint_warnings.append(joint_warning)
         if joint.mimic_joint is not None:
-            # OmniSim has no coupled-joint primitive, so this constraint is
-            # DROPPED at emission. Silence here turns a coupled gripper into
-            # independently free fingers: they drift apart under asymmetric load
-            # and never close symmetrically, with no error anywhere. Every
-            # commodity parallel-jaw gripper is mimic-driven, including three
-            # shipped in this repo.
-            joint_warning = (
+            # Imported since 2026-10-06: the follower motor names its leader
+            # (mimicMotor/mimicMultiplier/mimicOffset) and the engine enforces the
+            # coupling as a joint-equality constraint. A note, not a warning --
+            # but the follower's own motor commands are ignored, which a
+            # controller that drives every finger separately should know.
+            joint_notes.append(
                 f"Joint mimics '{joint.mimic_joint}' (multiplier {joint.mimic_multiplier}, "
-                f"offset {joint.mimic_offset}), but the coupling is NOT imported -- the joint "
-                "becomes independently free. Drive both joints from one command in the "
-                "controller, or the gripper will not close symmetrically."
+                f"offset {joint.mimic_offset}): coupled by a joint-equality constraint; "
+                "commands to this joint's own motor are ignored -- drive the leader."
             )
-            joint_notes.append(joint_warning)
-            joint_warnings.append(joint_warning)
         if joint.type in ("revolute", "prismatic", "continuous"):
             # effort/velocity of 0 is not "no limit declared" -- URDF spells that
             # by omitting the attribute. A declared zero is a declared inability

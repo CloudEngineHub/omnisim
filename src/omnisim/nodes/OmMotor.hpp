@@ -50,6 +50,12 @@ public:
   double minPosition() const { return mMinPosition->value(); }
   double maxPosition() const { return mMaxPosition->value(); }
   double multiplier() const { return mMultiplier->value(); }
+  // URDF <mimic>: this motor's joint follows the joint of the motor named mimicMotor()
+  // (q = mimicOffset() + mimicMultiplier() * q_leader), enforced as a physics constraint.
+  // Empty = not a mimic follower.
+  QString mimicMotor() const { return mMimicMotor ? mMimicMotor->value() : QString(); }
+  double mimicMultiplier() const { return mMimicMultiplier ? mMimicMultiplier->value() : 1.0; }
+  double mimicOffset() const { return mMimicOffset ? mMimicOffset->value() : 0.0; }
   void setMinPosition(double position) { mMinPosition->setValue(position); }
   void setMaxPosition(double position) { mMaxPosition->setValue(position); }
   const QString &sound() const { return mSound->value(); }
@@ -228,6 +234,9 @@ private:
   WbDeviceTag *mRequestedDeviceTag;
   OmDownloader *mDownloader;
   OmSFDouble *mMultiplier;
+  OmSFString *mMimicMotor;
+  OmSFDouble *mMimicMultiplier;
+  OmSFDouble *mMimicOffset;
   QList<OmMotor *> mCoupledMotors;
 
 private slots:

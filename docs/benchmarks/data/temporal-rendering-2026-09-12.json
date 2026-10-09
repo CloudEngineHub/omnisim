@@ -1,5 +1,6 @@
 {
   "date": "2026-09-12",
+  "raw_data": "docs/benchmarks/data/raw/2026-09-12-temporal (the OMNISIM_WGPU_GPU_TIMING paths in each environment block are the original run locations under .local-runs/temporal-pipeline; the same relative paths hold the copied files here)",
   "machine_id": "9722d23d12a3",
   "os": "Windows 11",
   "gpu": "NVIDIA GeForce RTX 3060 Laptop GPU",

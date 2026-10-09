@@ -248,18 +248,17 @@ tests/benchmarks/agentbench/**/controllers/*/r1_oracle_telemetry.json
 # existed. The DERIVED facts are what a claim rests on and those are committed
 # under preregister/v1/build_scale_gate_records/evidence/ -- these dirs are the
 # raw substrate behind them. Regenerable by rerunning the level.
-# ⚠ Before deleting one, check it is not named in a committed facts.json: eight
-# of them back the published 2026-08-13 gate records, and the level-250 pair
-# holds a complete 9/9 PASS that has no gate record yet.
+# The derived facts/verdicts are committed under
+# preregister/v1/build_scale_gate_records/evidence/ (the eight 2026-08-13 gate
+# records byte-identical, the level-250 9/9 PASS as omnisim_250_2026-08-14.*,
+# 2026-10-08); the workspaces are raw substrate only.
 .agentbench-*/
 .agentbench-*.pid
 # Machine-local run residue, consolidated out of the repo root (2026-08-15).
 # The root had accumulated 39 loose entries: 20 .agentbench-buildscale-* run
 # workspaces plus ~19 one-off engine/probe logs. They now live under
-#   .local-runs/agentbench/   the BuildScale workspaces described above --
-#                             including the eight that back the published
-#                             2026-08-13 gate records, so the ⚠ above still
-#                             applies, just one directory deeper
+#   .local-runs/agentbench/   the BuildScale workspaces described above
+#                             (raw substrate only; see the note above)
 #   .local-runs/logs/         husky/omniquad/swarm probe logs, fps_sweep summary,
 #                             MUJOCO_LOG.TXT, a grep stackdump
 # Nothing resolves these paths: the .agentbench-* strings inside the committed
@@ -537,28 +536,64 @@ packages/*/dist/
 # Engine run residue: regenerable, and the reports quote what matters.
 /social/launch/pilots/replies_*/**/logs/
 #
-# Waves that used the `evaluations/` layout: everything BESIDE `evaluations/`
-# at that level is the correspondent's own cloned repo, which is what the
-# original rule was protecting against. Listed per wave rather than as a
-# pattern because the layout is a property of each wave, not of the tree, and
-# the two newest waves (2026-09-03, 2026-09-12) deliberately do not use it --
-# there, the direct children ARE our evaluations and stay tracked.
+# Waves that used the `evaluations/` layout (2026-08-31 .. 2026-09-11).
+#
+# 2026-10-08 correction. This block used to say that everything BESIDE
+# `evaluations/` at a wave's root is the correspondent's own cloned repo, and
+# blanket-ignored `replies_<wave>/*/` for eight waves. That holds for
+# 2026-08-31, 2026-09-01 and 2026-09-08 only, which keep the blanket below. In
+# 2026-09-02, 09-07, 09-09, 09-10 and 09-11 the wave root also holds OUR work:
+# rigs, controllers, worlds, scripts, reply drafts, the bundles we sent, and the
+# entire 2026-09-11 wave (go1_ibiyemi/, esp32_fine/, kazmi_correction/, ... --
+# the directories EVALUATIONS_2026_09_11_INDEX.txt tells a reader to start
+# with). None of it had ever been committed; it was one `git clean -X` from gone.
+# Those five waves now follow the general reply-wave rules above (wave contents
+# ignored by default, authored file types re-included, clones / external /
+# deps / caches / logs excluded). The third-party directories they still carry
+# are named below, and their result data is re-included after that.
 /social/launch/pilots/replies_2026_08_31/*/
 !/social/launch/pilots/replies_2026_08_31/evaluations/
 /social/launch/pilots/replies_2026_09_01/*/
 !/social/launch/pilots/replies_2026_09_01/evaluations/
-/social/launch/pilots/replies_2026_09_02/*/
-!/social/launch/pilots/replies_2026_09_02/evaluations/
-/social/launch/pilots/replies_2026_09_07/*/
-!/social/launch/pilots/replies_2026_09_07/evaluations/
 /social/launch/pilots/replies_2026_09_08/*/
 !/social/launch/pilots/replies_2026_09_08/evaluations/
-/social/launch/pilots/replies_2026_09_09/*/
-!/social/launch/pilots/replies_2026_09_09/evaluations/
-/social/launch/pilots/replies_2026_09_10/*/
-!/social/launch/pilots/replies_2026_09_10/evaluations/
-/social/launch/pilots/replies_2026_09_11/*/
-!/social/launch/pilots/replies_2026_09_11/evaluations/
+# Third-party directories at the root of the repaired waves. `external/` is
+# already covered by `replies_*/**/external/` above; these are the other names.
+/social/launch/pilots/replies_2026_09_07/external_*/
+/social/launch/pilots/replies_*/*/clones/
+/social/launch/pilots/replies_2026_09_09/wave2/lamp_cache/
+/social/launch/pilots/replies_2026_09_11/mahmud/
+/social/launch/pilots/replies_2026_09_11/go1_ibiyemi/run/protos/
+# Result data of our own evaluations in the repaired waves: summaries, traces,
+# manifests, configs and the bundles we sent. Engine logs, stdout/stderr and
+# binary scratch stay out (no re-include for them).
+!/social/launch/pilots/replies_2026_09_0[279]/*/**/*.json
+!/social/launch/pilots/replies_2026_09_0[279]/*/**/*.csv
+!/social/launch/pilots/replies_2026_09_0[279]/*/**/*.txt
+!/social/launch/pilots/replies_2026_09_0[279]/*/**/*.tsv
+!/social/launch/pilots/replies_2026_09_0[279]/*/**/*.yaml
+!/social/launch/pilots/replies_2026_09_0[279]/*/**/*.ini
+!/social/launch/pilots/replies_2026_09_0[279]/*/**/*.xacro
+!/social/launch/pilots/replies_2026_09_0[279]/*/**/*.sdf
+!/social/launch/pilots/replies_2026_09_0[279]/*/**/*.zip
+!/social/launch/pilots/replies_2026_09_1[01]/*/**/*.json
+!/social/launch/pilots/replies_2026_09_1[01]/*/**/*.csv
+!/social/launch/pilots/replies_2026_09_1[01]/*/**/*.txt
+!/social/launch/pilots/replies_2026_09_1[01]/*/**/*.tsv
+!/social/launch/pilots/replies_2026_09_1[01]/*/**/*.yaml
+!/social/launch/pilots/replies_2026_09_1[01]/*/**/*.ini
+!/social/launch/pilots/replies_2026_09_1[01]/*/**/*.xacro
+!/social/launch/pilots/replies_2026_09_1[01]/*/**/*.sdf
+!/social/launch/pilots/replies_2026_09_1[01]/*/**/*.zip
+!/social/launch/pilots/replies_2026_09_11/*.zip
+# Correspondent-supplied private material: kept on disk, never committed.
+# Placed after the re-includes above because the last matching rule wins.
+/social/launch/pilots/replies_2026_09_07/inbound/
+/social/launch/pilots/replies_2026_09_10/external/swarm_zip/
+/social/launch/pilots/replies_*/**/their_*
+/social/launch/pilots/replies_*/**/inbound_*
+/social/launch/pilots/replies_*/**/*_as_attached.*
+/social/launch/pilots/replies_2026_09_22/morpho_textured/omnisim_corridor_texture_*.zip
 
 # Warp JIT kernel caches left next to pilot evaluation runs.
 /social/launch/pilots/**/warp_cache_*/

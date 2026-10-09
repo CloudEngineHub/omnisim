@@ -59,3 +59,30 @@ lineage, not LAFAN1.
 So a public reader sees 23 of the 35 checkpoints. That is a *distribution*
 decision recorded in the deny-list, not a gap in this record: the terms of all
 35 are the same, and they are stated above.
+
+## G1 "turn pro" checkpoints — added 2026-10-08 from `_scratch/turn_pro_downloads/`
+
+Four more checkpoints, plus the logs that produced them, copied unchanged
+(sha256-verified) from the local `_scratch/turn_pro_downloads/` download of the
+owner-authorized RunPod campaign of 2026-07-18. The pod is gone, so these are
+the only copies. They are **not counted** in the 35 of the 2026-08-24 table above.
+
+| file | what |
+|---|---|
+| `wr_turn_pro90_s31_it200.pt`, `wr_turn_pro90_s47_it200.pt` | unloaded 90° turn, seeds 31 / 47, 200 iterations, warm-started from `wr_turn90.pt`, ghost `ghost_turn_pro90` |
+| `wr_carryturn_pro45_s31_it300.pt`, `wr_carryturn_pro45_s47_it300.pt` | loaded (box-carry) 45° turn, seeds 31 / 47, 300 iterations, warm-started from the matching `wr_turn_pro90_s*_it200.pt`, ghost `ghost_carry_turn_pro45`. **Kept in `cloud/runpod/campaigns/results/g1_turn_pro_2026-07-18/`, not here:** they are not champions, and `cloud/` is held back from the public snapshot |
+| `g1turn_pro_loaded_s31_mpc.txt`, `g1turn_pro_loaded_s47_mpc.txt` | the in-engine training logs of the loaded stage (per-iteration `DEPLOY-EVAL` lines), kept beside those two checkpoints in `cloud/` |
+| `pod_driver.log` | the pod driver's log for the whole campaign (bootstrap, apt, both stages) |
+
+The recipe is [`cloud/runpod/campaigns/campaign_g1_turn_pro.sh`](../../../../cloud/runpod/campaigns/campaign_g1_turn_pro.sh)
+(launcher: `launch_g1_turn_pro_pod.sh`). It reads and writes these exact names in
+this directory, and `tests/test_g1_turn_heading_randomization.py` pins the two
+`_it200` names. Both ghosts are **Class 0** (built from scratch, no third-party
+data) in [`docs/developer/motion-data-provenance.md`](../../../../docs/developer/motion-data-provenance.md),
+and `wr_turn90.pt` is not on the deny-list, so none of the four inherits a
+LAFAN1 restriction. They are original work under the same terms as the rest of
+this directory.
+
+No skill or sequence references these checkpoints: `skills/humanoid/g1_turn_in_place`
+uses `wr_turn_natural90.pt`. They are kept as the campaign's result, not as a
+certified skill. Like everything here they are untracked until force-added.

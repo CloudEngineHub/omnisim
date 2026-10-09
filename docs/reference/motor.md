@@ -11,6 +11,9 @@ Motor {
   SFFloat  maxPosition       0        # (-inf, inf)
   SFFloat  maxVelocity       10       # [0, inf)
   SFFloat  multiplier        1        # (inf, 0[ or ]0, inf)
+  SFString mimicMotor        ""       # any string
+  SFFloat  mimicMultiplier   1        # (-inf, inf)
+  SFFloat  mimicOffset       0        # (-inf, inf)
   SFString sound             ""       # any string
   MFNode   muscles           []       # {Muscle, PROTO}
 }
@@ -93,6 +96,8 @@ By default, this field is 1.
 
 > **Note:** When using a multiplier different from 1, the values `minPosition`, `maxPosition` and `maxVelocity` as displayed in the interface do not reflect the practical limits.
 For example, for a motor with `multiplier` = 2 and `maxVelocity` = 10, to remain within this limit the maximal velocity that the controller can set is 5, not 10.
+
+- The `mimicMotor`, `mimicMultiplier` and `mimicOffset` fields make this motor's joint **mirror another joint** — a URDF `<mimic>`, which the URDF importer writes here (since 2026-10-06). `mimicMotor` names the leader's motor *in the same robot*; the joint is then held at `mimicOffset + mimicMultiplier × q_leader` by a MuJoCo joint-equality constraint (soft, like every MuJoCo constraint: under a hard grasp the follower can sit a few hundredths of a radian off). The follower is registered **without a drive**, so commands sent to this motor are ignored — drive the leader. Unlike `multiplier`, which scales *commands* between coupled motors, this couples the *joints* physically: a follower cannot drift from its leader under load. Before this, the importer dropped `<mimic>` and a mimic-driven gripper arrived as independent motors. `OMNISIM_URDF_MIMIC=0` restores that old import. Pin: `tests/test_urdf_mimic_joints.py`.
 
 - The `sound` field specifies the URL of a WAVE sound file.
 If the `sound` value starts with `http://` or `https://`, OmniSim will get the file from the web.

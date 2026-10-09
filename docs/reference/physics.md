@@ -108,6 +108,8 @@ Whether to use or not a [Physics](#physics) node in a particular case depends on
 
 Note that if a [Solid](solid.md) node has at least one [Solid](solid.md) ancestor node and contains a [Physics](#physics) node but none of its [Solid](solid.md) ancestor nodes contain a [Physics](#physics) node, then this node is attached to the static environment with a fixed joint and thus it won't move from its initial position.
 
+> ✅ **Honoured under Newton since 2026-10-09.** Until then OmniSim broke this rule and the static-base note below: a [Robot](robot.md) without Physics whose child carried Physics became a *dynamic* body that rolled the child's mass up, and the child often registered as a second free body. When the child had no Physics either and the joints hung off it, the world failed to load. Measured on a published Webots twin (a Robot without Physics, one body child with Physics): the body dropped 22.6 mm onto its desk, slid 0.40 m during a replay and fell off. Now such a child keeps its own mass and inertia and is welded to the world at its spawn pose; the physics-less parent is static, and a physics-less child carrying the joints makes the Robot a static base. The load log names each welded Solid. `OMNISIM_NEWTON_PHYSICSLESS_ANCESTOR_WELD=0` restores the old registration. Pin: `tests/test_newton_physicsless_ancestor_static_base.py`.
+
 #### In Passive Objects
 
 If a passive object should never move during a simulation then you should leave its `physics` field empty.

@@ -25,6 +25,76 @@ top of that foundation.
 ---
 
 
+## [v9.2.1] — 2026-10-09
+
+More of the same work as v9.2.0: robot makers' own published models, run as they ship, kept
+exposing places where OmniSim read them differently from their own files or from plain MuJoCo.
+Each fix below was measured against plain MuJoCo or against the documented rule, has a pin test
+that fails on the old engine, and (except where noted) a value-parsed hatch that restores the old
+behaviour. The engine and the physics runtime both change, so use the v9.2.1 installer (`doctor`
+must read `bundle == source`).
+
+### ⚠️ Behaviour changes — read before upgrading
+
+- **URDF links with `<inertial>` but no `<collision>` no longer collide.** The importer gives such a
+  link a 1 cm placeholder sphere so it has a body; that sphere used to collide, so every
+  collision-less link carried an invisible marble. URDF semantics, and MuJoCo's own URDF import,
+  give it no contact. Measured: a LimX HU_D04 arm stopped against a box at −44° where MuJoCo's
+  reaches −67.6° (now −67.57°); TRON1 stood on the marbles under its feet with 12.03 N·m at the
+  knee (MuJoCo 0.54; now 0.5425519). The DJI Mavic now rests on its own body box. Hatch:
+  `OMNISIM_NEWTON_URDF_PLACEHOLDER_COLLIDES=1` (this one is opt-in to restore).
+- **Mesh colliders get full convex hulls and multi-point contact by default.** Hulls were capped at
+  64 vertices and each mesh pair produced one contact point, so grasps on meshes slipped where
+  MuJoCo's held (the Elephant F100 lift now holds, 8.47 cm, the same as MuJoCo). Across the 56
+  catalogued worlds with mesh colliders wall time went 709 → 706 s, two verdicts went FAIL → PASS
+  and none got worse. Hatches: `OMNISIM_NEWTON_MULTICCD=0`, `OMNISIM_NEWTON_MESH_MAXHULLVERT=0`
+  (or `=n` for an n-vertex cap).
+- **URDF `<mimic>` is imported.** It was dropped, so mimic-driven grippers (Robotiq 2F-85/2F-140,
+  Franka Hand, Kinova, LimX, Dexmate, Elephant) arrived as independent motors and the fingers
+  drifted apart under load. The follower's motor now names its leader (`RotationalMotor` /
+  `LinearMotor` `mimicMotor`, `mimicMultiplier`, `mimicOffset`) and the engine enforces it as a
+  MuJoCo joint-equality constraint; commands sent to a follower are ignored. Elephant F100 with its
+  five mimics: lift 8.70 cm at a 0.714 rad drive, plain MuJoCo with the same equalities 8.82 cm at
+  0.725. Hatch: `OMNISIM_URDF_MIMIC=0`.
+- **A `<rest>` pose on a joint whose range passes ±π is read correctly.** Since v9.0.0 such a joint
+  spawned posed at `<rest>` while its sensor read 0 there, so every command landed `rest` radians
+  off (a UFACTORY xArm6 joint3 was driven to −245.6°, past its −225° stop). This changes the
+  shipped quadrupeds whose thigh range passes π: the Unitree Go2 and B2 and the OmniQuad (28
+  joints) no longer crouch at twice their stance angle — holding its standing pose the Go2 now
+  stands level at 0.310 m instead of slumping to 0.184 m. The Go2/B2 RL deploy worlds still fall:
+  they run a 16 ms step without the quadruped stance recipe (substeps 8, compound colliders,
+  ground friction 2), on the old engine and the new. No hatch (the old state was inconsistent).
+- **A body with Physics under a Robot without Physics is fixed to the world**, as
+  `docs/reference/physics.md` (inherited from Webots) has always said. The physics-less Robot used
+  to become a dynamic body that rolled the child's mass up, and the physics-less "larger static
+  base" form failed to load when its joints hung off a child Solid. Measured on a published Webots
+  twin (pib): its body dropped 22.6 mm onto its desk, slid 0.40 m and fell off; now it holds its
+  spawn pose and the replay is identical to the hand-pinned model. Of 223 catalogued worlds one
+  changes: `warehouse_industrial`'s ConveyorBelt no longer sinks 0.68 m through the floor. Hatch:
+  `OMNISIM_NEWTON_PHYSICSLESS_ANCESTOR_WELD=0`.
+
+### Fixed
+
+- **A moving joint on an empty fixed frame loads.** `body -fixed-> mount (no <inertial>)
+  -continuous-> wheel` (Husarion Lynx) or `torso -fixed-> arm_center -revolute-> arm` (Dexmate
+  Vega) FATALed with "parent body ... never registered a Newton body". The joint now attaches to
+  the body that carries the frame, bitwise identical to the same robot with the frame folded in.
+  Hatch: `OMNISIM_NEWTON_JOINT_PARENT_FRAME_WALK=0`.
+- **An empty link on a moving joint carries the links fixed below it.** A link with neither
+  `<inertial>` nor `<collision>` (Kinova Gen3 lite's `end_effector_link`, gripper underneath) had no
+  body, so the fixed subtree registered as a separate free body and fell away; the gripper's mass
+  vanished from the arm's joint torques. Gen3 lite joint_2 now 13.719 N·m with a 0.5 kg payload
+  (plain MuJoCo 13.712). Hatch: `OMNISIM_URDF_EMPTY_LINK_BODY=0`.
+- **A prismatic joint's motor reports its travel.** `LinearMotor.getMinPosition()` /
+  `getMaxPosition()` read 0/0 while the stops enforced the URDF range (Niryo Ned2 jaws: now
+  −0.01/0.01). Solver limits are unchanged; a `setPosition()` past the travel is now clamped with
+  a warning, as for revolute joints. No hatch.
+- **No false "collisions will have no effect" warning for fixed-child colliders.** Since v9.2.0
+  those colliders are attached and do collide; the inherited Webots warning still fired and was
+  read as "this robot has no caster" (Ubiquity Magni). It now fires only with
+  `OMNISIM_NEWTON_FIXED_CHILD_COLLIDERS=0`, when it is true.
+
+
 ## [v9.2.0] — 2026-10-03
 
 URDF robots now arrive in the solver the way their files describe them, and a joint resting on

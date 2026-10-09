@@ -529,6 +529,7 @@ void OmBasicJoint::flushPendingNewtonRegistrations() {
   if (raw == nullptr || !raw->isAvailable())
     return;
   OmNewtonBackend *const newton = static_cast<OmNewtonBackend *>(raw);
+  QList<QPointer<OmBasicJoint>> mimicFollowers;  // resolved after the loop
 
   for (const QPointer<OmBasicJoint> &p : queue) {
     if (p.isNull())
@@ -546,7 +547,11 @@ void OmBasicJoint::flushPendingNewtonRegistrations() {
       const OmSolid *const child = p->solidEndPoint();
       if (parent == nullptr || child == nullptr)
         continue;
-      const int parentIdx = parent->effectiveNewtonBodyIndex();
+      // Merger-aware, and walks up through Physics-less frames (a URDF link with no
+      // <inertial> on a fixed joint) to the body that carries them -- see
+      // OmSolid::newtonJointParentBodySolid().
+      const OmSolid *const parentBody = parent->newtonJointParentBodySolid();
+      const int parentIdx = parentBody != nullptr ? parentBody->newtonBodyIndex() : -1;
       const int childIdx = child->effectiveNewtonBodyIndex();
       if (parentIdx < 0 || childIdx < 0) {
         enforceNewtonJointEndpoints(parent, child, parentIdx, childIdx);
@@ -557,9 +562,8 @@ void OmBasicJoint::flushPendingNewtonRegistrations() {
       const OmVector3 childAnchor = (jointWorld - child->matrix().translation()) * child->rotationMatrix();
       OmVector3 parentAnchor = anchor;  // re-express in the merger LEADER's frame if the parent merged away
       OmMatrix3 jointParentRot = parent->rotationMatrix();
-      if (parent->newtonBodyIndex() < 0 && parent->solidMerger() != nullptr &&
-          parent->solidMerger()->solid() != nullptr && parent->solidMerger()->solid() != parent) {
-        const OmSolid *const leader = parent->solidMerger()->solid();
+      if (parentBody != parent) {
+        const OmSolid *const leader = parentBody;
         parentAnchor = (jointWorld - leader->matrix().translation()) * leader->rotationMatrix();
         jointParentRot = leader->rotationMatrix();
       }
@@ -608,7 +612,11 @@ void OmBasicJoint::flushPendingNewtonRegistrations() {
       const OmSolid *const child = h2->solidEndPoint();
       if (parent == nullptr || child == nullptr)
         continue;
-      const int parentIdx = parent->effectiveNewtonBodyIndex();
+      // Merger-aware, and walks up through Physics-less frames (a URDF link with no
+      // <inertial> on a fixed joint) to the body that carries them -- see
+      // OmSolid::newtonJointParentBodySolid().
+      const OmSolid *const parentBody = parent->newtonJointParentBodySolid();
+      const int parentIdx = parentBody != nullptr ? parentBody->newtonBodyIndex() : -1;
       const int childIdx = child->effectiveNewtonBodyIndex();
       if (parentIdx < 0 || childIdx < 0) {
         enforceNewtonJointEndpoints(parent, child, parentIdx, childIdx);
@@ -619,9 +627,8 @@ void OmBasicJoint::flushPendingNewtonRegistrations() {
       const OmVector3 childAnchor = (jointWorld - child->matrix().translation()) * child->rotationMatrix();
       OmVector3 parentAnchor = anchor;  // re-express in the merger LEADER's frame if the parent merged away
       OmMatrix3 jointParentRot = parent->rotationMatrix();
-      if (parent->newtonBodyIndex() < 0 && parent->solidMerger() != nullptr &&
-          parent->solidMerger()->solid() != nullptr && parent->solidMerger()->solid() != parent) {
-        const OmSolid *const leader = parent->solidMerger()->solid();
+      if (parentBody != parent) {
+        const OmSolid *const leader = parentBody;
         parentAnchor = (jointWorld - leader->matrix().translation()) * leader->rotationMatrix();
         jointParentRot = leader->rotationMatrix();
       }
@@ -681,7 +688,11 @@ void OmBasicJoint::flushPendingNewtonRegistrations() {
     // (a non-leader fixed-merger participant) needs to attach to the
     // chassis leader's Newton body, not to a non-existent body of the
     // merged-away child.
-    const int parentIdx = parent->effectiveNewtonBodyIndex();
+    // Merger-aware, and walks up through Physics-less frames (a URDF link with no
+    // <inertial> on a fixed joint) to the body that carries them -- see
+    // OmSolid::newtonJointParentBodySolid().
+    const OmSolid *const parentBody = parent->newtonJointParentBodySolid();
+    const int parentIdx = parentBody != nullptr ? parentBody->newtonBodyIndex() : -1;
     const int childIdx = child->effectiveNewtonBodyIndex();
     if (parentIdx < 0 || childIdx < 0) {
       enforceNewtonJointEndpoints(parent, child, parentIdx, childIdx);
@@ -745,10 +756,8 @@ void OmBasicJoint::flushPendingNewtonRegistrations() {
     // shift, which is exactly the correction needed.
     OmVector3 parentAnchor = anchor;
     OmMatrix3 jointParentRot = parentRot;
-    if (parent->newtonBodyIndex() < 0 && parent->solidMerger() != nullptr &&
-        parent->solidMerger()->solid() != nullptr &&
-        parent->solidMerger()->solid() != parent) {
-      const OmSolid *const leader = parent->solidMerger()->solid();
+    if (parentBody != parent) {
+      const OmSolid *const leader = parentBody;
       const OmVector3 leaderWorld = leader->matrix().translation();
       const OmMatrix3 leaderRot = leader->rotationMatrix();
       parentAnchor = (jointWorld - leaderWorld) * leaderRot;
@@ -779,6 +788,12 @@ void OmBasicJoint::flushPendingNewtonRegistrations() {
         (childRot.transposed() * jointParentRot).toQuaternion();
 
     OmMotor *const motor = hinge ? hinge->motor() : slider->motor();
+    // URDF <mimic> follower (2026-10-06, OmUrdfImporter appendMimicFields): the
+    // joint is coupled to its leader by a MuJoCo joint-equality constraint after
+    // this loop, so it is registered WITHOUT a drive -- a servo of its own would
+    // fight the constraint. Its motor's min/maxPosition still describe the stops.
+    const bool mimicFollower = motor != nullptr && !motor->mimicMotor().isEmpty();
+    OmMotor *const driveMotor = mimicFollower ? nullptr : motor;
     // ke/kd are decided AFTER the position limits are computed below: the
     // presence of finite limits is what distinguishes a position-controlled
     // limb from a velocity-driven wheel. See the control-mode-aware block
@@ -797,8 +812,10 @@ void OmBasicJoint::flushPendingNewtonRegistrations() {
     double limitLower = 0.0;
     double limitUpper = 0.0;
     if (motor != nullptr) {
-      effortLimit = motor->maxForceOrTorque();
-      velocityLimit = motor->maxVelocity();
+      if (driveMotor != nullptr) {
+        effortLimit = motor->maxForceOrTorque();
+        velocityLimit = motor->maxVelocity();
+      }
       const double minP = motor->minPosition();
       const double maxP = motor->maxPosition();
       if (minP != maxP) {
@@ -859,8 +876,8 @@ void OmBasicJoint::flushPendingNewtonRegistrations() {
     // promotion, exactly as a `continuous` joint does (isUnboundedLimitRange).
     const bool unboundedHinge = slider == nullptr && isUnboundedLimitRange(limitLower, limitUpper);
     const bool positionControlled =
-        (motor != nullptr) && ((limitLower != limitUpper && !unboundedHinge) || slider != nullptr);
-    if (motor != nullptr) {
+        (driveMotor != nullptr) && ((limitLower != limitUpper && !unboundedHinge) || slider != nullptr);
+    if (driveMotor != nullptr) {
       if (positionControlled) {
         // Position-spring stiffness scaled to the joint's torque capacity.
         // The legacy flat ke=20 left a heavy arm sagging ~0.8 rad under
@@ -1036,12 +1053,63 @@ void OmBasicJoint::flushPendingNewtonRegistrations() {
                       .arg(velocityLimit)
                       .arg(limitLower)
                       .arg(limitUpper)
-                      .arg(motor != nullptr ?
+                      .arg(driveMotor != nullptr ?
                                QString("[motorized: kd=%1]").arg(targetKd) :
-                               QStringLiteral("[free-spinning]")));
-      if (motor != nullptr)
+                               mimicFollower ? QString("[mimic of '%1']").arg(motor->mimicMotor()) :
+                                               QStringLiteral("[free-spinning]")));
+      if (driveMotor != nullptr)
         registeredNewtonMotorizedJoints().append(p);
+      else if (mimicFollower)
+        mimicFollowers.append(QPointer<OmBasicJoint>(p));
     }
+  }
+
+  // URDF <mimic> coupling: q_follower = offset + multiplier * q_leader as a MuJoCo
+  // joint-equality constraint, between the follower and the joint driven by the
+  // motor it names IN THE SAME ROBOT. A leader that cannot be found, or that has
+  // no Newton joint, leaves the follower undriven and says so.
+  for (const QPointer<OmBasicJoint> &f : mimicFollowers) {
+    if (f.isNull())
+      continue;
+    const OmMotor *const fm = dynamic_cast<const OmHingeJoint *>(f.data()) ?
+                                  static_cast<const OmHingeJoint *>(f.data())->motor() :
+                                  dynamic_cast<const OmSliderJoint *>(f.data()) ?
+                                  static_cast<const OmSliderJoint *>(f.data())->motor() : nullptr;
+    if (fm == nullptr)
+      continue;
+    const OmBasicJoint *leader = nullptr;
+    for (const OmSolid *solid : OmSolid::solids()) {
+      for (OmBasicJoint *const j : solid->jointChildren()) {
+        const OmMotor *const lm = dynamic_cast<const OmHingeJoint *>(j) ? static_cast<const OmHingeJoint *>(j)->motor() :
+                                  dynamic_cast<const OmSliderJoint *>(j) ? static_cast<const OmSliderJoint *>(j)->motor() :
+                                                                           nullptr;
+        if (lm != nullptr && lm != fm && lm->robot() == fm->robot() && lm->deviceName() == fm->mimicMotor()) {
+          leader = j;
+          break;
+        }
+      }
+      if (leader != nullptr)
+        break;
+    }
+    const int rc = (leader != nullptr && leader->mNewtonJointIndex >= 0 && f->mNewtonJointIndex >= 0) ?
+                       newton->addJointMimic(f->mNewtonJointIndex, leader->mNewtonJointIndex, fm->mimicMultiplier(),
+                                             fm->mimicOffset()) :
+                       -1;
+    if (rc == 0)
+      OmLog::info(QString("[OmNewtonBackend] joint %1 '%2' mimics joint %3 ('%4'): q = %5 + %6 * q_leader")
+                      .arg(f->mNewtonJointIndex)
+                      .arg(fm->deviceName())
+                      .arg(leader->mNewtonJointIndex)
+                      .arg(fm->mimicMotor())
+                      .arg(fm->mimicOffset())
+                      .arg(fm->mimicMultiplier()));
+    else
+      OmLog::warning(QObject::tr("Motor '%1' mimics '%2' (URDF <mimic>), but %3, so the joint is NOT coupled and "
+                                 "is left undriven. OMNISIM_URDF_MIMIC=0 restores the old independent motor.")
+                         .arg(fm->deviceName())
+                         .arg(fm->mimicMotor())
+                         .arg(leader == nullptr ? QObject::tr("no motor of that name exists in the same robot") :
+                                                  QObject::tr("the physics backend could not add the coupling")));
   }
 }
 

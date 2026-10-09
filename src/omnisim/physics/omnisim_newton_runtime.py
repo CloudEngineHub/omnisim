@@ -1072,7 +1072,9 @@ class World:
         # pair enumeration never emits a world-world pair -- so hide the
         # sibling list for the duration of the call and re-attach it after.
         if int(body) != -1:
-            return fn(int(body), **kw) if with_body else fn(**kw)
+            out = fn(int(body), **kw) if with_body else fn(**kw)
+            self._last_shape_sid = out
+            return out
         bs = self.builder.body_shapes
         saved = bs.get(-1)
         bs[-1] = []
@@ -1082,6 +1084,7 @@ class World:
             added = bs[-1]
             bs[-1] = saved if saved is not None else []
             bs[-1].extend(added)
+        self._last_shape_sid = out
         return out
 
     def _overlay_world_statics(self, shape_body):
@@ -1613,6 +1616,29 @@ class World:
             (int(body_idx), float(cx), float(cy), float(cz)))
         return 0
 
+    @staticmethod
+    def _mesh_hull_kwargs():
+        """Convex-hull vertex cap for mesh colliders (2026-10-06).
+
+        newton passes every mesh to MuJoCo with maxhullvert = Mesh.MAX_HULL_VERTICES
+        (64); MuJoCo's own URDF import leaves the hull uncapped. On the Elephant F100
+        pad (436 hull vertices) the 64-vertex hull plus single-point contact let a
+        grasp slip on lift that plain MuJoCo holds.
+        DEFAULT UNCAPPED since 2026-10-06 (with multi-CCD on, see make_solver): over
+        the 56 catalogued worlds with mesh colliders the two together cost nothing
+        measurable (709 -> 706 s wall for 10 s each) and changed two verdicts, both
+        FAIL -> PASS. OMNISIM_NEWTON_MESH_MAXHULLVERT=<n> sets a cap (n >= 4);
+        =0/false/off/no restores newton's own 64; unparseable = uncapped.
+        """
+        v = (_os.environ.get("OMNISIM_NEWTON_MESH_MAXHULLVERT") or "").strip().lower()
+        if v in ("0", "false", "off", "no"):
+            return {}
+        try:
+            n = int(v) if v else -1
+        except ValueError:
+            n = -1
+        return {"maxhullvert": n if (n == -1 or n >= 4) else -1}
+
     def add_shape_mesh(self, body_idx, vertices, indices, n_vertices, cx=0.0, cy=0.0, cz=0.0,
                        qx=0.0, qy=0.0, qz=0.0, qw=1.0, mu=-1.0, mu_t=-1.0, mu_r=-1.0):
         # Native triangle-mesh collision (newton-ode-replacement-plan.md W1) -- replaces the old AABB-box
@@ -1624,7 +1650,8 @@ class World:
         import numpy as _np
         verts = _np.asarray(vertices, dtype=_np.float32).reshape(int(n_vertices), 3)
         tris = _np.asarray(indices, dtype=_np.int32)
-        mesh = newton.Mesh(verts, tris, compute_inertia=False, is_solid=True)
+        mesh = newton.Mesh(verts, tris, compute_inertia=False, is_solid=True,
+                           **self._mesh_hull_kwargs())
         # (qx,qy,qz,qw): the collider's authored orientation in the body frame. Was hard identity,
         # which tipped any mesh collision authored inside a rotated Pose -- which the URDF importer
         # emits routinely.
@@ -3470,6 +3497,63 @@ class World:
         ))
         return slot
 
+    def add_joint_mimic(self, follower_slot, leader_slot, multiplier, offset):
+        """Couple two registered 1-DoF joints (URDF <mimic>, 2026-10-06).
+
+        q_follower = offset + multiplier * q_leader, enforced at finalize as a
+        MuJoCo joint-equality constraint (EqType.JOINT, polycoef [offset,
+        multiplier, 0, 0, 0]) -- the standard MuJoCo encoding of a mimic
+        (MuJoCo 3.11's own URDF import drops <mimic> entirely). The slots
+        are the add_joint_revolute / add_joint_prismatic return values; the
+        newton joints only exist after the BFS push in finalize, which is where
+        _apply_joint_mimics resolves them. BUILD phase only. Returns 0 or -1.
+        """
+        if self.model is not None:
+            return -1
+        n = len(getattr(self, "pending_revolutes", ()) or ())
+        if not (0 <= int(follower_slot) < n and 0 <= int(leader_slot) < n) or int(follower_slot) == int(leader_slot):
+            return -1
+        self.__dict__.setdefault("_pending_mimics", []).append(
+            (int(follower_slot), int(leader_slot), float(multiplier), float(offset)))
+        return 0
+
+    def weld_body_to_world(self, body_idx):
+        """Pin a DYNAMIC body to the world at its spawn pose (2026-10-09).
+
+        Webots' rule (docs/reference/physics.md): a Solid with Physics whose
+        Solid ancestors all lack Physics "is attached to the static environment
+        with a fixed joint". Unlike add_static_body the body keeps its real
+        mass and inertia, so the joints hanging off it see the right loads;
+        finalize gives it a FIXED joint (parent=-1, at body_q) where a root
+        would otherwise get a FREE one. BUILD phase only. Returns 0 or -1.
+        """
+        if self.model is not None or int(body_idx) not in set(self.body_indices):
+            return -1
+        self.__dict__.setdefault("_world_welded_bodies", set()).add(int(body_idx))
+        return 0
+
+    def _apply_joint_mimics(self):
+        pend = getattr(self, "_pending_mimics", None)
+        if not pend:
+            return
+        from newton._src.solvers.mujoco.equality import _add_equality_constraint
+        from newton._src.solvers.mujoco.enums import EqType
+        done = 0
+        for f, l, m, o in pend:
+            jf, jl = self.slot_to_real_idx.get(f), self.slot_to_real_idx.get(l)
+            if jf is None or jl is None:
+                self._newton_log("[OmNewtonBackend] mimic slot %d -> %d: joint not built, coupling skipped" % (f, l))
+                continue
+            try:
+                _add_equality_constraint(self.builder, constraint_type=EqType.JOINT, joint1=int(jf), joint2=int(jl),
+                                         polycoef=[o, m, 0.0, 0.0, 0.0])
+                done += 1
+            except Exception as _exc:                       # noqa: BLE001
+                self._newton_log("[OmNewtonBackend] mimic slot %d -> %d FAILED: %r" % (f, l, _exc))
+        if done:
+            self._set_engine_note("joint_mimic", "%d URDF <mimic> joint coupling(s) enforced as MuJoCo joint-equality "
+                                  "constraints. OMNISIM_URDF_MIMIC=0 restores independent motors." % done)
+
     def add_joint_prismatic(self, parent_idx, child_idx,
                             ax, ay, az,
                             parent_anchor_x, parent_anchor_y, parent_anchor_z,
@@ -4675,6 +4759,44 @@ class World:
             "velocity-wheel config (ke=0, kd=500) like a `continuous` joint. "
             "OMNISIM_NEWTON_UNBOUNDED_LIMIT_AS_CONTINUOUS=0 reverts."
             % (n, max(abs(lo), abs(hi)), big, nd))
+
+    def quiet_last_shape(self):
+        """Keep the shape registered last on its body, but stop it touching
+        anything (2026-10-06).
+
+        The URDF importer gives a link that declares <inertial> but no
+        <collision> a 1 cm sphere (`DEF URDF_INERTIA_PLACEHOLDER`), because the
+        engine needs SOME boundingObject on a body -- without one it falls back
+        to a 12 cm sphere. URDF semantics, and MuJoCo's own URDF import, give
+        such a link no collision at all; the sphere collided anyway. MEASURED:
+        LimX HU_D04's arm stopped against a box at -44 deg with a placeholder
+        9 mm from the face (plain MuJoCo: the hand passes 10 cm into it), and
+        TRON1 stood on placeholders under its feet (knee 12.0 vs 0.54 N*m).
+        The engine calls this right after attaching such a sphere; the shape
+        stays on the body (density 0, so mass and inertia are untouched) with
+        its COLLIDE_SHAPES flag cleared, as _quiet_wrapper_placeholders does.
+        Returns 0, or -1 when nothing was registered.
+        """
+        sid = getattr(self, "_last_shape_sid", None)
+        if sid is None or self.builder is None:
+            return -1
+        try:
+            collide = int(newton.ShapeFlags.COLLIDE_SHAPES)
+        except Exception:                                   # noqa: BLE001
+            from newton.geometry import ShapeFlags as _SF
+            collide = int(_SF.COLLIDE_SHAPES)
+        flags = self.builder.shape_flags
+        sid = int(sid)
+        if not 0 <= sid < len(flags):
+            return -1
+        flags[sid] = int(flags[sid]) & ~collide
+        self._n_quiet_urdf_placeholders = getattr(self, "_n_quiet_urdf_placeholders", 0) + 1
+        self._set_engine_note(
+            "urdf_inertia_placeholder",
+            "%d URDF inertia placeholder sphere(s) (r=1 cm on links with <inertial> but no "
+            "<collision>) made non-colliding. OMNISIM_NEWTON_URDF_PLACEHOLDER_COLLIDES=1 "
+            "restores them." % self._n_quiet_urdf_placeholders)
+        return 0
 
     def _quiet_wrapper_placeholders(self):
         """Stop the 1 mm Robot-wrapper placeholder from carrying contact
@@ -6405,6 +6527,12 @@ class World:
                 if not hasattr(self, "_body_fixed_joint"):
                     self._body_fixed_joint = {}
                 self._body_fixed_joint[root] = jf
+            elif root in self.__dict__.get("_world_welded_bodies", ()):
+                # A dynamic body under physics-less ancestors (weld_body_to_world):
+                # pinned at its spawn pose, real mass kept.
+                jf = self.builder.add_joint_fixed(
+                    parent=-1, child=root,
+                    parent_xform=self.builder.body_q[root])
             else:
                 jf = self.builder.add_joint_free(child=root)
             self.joint_indices.append(jf)
@@ -6442,6 +6570,8 @@ class World:
             self._rbp_slot_map = None   # readback_packed's cached mapping
             self.joint_indices.append(idx)
 
+        self._apply_joint_mimics()
+
         # FREE joints for any body that participates in no revolute at
         # all (single-body world, free-floating debris). Without an
         # explicit FREE the solver leaves the body unreferenced. P8.2:
@@ -6458,9 +6588,16 @@ class World:
         # (a separate contiguous block). Interleaving them trips
         # "Joints must be contiguous ... gap between 1 and 3".
         static_set = set(self.static_body_indices)
+        _welded = self.__dict__.get("_world_welded_bodies", ())
         for body_idx in self.body_indices:
             if body_idx not in connected and body_idx not in static_set:
-                j = self.builder.add_joint_free(child=body_idx)
+                if body_idx in _welded:
+                    # weld_body_to_world on a jointless body: pinned, real mass kept.
+                    j = self.builder.add_joint_fixed(
+                        parent=-1, child=body_idx,
+                        parent_xform=self.builder.body_q[body_idx])
+                else:
+                    j = self.builder.add_joint_free(child=body_idx)
                 self.joint_indices.append(j)
         # P8.2 MuJoCo fix: pin standalone static colliders (bin walls,
         # obstacles) with a FIXED joint to the world + nominal mass/inertia,
@@ -7029,13 +7166,17 @@ class World:
                     "determinism. OMNISIM_NEWTON_CLOTH_CPU_MJ=1 restores the CPU "
                     "entry." % (self.model.device,))
             _kw = {"use_mujoco_cpu": _use_cpu}
-            # OMNISIM_NEWTON_MULTICCD enables multiple contact points for convex
-            # mesh pairs. An opt-in for small manipulation parts: a 49 x 13.6 mm
-            # flat-ended battery rocks/sinks with the single-contact default.
-            # Unset preserves Newton's default; =0/false/off/no disables it.
-            _multiccd = _os.environ.get("OMNISIM_NEWTON_MULTICCD")
-            if _multiccd not in (None, ""):
-                _kw["enable_multiccd"] = _multiccd.strip().lower() not in ("0", "false", "off", "no")
+            # OMNISIM_NEWTON_MULTICCD: multiple contact points for convex pairs
+            # (mesh, capsule, cylinder vs box ...). ON BY DEFAULT since 2026-10-06,
+            # matching stock MuJoCo 3.11 -- newton's SolverMuJoCo turns it OFF
+            # (mjDSBL_MULTICCD) unless asked. With one contact per pair a 49 x
+            # 13.6 mm flat-ended battery rocks and sinks, and a gripper pad holds a
+            # cube at a single point it can pivot about: the Elephant F100 grasp
+            # slipped on lift where plain MuJoCo holds (needs the uncapped mesh
+            # hull too, _mesh_hull_kwargs). =0/false/off/no restores newton's
+            # single-contact default.
+            _multiccd = (_os.environ.get("OMNISIM_NEWTON_MULTICCD") or "").strip().lower()
+            _kw["enable_multiccd"] = _multiccd not in ("0", "false", "off", "no")
             # Contact-stability knobs for DENSE manipulation (env-tunable; unset
             # -> MuJoCo defaults = exact current physics). MuJoCo recommends a
             # HIGH impratio + ELLIPTIC cone + more iterations for grasping /

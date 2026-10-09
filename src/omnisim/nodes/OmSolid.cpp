@@ -338,8 +338,20 @@ void OmSolid::preFinalize() {
     }
   }
 
-  if (nodeType() != WB_NODE_TOUCH_SENSOR && nodeType() != WB_NODE_VACUUM_GRIPPER && mBoundingObject->value() &&
-      mPhysics->value() == NULL && mJointParents.size() == 0 && upperSolid() && upperSolid()->physics()) {
+  // ⚠ This is EXACTLY the Solid the Newton fixed-child collider path harvests
+  // (2026-10-03, b97b4d8c0): its boundingObject is attached to the parent's body
+  // and DOES collide -- so the inherited Webots warning below was false for every
+  // URDF caster, foot, bumper and sensor housing, and an outreach lane concluded
+  // from it that a robot's casters carried nothing (measured 2026-10-07 on the
+  // Ubiquity Magni: level on its casters, tips back only with the path off). It
+  // now fires only when that path is switched off.
+  static const bool fixedChildCollidersOn = [] {
+    const QString v = QString::fromUtf8(qgetenv("OMNISIM_NEWTON_FIXED_CHILD_COLLIDERS")).trimmed().toLower();
+    return v.isEmpty() || (v != "0" && v != "false" && v != "off" && v != "no");
+  }();
+  if (!fixedChildCollidersOn && nodeType() != WB_NODE_TOUCH_SENSOR && nodeType() != WB_NODE_VACUUM_GRIPPER &&
+      mBoundingObject->value() && mPhysics->value() == NULL && mJointParents.size() == 0 && upperSolid() &&
+      upperSolid()->physics()) {
     // P5 hang fix 2026-05-28: dedupe this warning at module scope.
     // The same warning fires once per URDF-imported visual-only Solid
     // (top_plate_link, top_chassis_link, etc. on Husky; many more on
@@ -2127,6 +2139,41 @@ int OmSolid::nearestNewtonBodyIndex() const {
   return -1;
 }
 
+// A URDF link with no <inertial> on a fixed joint imports as a Physics-less
+// nested Solid: a frame, not a body. setSolidMerger() already walks through such
+// frames (2026-09-20), but a MOVING joint whose own parent is that frame still
+// resolved its parent body through effectiveNewtonBodyIndex() alone, found
+// neither a body nor a merger, and the load FATALed with "parent body '<frame>'
+// ... never registered a Newton body". Common ROS layouts hit it: a wheel on a
+// mount frame (Husarion Lynx: body_link -fixed-> fl_wheel_base_link
+// -continuous-> fl_wheel_link) or arms on a centre frame (Dexmate Vega:
+// torso_flip_link -fixed-> arm_center -revolute-> L_arm_l1). 2026-10-06.
+static bool newtonJointParentFrameWalkEnabled() {
+  static const bool on = [] {
+    const QString v = QString::fromUtf8(qgetenv("OMNISIM_NEWTON_JOINT_PARENT_FRAME_WALK")).trimmed().toLower();
+    return v.isEmpty() || (v != "0" && v != "false" && v != "off" && v != "no");
+  }();
+  return on;
+}
+
+const OmSolid *OmSolid::newtonJointParentBodySolid() const {
+  const bool walk = newtonJointParentFrameWalkEnabled();
+  for (const OmSolid *s = this; s != nullptr; s = s->upperSolid()) {
+    if (s->mNewtonBodyIndex >= 0)
+      return s;
+    const OmSolid *const leader = s->mSolidMerger ? s->mSolidMerger->solid() : nullptr;
+    if (leader != nullptr && leader != s && leader->mNewtonBodyIndex >= 0)
+      return leader;
+    // Only a pure frame may be walked through: a Solid with Physics that has no
+    // body is a genuine miss (enforcement must name it), and a joint endpoint is
+    // a separate body by construction -- crossing it would weld the joint below
+    // to the wrong side of that joint.
+    if (!walk || s->physics() != nullptr || s->jointParent() != nullptr)
+      return nullptr;
+  }
+  return nullptr;
+}
+
 OmSolid *OmSolid::findSolidByNewtonBodyIndex(int idx) {
   if (idx < 0)
     return nullptr;
@@ -2746,6 +2793,40 @@ static bool fixedChildOwnsNewtonBody(const OmSolid *sol, const OmSolid *leader) 
 }
 
 
+// docs/reference/physics.md (Webots semantics): "if a Solid node has at least one
+// Solid ancestor node and contains a Physics node but none of its Solid ancestor
+// nodes contain a Physics node, then this node is attached to the static
+// environment with a fixed joint", and a subtree of physics-less Solids under the
+// top Solid is a "larger static base". Until 2026-10-09 neither held under Newton:
+// a Robot without Physics whose child carried Physics became a DYNAMIC body that
+// rolled the child's mass up (with a 1 mm placeholder collider), the child itself
+// often registered as a second free body, and the physics-less form FATALed when
+// its joints hung below the top Solid. Measured on isento's pib Webots twin: the
+// body dropped 22.6 mm onto its desk, slid 0.40 m and fell off it. Value-parsed
+// hatch: OMNISIM_NEWTON_PHYSICSLESS_ANCESTOR_WELD=0 restores the old registration.
+static bool physicslessAncestorWeldEnabled() {
+  static const bool on = [] {
+    const QString v = QString::fromUtf8(qgetenv("OMNISIM_NEWTON_PHYSICSLESS_ANCESTOR_WELD")).trimmed().toLower();
+    return v.isEmpty() || !(v == "0" || v == "false" || v == "off" || v == "no");
+  }();
+  return on;
+}
+
+static bool anySolidAncestorHasPhysics(const OmSolid *s) {
+  for (const OmSolid *a = s->upperSolid(); a != nullptr; a = a->upperSolid())
+    if (a->physics() != nullptr)
+      return true;
+  return false;
+}
+
+// A Solid the rule above attaches to the static environment: it has Physics, is
+// not a joint endpoint (an endpoint articulates off its parent), sits under at
+// least one Solid, and no Solid above it has Physics.
+static bool weldedToStaticEnvironment(const OmSolid *s) {
+  return physicslessAncestorWeldEnabled() && s->physics() != nullptr && s->jointParent() == nullptr &&
+         s->upperSolid() != nullptr && !anySolidAncestorHasPhysics(s);
+}
+
 // Phase-D regression guard companion to rolledUpMass(): true iff this
 // Solid (or any of its fixed-child descendants -- same traversal as
 // rolledUpMass, stopping at joint subtrees) carries a Physics node.
@@ -2819,6 +2900,37 @@ static double newtonSoftKeForMaterial(const OmSFString *contactMaterial) {
 // true (its wheels/feet are the load-bearing colliders and the wrapper should
 // stay out of their way); a single-link one answers false and would otherwise
 // have no usable collision geometry at all.
+// The URDF importer marks the sphere it gives a link with <inertial> but no
+// <collision> (OmUrdfImporter.cpp emitLinkPhysics) with this DEF. The engine needs
+// SOME boundingObject on such a body -- without one it falls back to a 12 cm
+// sphere -- but URDF semantics, and MuJoCo's own URDF import, give the link no
+// collision at all. Until 2026-10-06 the 1 cm sphere collided: LimX HU_D04's arm
+// stopped against a box its hand should have entered, and TRON1 stood on the
+// spheres under its feet. Registered, then made non-colliding.
+// OMNISIM_NEWTON_URDF_PLACEHOLDER_COLLIDES=1 (value-parsed) restores the old contact.
+static const char *const kUrdfInertiaPlaceholderDef = "URDF_INERTIA_PLACEHOLDER";
+
+static bool urdfInertiaPlaceholderCollides() {
+  static const bool collides = [] {
+    const QString v = QString::fromUtf8(qgetenv("OMNISIM_NEWTON_URDF_PLACEHOLDER_COLLIDES")).trimmed().toLower();
+    return !v.isEmpty() && v != "0" && v != "false" && v != "off" && v != "no";
+  }();
+  return collides;
+}
+
+// TRUE when a boundingObject is ONLY the importer's marked sphere (bare, or in the
+// Pose the importer wraps it in for a re-rooted link) and that sphere is quieted.
+static bool isQuietUrdfInertiaPlaceholder(const OmNode *bo) {
+  if (bo == nullptr || urdfInertiaPlaceholderCollides())
+    return false;
+  if (const OmPose *p = dynamic_cast<const OmPose *>(bo)) {
+    if (p->children().size() != 1)
+      return false;
+    bo = p->children().item(0);
+  }
+  return bo != nullptr && bo->defName() == QLatin1String(kUrdfInertiaPlaceholderDef);
+}
+
 static bool hasDescendantCollider(const OmSolid *s) {
   if (s == nullptr)
     return false;
@@ -2826,7 +2938,12 @@ static bool hasDescendantCollider(const OmSolid *s) {
   foreach (const OmSolid *child, kids) {
     if (child == nullptr)
       continue;
-    if (child->boundingObject() != nullptr)
+    // A quieted URDF inertia placeholder carries no contact, so it must not
+    // count: a wrapper whose descendants are ALL such links (DJI Mavic 2 Pro:
+    // propellers and gimbal links with no <collision>) has to keep its own
+    // collider. Counting them left the Mavic resting on the 1 mm wrapper
+    // sphere at its origin, half sunk into the floor (2026-10-06).
+    if (child->boundingObject() != nullptr && !isQuietUrdfInertiaPlaceholder(child->boundingObject()))
       return true;
     if (hasDescendantCollider(child))
       return true;
@@ -2869,6 +2986,15 @@ static OmNewtonShapeXform composeNewtonShapePose(const OmNewtonShapeXform &runni
   return out;
 }
 
+static QString quietIfUrdfInertiaPlaceholder(OmNewtonBackend *newton, const OmBaseNode *sphere) {
+  if (sphere == nullptr || sphere->defName() != QLatin1String(kUrdfInertiaPlaceholderDef) ||
+      urdfInertiaPlaceholderCollides() || newton->quietLastShape() != 0)
+    return QString();
+  // Worded without "placeholder": that word arms the "collider is NOT the authored
+  // geometry" warning below, and here the authored geometry is no collider at all.
+  return QStringLiteral(" (URDF link with no <collision>: non-colliding)");
+}
+
 static QString addNewtonPrimitive(OmNewtonBackend *newton, int idx,
                                   const OmBaseNode *g, const OmNewtonShapeXform &x,
                                   double softKe, double solidMu,
@@ -2882,7 +3008,7 @@ static QString addNewtonPrimitive(OmNewtonBackend *newton, int idx,
     newton->addShapeSphere(idx, sphere->radius(), off.x(), off.y(), off.z(), solidMu,
                            solidMuT, solidMuR);
     return QString("sphere r=%1 at (%2,%3,%4)").arg(sphere->radius())
-        .arg(off.x()).arg(off.y()).arg(off.z());
+        .arg(off.x()).arg(off.y()).arg(off.z()) + quietIfUrdfInertiaPlaceholder(newton, sphere);
   }
   if (const OmBox *box = dynamic_cast<const OmBox *>(g)) {
     const OmVector3 &sz = box->size();
@@ -3119,7 +3245,8 @@ static QString attachNewtonShapeFromBoundingObject(OmNewtonBackend *newton, int 
     newton->addShapeSphere(idx, radius, shapeOffset.x(), shapeOffset.y(), shapeOffset.z(), solidMu,
                            solidMuT, solidMuR);
     shapeDesc = QString("sphere r=%1 at (%2,%3,%4)").arg(radius)
-                    .arg(shapeOffset.x()).arg(shapeOffset.y()).arg(shapeOffset.z());
+                    .arg(shapeOffset.x()).arg(shapeOffset.y()).arg(shapeOffset.z()) +
+                quietIfUrdfInertiaPlaceholder(newton, sphere);
   } else if (const OmBox *box = dynamic_cast<const OmBox *>(bo)) {
     const OmVector3 &sz = box->size();
     newton->addShapeBox(idx, sz.x() * 0.5, sz.y() * 0.5, sz.z() * 0.5,
@@ -3507,6 +3634,9 @@ void OmSolid::flushPendingNewtonRegistrations() {
   // many boundingObjects (root + merged fixed children) went onto them.
   int staticBaseRootsWithColliders = 0;
   int staticBaseColliderSources = 0;
+  // Physics-bearing Solids under physics-less ancestors, welded to the world
+  // this flush (weldedToStaticEnvironment).
+  QStringList weldedToWorldNames;
   // Dynamic merge leaders that received their fixed children's colliders, how
   // many boundingObjects went onto them, and how many leaders took the
   // composite (leader + fixed children) inertia (2026-10-03).
@@ -3642,7 +3772,11 @@ void OmSolid::flushPendingNewtonRegistrations() {
           break;
         }
       }
-      if (!(s->physics() != nullptr && !s->mJointChildren.isEmpty() && !ancestorHasPhysics))
+      // A physics-bearing Solid under physics-less ancestors registers its own
+      // body too, jointed or not, and is welded to the world below
+      // (weldedToStaticEnvironment, the physics.md rule).
+      if (!weldedToStaticEnvironment(s) &&
+          !(s->physics() != nullptr && !s->mJointChildren.isEmpty() && !ancestorHasPhysics))
         continue;
       // fall through: register this jointed, physics-bearing Solid as its own body
     }
@@ -3660,10 +3794,42 @@ void OmSolid::flushPendingNewtonRegistrations() {
     // is unambiguous from the stripped root physics, so detect it directly
     // (an articulated Robot whose own Physics was removed) and route the base
     // through the SAME FIXED-joint weld the fixed-base arms use.
+    // A "larger static base" (physics.md): the joints may hang off a physics-less
+    // Solid BELOW the Robot (pib with urdf_body's Physics removed) rather than off
+    // the Robot itself. OmBasicJoint walks such pure frames up to the Robot's body
+    // (newtonJointParentBodySolid), so the Robot must register one.
+    const auto staticSubtreeHasJoint = [](const OmSolid *root) {
+      QVector<const OmNode *> jwalk;
+      jwalk.append(root);
+      while (!jwalk.isEmpty()) {
+        const OmNode *const node = jwalk.takeLast();
+        if (const OmSolid *const sol = dynamic_cast<const OmSolid *>(node)) {
+          if (sol != root && sol->physics() != nullptr)
+            continue;  // owns its own body; its joints attach there
+          if (!sol->mJointChildren.isEmpty())
+            return true;
+        }
+        if (const OmGroup *const g = dynamic_cast<const OmGroup *>(node)) {
+          const OmMFNode &kids = g->children();
+          for (int i = 0; i < kids.size(); ++i) {
+            const OmNode *const kid = kids.item(i);
+            if (kid != nullptr && dynamic_cast<const OmBasicJoint *>(kid) == nullptr)
+              jwalk.append(kid);
+          }
+        }
+      }
+      return false;
+    };
     const bool staticBaseRobot =
         dynamic_cast<const OmRobot *>(s) != nullptr &&
         s->physics() == nullptr &&
-        !s->mJointChildren.isEmpty();
+        (!s->mJointChildren.isEmpty() || (physicslessAncestorWeldEnabled() && staticSubtreeHasJoint(s)));
+    // A physics-less top Solid whose Physics lives only in its children: under
+    // the physics.md rule those children are welded bodies of their own, so this
+    // Solid is static scenery (or a static base), not a dynamic leader rolling
+    // their mass up.
+    const bool physicslessLeader = physicslessAncestorWeldEnabled() && s->physics() == nullptr &&
+                                   s->jointParent() == nullptr && subtreeHasPhysics(s);
 
     // A Solid with no Physics node anywhere in its fixed-child subtree
     // is STATIC scene geometry (RectangleArena floor, walls,
@@ -3677,7 +3843,7 @@ void OmSolid::flushPendingNewtonRegistrations() {
     // resetJointsToDefaults() on the SHARED webots_world articulation
     // every tick -- snapping every real robot's joints + bodies back to
     // spawn and freezing them in place (the husky chassis-freeze bug).
-    if (!subtreeHasPhysics(s) || staticBaseRobot) {
+    if (!subtreeHasPhysics(s) || staticBaseRobot || physicslessLeader) {
       // OMNISIM_NEWTON_KINEMATIC (value-parsed, default OFF) -- kernel
       // blocker #4, _scratch/design_kinematic_inertia.md Part 1. A
       // physics-less JOINT ENDPOINT is animated by the ENGINE
@@ -3756,7 +3922,10 @@ void OmSolid::flushPendingNewtonRegistrations() {
       // statics. Only staticBase robots reach here -- a normal robot's base
       // keeps its Physics so subtreeHasPhysics() is true and it takes the
       // dynamic addBody/free-root path below, unchanged.
-      if (dynamic_cast<const OmRobot *>(s) != nullptr) {
+      // A physics-less Robot with no joints of its own whose Physics lives in
+      // welded children (physicslessLeader) is plain static scenery: it skips
+      // this branch and harvests its own colliders with the scene statics below.
+      if (dynamic_cast<const OmRobot *>(s) != nullptr && !(physicslessLeader && !staticBaseRobot)) {
         // Only an ARTICULATED robot base needs a Newton root body: a joint must
         // hang off it. A physics-less Robot with NO joint children (the
         // draggable OmniSimSunMarker supervisor, a sensor-only beacon, ...) is
@@ -3766,7 +3935,8 @@ void OmSolid::flushPendingNewtonRegistrations() {
         // static body injects a spurious mass=0 orphan into the "statics"
         // articulation: harmless under XPBD but fatal to SolverMuJoCo, which
         // refuses to compile a body whose mass/inertia is below mjMINVAL.
-        if (s->mJointChildren.isEmpty())
+        // (staticBaseRobot also covers joints hanging off a physics-less child.)
+        if (!staticBaseRobot)
           continue;
         if (newton->ensureWorldOpen() != 0)
           return;
@@ -3809,7 +3979,8 @@ void OmSolid::flushPendingNewtonRegistrations() {
               OmSolid *const sol = dynamic_cast<OmSolid *>(node);
               if (sol != nullptr && sol != s &&
                   (sol->mNewtonBodyIndex >= 0 || isUnfoldedContactDevice(sol) ||
-                   (sol->physics() != nullptr && !sol->mJointChildren.isEmpty())))
+                   (sol->physics() != nullptr && !sol->mJointChildren.isEmpty()) ||
+                   weldedToStaticEnvironment(sol)))
                 continue;  // owns (or will own) its body and its collider
               if (sol != nullptr && sol->mBoundingObject != nullptr &&
                   sol->mBoundingObject->value() != nullptr) {
@@ -3922,6 +4093,8 @@ void OmSolid::flushPendingNewtonRegistrations() {
       while (!walk.isEmpty()) {
         OmNode *const node = walk.takeLast();
         if (OmSolid *const sol = dynamic_cast<OmSolid *>(node)) {
+          if (sol != s && weldedToStaticEnvironment(sol))
+            continue;  // a welded body of its own carries its subtree's colliders
           if (sol->mBoundingObject != nullptr && sol->mBoundingObject->value() != nullptr)
             staticColliders.append(sol);
         }
@@ -4273,6 +4446,17 @@ void OmSolid::flushPendingNewtonRegistrations() {
       // and cannot be patched into mj_model afterwards. A 0 value is a no-op, so
       // a world that does not declare the field is untouched.
       newton->setBodyGravcomp(idx, s->mNewtonGravityCompensation->value());
+    if (idx >= 0 && weldedToStaticEnvironment(s)) {
+      // physics.md: attached to the static environment with a fixed joint, at
+      // its spawn pose, keeping its real mass for the joints hanging off it.
+      if (newton->weldBodyToWorld(idx) == 0)
+        weldedToWorldNames.append(s->name().isEmpty() ? QString("<unnamed>") : s->name());
+      else
+        OmLog::warning(tr("Solid '%1' has Physics but no Solid above it does, so it should be attached to the "
+                          "static environment (docs/reference/physics.md); the physics runtime could not weld it "
+                          "and it stays FREE. Re-stage the Newton runtime bundle.")
+                           .arg(s->name()));
+    }
     if (idx >= 0) {
       // P3.10i: OmRobot wrappers (URDFRobot expansion produces these)
       // typically have a chassis-envelope bounding box that includes
@@ -4621,6 +4805,12 @@ void OmSolid::flushPendingNewtonRegistrations() {
                           "(statics: %3)")
                       .arg(nDynamic).arg(nStatic).arg(staticNames.join(", ")).arg(registeredThisFlush)
                       .arg(nWorldStatic));
+    if (!weldedToWorldNames.isEmpty())
+      OmLog::info(QString("[OmNewtonBackend] %1 Solid(s) with Physics under physics-less ancestors attached to the "
+                          "static environment (physics.md): %2; OMNISIM_NEWTON_PHYSICSLESS_ANCESTOR_WELD=0 reverts")
+                      .arg(weldedToWorldNames.size())
+                      .arg(weldedToWorldNames.mid(0, 8).join(", ") +
+                           (weldedToWorldNames.size() > 8 ? QString(", ...") : QString())));
     if (staticBaseRootsWithColliders > 0)
       OmLog::info(QString("[OmNewtonBackend] staticBase root colliders: %1 boundingObject(s) attached to %2 "
                           "fixed robot root(s); OMNISIM_NEWTON_STATIC_BASE_COLLIDERS=0 reverts")

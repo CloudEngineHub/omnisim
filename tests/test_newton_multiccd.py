@@ -2,8 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Engine regression: a small flat-ended cylinder must rest on its surface.
 
-The optional multiple-contact setting must reach the solver, and setting it
-to zero must restore the default. Run after staging the Newton runtime module.
+Multiple contacts per convex pair are ON by default since 2026-10-06 (stock
+MuJoCo's default; newton's SolverMuJoCo had turned them off). The default must
+rest the battery flat; OMNISIM_NEWTON_MULTICCD=0 must restore the old
+single-contact behaviour, where it rocks and sinks by more than 5 mm. Run after
+staging the Newton runtime module.
 """
 import json
 import os
@@ -67,6 +70,6 @@ def test_flat_mesh_contact_and_explicit_disable(tmp_path):
     default=run_probe(tmp_path/'default',None)
     disabled=run_probe(tmp_path/'disabled','0')
     enabled=run_probe(tmp_path/'enabled','1')
-    assert default == disabled
+    assert default == enabled
     assert max(abs(z-.0168) for z in enabled)<.0005
     assert min(abs(z-.0168) for z in disabled)>.005

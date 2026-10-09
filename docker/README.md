@@ -4,12 +4,14 @@ Two images live here. They are for different jobs and are not interchangeable.
 
 | File | Image | Purpose | Base | Rough size |
 |---|---|---|---|---|
-| [`Dockerfile.runtime`](Dockerfile.runtime) | `ghcr.io/omnilink-tech/omnisim` (not published — see Status) | **Run OmniSim.** The no-build onboarding path. | `ubuntu:24.04` | ~1.2-1.6 GB (est.) |
+| [`Dockerfile.runtime`](Dockerfile.runtime) | `ghcr.io/omnilink-tech/omnisim` (published, anonymous pull — `:v9.2.0` and `:latest`; see Status) | **Run OmniSim.** The no-build onboarding path. | `ubuntu:24.04` | 3.00 GB unpacked, ~1.37 GB to pull (measured 2026-10-03) |
 | [`Dockerfile.train`](Dockerfile.train) | `ghcr.io/omnilink-tech/omnisim-train` | In-engine RL training. Needs a GPU. | `nvidia/cuda:12.8.1-devel` | ~12-16 GB (est.) |
 
-Both size figures are **estimates from layer contents, not measurements** — no
-one has run `docker image inspect` on either. The runtime workflow prints the
-real number on every build; replace these once it has.
+The runtime figure is **measured**: 3.00 GB is `docker image inspect .Size`
+printed by the workflow (run 37142637927), and ~1.37 GB is the content a pull
+downloads (`docker image inspect` on the pulled `:v9.2.0`, Docker Desktop,
+2026-10-03). The training figure is still an **estimate from layer contents**;
+nobody has measured it.
 
 **The Ubuntu tag is load-bearing, not cosmetic.** `Dockerfile.runtime` sets
 `ARG UBUNTU_TAG=24.04` and then asserts the system interpreter at build time
@@ -31,18 +33,31 @@ rather than as supported.
 
 ### Status
 
-✅ **Published 2026-08-29** — `ghcr.io/omnilink-tech/omnisim:latest`
-(digest `sha256:9fd2159d…`, workflow run 33267809386), the first push after four
-runs that never got past the doctor smoke. What that run **measured** on a
-GPU-less runner: the doctor exits in 0 s through the entrypoint (tini as PID 1;
-without it every xvfb-run arrangement hangs before running anything), a real
-world finalises **and steps** on the CPU solver with the Newton sidecar reading
-`degraded: false`, and wgpu selects **Vulkan / llvmpipe (LLVM 20.1.2)** with
-`ALL OK (instance+adapter+device+queue)`. The workflow gates every push on the
-first two and prints the third. To republish:
+✅ **Published — current: v9.2.0, 2026-10-03.**
+`ghcr.io/omnilink-tech/omnisim:v9.2.0` and `:latest` both point at digest
+`sha256:3509de8ebe55…` (workflow run 37142637927 on the public repo, dispatched
+with `omnisim_tag=v9.2.0`). An anonymous pull of `:v9.2.0` (no `docker login`)
+succeeds and resolves to that digest. What that run **measured** on a GPU-less
+runner: `doctor` reports `omnisim 9.2.0`, `physics Newton runtime OK` and
+`VERDICT READY`, both without a display and through the entrypoint (tini as
+PID 1 exits in 1 s; the four xvfb-run-as-PID-1 probe rows still hang, as
+expected); the CPU-solver warehouse world finalises **and steps** with the
+Newton sidecar reading `degraded: false` (newton 1.5.0, mujoco 3.11.0, warp
+1.16.0, device cpu). ⚠ The render-adapter probe printed **no wgpu init log** on
+this run, so the renderer line below is still the 2026-08-29 measurement
+(Vulkan / llvmpipe, `ALL OK`) and is unverified on v9.2.0 — most likely the probe
+went inert when `--no-rendering` stopped initialising wgpu (2026-09-02), not a
+renderer regression, but nobody has checked.
+
+History: first published 2026-08-29 (digest `sha256:9fd2159d…`, run
+33267809386) after four runs that never got past the doctor smoke; the v8.1.13
+push of the same day was the last until v9.2.0.
+
+To republish (the workflow lives on the PUBLIC repo; the dev fork's job is
+skipped by its owner guard):
 
 ```bash
-gh workflow run runtime-image.yml -f omnisim_tag=v8.1.6
+gh workflow run runtime-image.yml -R omnilink-tech/omnisim -f omnisim_tag=vX.Y.Z
 ```
 
 ### Why it exists

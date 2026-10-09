@@ -422,9 +422,10 @@ Husky off a 12 m floor to (−6.86, 4.75) and nothing objected.
 - **Vendored OmniLink SDK examples** under
   `msys64/.../site-packages/omnilink/examples/` are live `/tool`
   handlers if anyone runs them.
-- **`.local-runs/lab-offer-publish/`** is a published snapshot with the
-  same holes at older line numbers — a copy, not a separate path, but it
-  means the ungated `/tool` pattern has already shipped outward.
+- **The public `omnilink-tech/omnisim` repository** (snapshots from
+  v8.1.6, 2026-08-25, onward) has the same holes at older line numbers.
+  That is a copy, not a separate path, but it means the ungated `/tool`
+  pattern has already shipped outward.
 
 ## ⚠️ What interpbench does and does not prove
 

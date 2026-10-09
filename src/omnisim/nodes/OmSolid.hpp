@@ -151,6 +151,15 @@ public:
   // own -- the merge leader's body is what a weld or wrench read must anchor
   // on. -1 when the whole chain owns no Newton body (ODE world / kinematic).
   int nearestNewtonBodyIndex() const;
+  // The Solid whose Newton body a joint parented to THIS Solid must attach to,
+  // or nullptr when there is none: this Solid when it owns a body, its merger
+  // leader when it was merged away, and otherwise -- for a Physics-less frame
+  // that is not itself a joint endpoint (a URDF link with no <inertial> on a
+  // fixed joint) -- the same answer for the nearest ancestor, walking the
+  // rule setSolidMerger() uses. The returned Solid's frame is the body frame
+  // the joint's anchor and axis must be re-expressed in.
+  // OMNISIM_NEWTON_JOINT_PARENT_FRAME_WALK=0 (value-parsed) skips the walk.
+  const OmSolid *newtonJointParentBodySolid() const;
   // Reverse lookup over the finalized-solid census: the Solid whose
   // mNewtonBodyIndex is `idx`, or NULL. Used by VacuumGripper's native
   // contact-based attach trigger (the ODE odeNearCallback source is dead for

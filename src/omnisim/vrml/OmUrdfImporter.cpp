@@ -187,6 +187,10 @@ struct UrdfJoint {
   bool hasFriction = false;
   double rest = 0.0;     // OmniSim extension: <rest>X</rest> child of <joint>
   bool hasRest = false;  // overrides the default initial joint position
+  // <mimic joint="L" multiplier="m" offset="o">: q = o + m * q_L (2026-10-06).
+  QString mimicJoint;
+  double mimicMultiplier = 1.0;
+  double mimicOffset = 0.0;
 };
 
 struct UrdfRobot {
@@ -625,6 +629,14 @@ UrdfJoint parseJoint(const QDomElement &elem) {
     }
   }
 
+  const QDomElement mimicEl = elem.firstChildElement("mimic");
+  if (!mimicEl.isNull() && !mimicEl.attribute("joint").trimmed().isEmpty()) {
+    j.mimicJoint = mimicEl.attribute("joint").trimmed();
+    if (mimicEl.hasAttribute("multiplier"))
+      j.mimicMultiplier = mimicEl.attribute("multiplier").toDouble();
+    if (mimicEl.hasAttribute("offset"))
+      j.mimicOffset = mimicEl.attribute("offset").toDouble();
+  }
   const QDomElement dynamicsEl = elem.firstChildElement("dynamics");
   if (!dynamicsEl.isNull()) {
     if (dynamicsEl.hasAttribute("damping")) {
@@ -1342,8 +1354,18 @@ QString emitLinkChildren(const UrdfLink &link, const QString &indent,
   return out;
 }
 
+// `bodyForFixedSubtree`: the link is the child of a MOVING joint, declares neither
+// <inertial> nor <collision>, but links welded below it by fixed joints carry mass
+// or collision (computed by emptyLinkCarriesFixedSubtree). It must become a body,
+// or nothing is: with no Physics it is a kinematic frame, its joint has no dynamic
+// endpoint, and the fixed subtree -- whose merge walk stops at that joint endpoint
+// -- registers as a FREE body of its own. Measured 2026-10-06: a 1 kg gripper
+// fixed below such a link fell away to z = -11 m while the arm swung on without
+// it; on Kinova's Gen3 lite (end_effector_link) the gripper and any tool payload
+// vanished from the arm's joint torques. MuJoCo fuses the fixed children into the
+// body instead, which is what the composite merge does once this link has a body.
 QString emitLinkPhysics(const UrdfLink &link, const QString &indent, bool allowSyntheticPhysics = true,
-                        const UrdfOrigin *linkOffset = nullptr) {
+                        const UrdfOrigin *linkOffset = nullptr, bool bodyForFixedSubtree = false) {
   QString out;
 
   // Collect collisions with emittable geometry (supported primitives or resolved meshes).
@@ -1357,7 +1379,7 @@ QString emitLinkPhysics(const UrdfLink &link, const QString &indent, bool allowS
     out += emitBoundingObject(supported.first(), indent, link.name);
   } else if (supported.size() > 1) {
     out += emitBoundingObjectGroup(supported, indent, link.name);
-  } else if (link.inertial.present) {
+  } else if (link.inertial.present || (bodyForFixedSubtree && allowSyntheticPhysics)) {
     // OmniSim needs a boundingObject to compute an inertia matrix; a link with
     // <inertial> but no <collision> would otherwise trigger "Undefined inertia
     // matrix" on every load. Emit a 10 mm placeholder sphere -- big enough
@@ -1366,11 +1388,16 @@ QString emitLinkPhysics(const UrdfLink &link, const QString &indent, bool allowS
     // unable to receive friction-induced acceleration on small robots).
     // linkOffset (a re-rooted Robot link, emitRobot): keep the placeholder at
     // the LINK origin, not at the Robot's base_footprint frame on the floor.
+    // DEF URDF_INERTIA_PLACEHOLDER (2026-10-06): the engine registers this sphere
+    // NON-colliding (OmSolid.cpp quietIfUrdfInertiaPlaceholder). URDF gives a link
+    // with no <collision> no contact; the sphere used to collide as a 1 cm marble
+    // at every such link origin (LimX HU_D04, TRON1).
     if (linkOffset != nullptr && !isIdentityUrdfOrigin(*linkOffset))
-      out += indent + QString("boundingObject Pose { translation %1 %2 %3 children [ Sphere { radius 0.01 } ] }\n")
+      out += indent + QString("boundingObject Pose { translation %1 %2 %3 children [ DEF URDF_INERTIA_PLACEHOLDER "
+                              "Sphere { radius 0.01 } ] }\n")
                         .arg(linkOffset->x).arg(linkOffset->y).arg(linkOffset->z);
     else
-      out += indent + "boundingObject Sphere { radius 0.01 }\n";
+      out += indent + "boundingObject DEF URDF_INERTIA_PLACEHOLDER Sphere { radius 0.01 }\n";
   }
   // OmniSim treats a Solid with boundingObject but no Physics as unable to
   // participate in collisions ("collisions will have no effect"). Many ROS
@@ -1391,8 +1418,11 @@ QString emitLinkPhysics(const UrdfLink &link, const QString &indent, bool allowS
   // attachments (gripper hands, sensor mounts, antennas) that's the right
   // trade-off. Links that need real contact dynamics should declare an
   // <inertial> in the URDF or be connected via a non-fixed joint.
+  // The same near-zero synthetic mass (1 g) carries an empty moving-joint link
+  // whose fixed subtree has mass or collision (bodyForFixedSubtree, above): the
+  // subtree's own mass then merges into it, as MuJoCo's URDF fusing does.
   const bool needsSyntheticPhysics =
-    allowSyntheticPhysics && !link.inertial.present && !supported.isEmpty();
+    allowSyntheticPhysics && !link.inertial.present && (!supported.isEmpty() || bodyForFixedSubtree);
   if (link.inertial.present || needsSyntheticPhysics) {
     const double mass = link.inertial.present ? link.inertial.mass : 0.001;
     out += indent + "physics Physics {\n";
@@ -1617,14 +1647,20 @@ void appendJointPhysicsParameters(QString &out, const UrdfJoint &joint, const QS
         // preserve the original spawn pose -- e.g. Spot's hip_y was
         // limit [0.001, 0.60] (spawn midpoint 0.30) and is now widened
         // to [-2.50, 3.00] with <rest>0.30</rest> to keep walking.
-        //
-        // initialJointPosition is the single rule shared with emitSolidEndPoint,
-        // which writes the endPoint already posed at this angle.
-        double q0 = 0.0;
-        if (initialJointPosition(joint, q0))
-          out += indent + QString("position %1\n").arg(q0);
+        // (The `position` line itself is written below, outside this branch.)
       }
     }
+    // initialJointPosition is the single rule shared with emitSolidEndPoint,
+    // which writes the endPoint already posed at this angle, so the joint MUST
+    // be told it starts there whenever the endPoint was posed -- including the
+    // partial-range case, which emits no stops. Until 2026-10-07 this line sat
+    // inside the stops branch: a <rest> on a joint reaching past +/-pi (UFACTORY
+    // xArm joint3 -3.927..0.192) spawned the link at the rest angle while the
+    // joint read 0 there, so every setPosition() landed `rest` radians off and
+    // the xArm was driven 20 deg past its own stop.
+    double q0 = 0.0;
+    if (!fullRange && initialJointPosition(joint, q0))
+      out += indent + QString("position %1\n").arg(q0);
   }
   if (joint.hasDamping)
     out += indent + QString("dampingConstant %1\n").arg(joint.damping);
@@ -1660,6 +1696,49 @@ QString emitJoint(const UrdfJoint &j, const QString &indent,
                   const QHash<QString, QList<UrdfJoint>> &jointsByParent,
                   const QHash<QString, UrdfLink> &links,
                   const QHash<QString, QList<UrdfSensor>> &sensorsByLink);
+static void appendMimicFields(QString &out, const UrdfJoint &j, const QString &indent);
+
+// TRUE when `link` declares neither <inertial> nor a supported <collision> but a
+// link welded below it by fixed joints (any depth) declares either -- the case
+// emitLinkPhysics' `bodyForFixedSubtree` exists for. Value-parsed hatch:
+// OMNISIM_URDF_EMPTY_LINK_BODY=0 restores the old import (no body; the fixed
+// subtree comes loose).
+static bool emptyLinkCarriesFixedSubtree(const UrdfLink &link,
+                                         const QHash<QString, QList<UrdfJoint>> &jointsByParent,
+                                         const QHash<QString, UrdfLink> &links) {
+  static const bool enabled = [] {
+    const QString v = QString::fromUtf8(qgetenv("OMNISIM_URDF_EMPTY_LINK_BODY")).trimmed().toLower();
+    return v.isEmpty() || (v != "0" && v != "false" && v != "off" && v != "no");
+  }();
+  if (!enabled || link.inertial.present)
+    return false;
+  const auto isPhysical = [](const UrdfLink &l) {
+    if (l.inertial.present)
+      return true;
+    for (const UrdfCollision &c : l.collisions)
+      if (isSupportedGeometry(c.geometry))
+        return true;
+    return false;
+  };
+  if (isPhysical(link))
+    return false;  // has its own collision: the ordinary synthetic-physics path covers it
+  QList<QString> stack{link.name};
+  QSet<QString> seen;
+  while (!stack.isEmpty()) {
+    const QString name = stack.takeLast();
+    if (seen.contains(name))
+      continue;
+    seen.insert(name);
+    for (const UrdfJoint &cj : jointsByParent.value(name)) {
+      if (cj.type != "fixed" || !links.contains(cj.child))
+        continue;
+      if (isPhysical(links.value(cj.child)))
+        return true;
+      stack.append(cj.child);
+    }
+  }
+  return false;
+}
 
 QString emitSolidEndPoint(const UrdfLink &link, const UrdfJoint &joint, const QString &indent,
                           const QHash<QString, QList<UrdfJoint>> &jointsByParent,
@@ -1709,7 +1788,8 @@ QString emitSolidEndPoint(const UrdfLink &link, const UrdfJoint &joint, const QS
       out += emitJoint(cj, indent + "    ", jointsByParent, links, sensorsByLink);
   }
   out += indent + "  ]\n";
-  out += emitLinkPhysics(link, indent + "  ");
+  out += emitLinkPhysics(link, indent + "  ", true, nullptr,
+                         emptyLinkCarriesFixedSubtree(link, jointsByParent, links));
   out += indent + "}\n";
   return out;
 }
@@ -1792,6 +1872,7 @@ QString emitJoint(const UrdfJoint &j, const QString &indent,
       out += indent + QString("      minPosition %1\n").arg(j.lower);
       out += indent + QString("      maxPosition %1\n").arg(j.upper);
     }
+    appendMimicFields(out, j, indent + "      ");
     out += indent + "    }\n";
     // Pair the motor with a PositionSensor so controllers can read joint
     // angle / velocity (motor.getPositionSensor() returns this). Without it
@@ -1818,6 +1899,18 @@ QString emitJoint(const UrdfJoint &j, const QString &indent,
       out += indent + QString("      maxVelocity %1\n").arg(j.velocity);
     if (j.hasEffort)
       out += indent + QString("      maxForce %1\n").arg(j.effort);
+    // The travel as the motor's control range too, as for revolute joints
+    // (2026-09-20). Without it LinearMotor.getMinPosition()/getMaxPosition()
+    // read 0/0 while the stops enforced the URDF range (Niryo Ned2 and Seeed
+    // reBot grippers, 2026-10-04): a controller reading the motor to find the
+    // finger's travel was told it could not move. The solver limit is
+    // unchanged -- OmBasicJoint reads the motor range first, the stops second,
+    // and both now carry the same values.
+    if (j.hasLower && j.hasUpper && j.upper > j.lower) {
+      out += indent + QString("      minPosition %1\n").arg(j.lower);
+      out += indent + QString("      maxPosition %1\n").arg(j.upper);
+    }
+    appendMimicFields(out, j, indent + "      ");
     out += indent + "    }\n";
     out += indent + "    PositionSensor {\n";
     out += indent + QString("      name \"%1_sensor\"\n").arg(j.name);
@@ -1829,6 +1922,27 @@ QString emitJoint(const UrdfJoint &j, const QString &indent,
   }
 
   return QString();
+}
+
+// URDF <mimic> (2026-10-06). Until then the importer dropped it: a mimic-driven
+// gripper (Robotiq 2F-85/2F-140, Franka Hand, Kinova, LimX, Dexmate ...) arrived
+// as independent motors, the follower fingers free or held only by their own
+// servo, so they drifted apart under asymmetric load. The follower's motor now
+// names its leader; the engine enforces q = offset + multiplier * q_leader as a
+// MuJoCo joint-equality constraint (the standard MuJoCo encoding of a mimic:
+// <equality><joint polycoef="offset multiplier 0 0 0">; MuJoCo 3.11's own URDF
+// import drops <mimic> entirely) and registers the follower without a drive. OMNISIM_URDF_MIMIC=0 (value-parsed)
+// restores the old import.
+static void appendMimicFields(QString &out, const UrdfJoint &j, const QString &indent) {
+  static const bool enabled = [] {
+    const QString v = QString::fromUtf8(qgetenv("OMNISIM_URDF_MIMIC")).trimmed().toLower();
+    return v.isEmpty() || (v != "0" && v != "false" && v != "off" && v != "no");
+  }();
+  if (!enabled || j.mimicJoint.isEmpty())
+    return;
+  out += indent + QString("mimicMotor \"%1_motor\"\n").arg(j.mimicJoint);
+  out += indent + QString("mimicMultiplier %1\n").arg(j.mimicMultiplier, 0, 'g', 17);
+  out += indent + QString("mimicOffset %1\n").arg(j.mimicOffset, 0, 'g', 17);
 }
 
 QString emitRobot(const UrdfRobot &robot) {

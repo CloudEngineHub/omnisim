@@ -77,6 +77,10 @@ void OmMotor::init() {
   mMaxPosition = findSFDouble("maxPosition");
   mMaxVelocity = findSFDouble("maxVelocity");
   mMultiplier = findSFDouble("multiplier");
+  // URDF <mimic> (2026-10-06): may be absent on node types that do not declare them.
+  mMimicMotor = findSFString("mimicMotor");
+  mMimicMultiplier = findSFDouble("mimicMultiplier");
+  mMimicOffset = findSFDouble("mimicOffset");
   mSound = findSFString("sound");
   mMuscles = findMFNode("muscles");
   mDownloader = NULL;

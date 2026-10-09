@@ -1162,6 +1162,48 @@ int OmNewtonBackend::addShapeSphere(int bodyIdx, double radius,
   return 0;
 }
 
+int OmNewtonBackend::addJointMimic(int followerJoint, int leaderJoint, double multiplier, double offset) {
+  if (!mAvailable || mRuntime == nullptr || mRuntime->world == nullptr || !mRuntime->openForBuild)
+    return -1;
+  if (!PyObject_HasAttrString(mRuntime->world, "add_joint_mimic"))
+    return -1;  // an older staged bundle: the follower stays undriven and the caller warns
+  PyObject *r = PyObject_CallMethod(mRuntime->world, "add_joint_mimic", "(iidd)", followerJoint, leaderJoint,
+                                    multiplier, offset);
+  if (r == nullptr)
+    return reportPyError("add_joint_mimic");
+  const long rc = PyLong_Check(r) ? PyLong_AsLong(r) : -1;
+  Py_DECREF(r);
+  return static_cast<int>(rc);
+}
+
+int OmNewtonBackend::weldBodyToWorld(int bodyIdx) {
+  if (!mAvailable || mRuntime == nullptr || mRuntime->world == nullptr || !mRuntime->openForBuild)
+    return -1;
+  if (!PyObject_HasAttrString(mRuntime->world, "weld_body_to_world"))
+    return -1;  // an older staged bundle: the body stays free and the caller warns
+  PyObject *r = PyObject_CallMethod(mRuntime->world, "weld_body_to_world", "(i)", bodyIdx);
+  if (r == nullptr)
+    return reportPyError("weld_body_to_world");
+  const long rc = PyLong_Check(r) ? PyLong_AsLong(r) : -1;
+  Py_DECREF(r);
+  return static_cast<int>(rc);
+}
+
+int OmNewtonBackend::quietLastShape() {
+  if (!mAvailable || mRuntime == nullptr || mRuntime->world == nullptr || !mRuntime->openForBuild)
+    return -1;
+  // An older staged bundle has no quiet_last_shape: the placeholder then keeps
+  // colliding, exactly as before, instead of the call raising.
+  if (!PyObject_HasAttrString(mRuntime->world, "quiet_last_shape"))
+    return -1;
+  PyObject *r = PyObject_CallMethod(mRuntime->world, "quiet_last_shape", nullptr);
+  if (r == nullptr)
+    return reportPyError("quiet_last_shape");
+  const long rc = PyLong_Check(r) ? PyLong_AsLong(r) : -1;
+  Py_DECREF(r);
+  return static_cast<int>(rc);
+}
+
 int OmNewtonBackend::addShapeBox(int bodyIdx, double hx, double hy, double hz,
                                  double cx, double cy, double cz, double ke,
                                  double qx, double qy, double qz, double qw,
@@ -3692,6 +3734,9 @@ int OmNewtonBackend::addStaticBody(double, double, double, double, double, doubl
 int OmNewtonBackend::addKinematicBody(double, double, double, double, double, double, double) { return -1; }
 int OmNewtonBackend::setKinematicPose(int, double, double, double, double, double, double, double) { return -1; }
 int OmNewtonBackend::addShapeSphere(int, double, double, double, double, double, double, double) { return -1; }
+int OmNewtonBackend::quietLastShape() { return -1; }
+int OmNewtonBackend::addJointMimic(int, int, double, double) { return -1; }
+int OmNewtonBackend::weldBodyToWorld(int) { return -1; }
 int OmNewtonBackend::addShapeBox(int, double, double, double, double, double, double, double,
                                  double, double, double, double, double, double, double) { return -1; }
 int OmNewtonBackend::addShapeCylinder(int, double, double, double, double, double,
