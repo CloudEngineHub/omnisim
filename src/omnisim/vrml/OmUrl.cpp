@@ -274,12 +274,19 @@ QString OmUrl::remoteAssetRegex(bool capturing) {
 }
 
 const QString &OmUrl::remoteAssetPrefix() {
+  // Where an 'omnisim://' asset that is NOT in the local install comes from: this
+  // release's own tree on GitHub. An installed release ships no PROTO files (the
+  // packager skips every protos/ folder, as upstream Webots does) and fetches them
+  // from GitHub for its tag; the worlds it ships already name them that way
+  // (scripts/packaging/update_urls.py). From 2026-04-11 until 2026-10-09 this returned
+  // the local install path instead, so a world a user or agent wrote with
+  // 'omnisim://' PROTOs (the form every doc recommends) could not load on an install:
+  // the fallback pointed back at the missing local file ("Skipped PROTO ... not
+  // available at <install>/projects/..."). Measured on the v9.2.1 installer.
+  // A source checkout has every file, so this fallback never fires there.
   static QString url;
-  if (url.isEmpty()) {
-    // Use local WEBOTS_HOME path instead of remote GitHub URL.
-    // This ensures all assets resolve locally without network dependency.
-    url = OmStandardPaths::omniSimHomePath();
-  }
+  if (url.isEmpty())
+    url = "https://raw.githubusercontent.com/omnilink-tech/omnisim/v" + OmApplicationInfo::omniSimVersion() + "/";
   return url;
 }
 
@@ -305,10 +312,20 @@ QString OmUrl::combinePaths(const QString &rawUrl, const QString &rawParentUrl) 
 
   if (OmUrl::isLocalUrl(url)) {
     // URL fall-back mechanism: only trigger if the parent is a world file, and the file (omnisim://) does not exist
-    if (OmWorldFileFormat::isWorldFile(parentUrl) &&
-        !QFileInfo(QDir::cleanPath(url.replace("omnisim://", OmStandardPaths::omniSimHomePath()))).exists()) {
-      OmLog::error(QObject::tr("URL '%1' changed by fallback mechanism. Ensure you are opening the correct world.").arg(url));
-      return url.replace("omnisim://", OmUrl::remoteAssetPrefix());
+    if (OmWorldFileFormat::isWorldFile(parentUrl)) {
+      // QString::replace works in place: the old single-expression check rewrote `url`
+      // to the local path before the fallback ran, so the fallback could never see the
+      // 'omnisim://' prefix it meant to swap. Keep the original for the remote URL.
+      const QString original = url;
+      url.replace("omnisim://", OmStandardPaths::omniSimHomePath());
+      if (!QFileInfo(QDir::cleanPath(url)).exists()) {
+        // On an installed release this is the normal path (it ships no PROTO files),
+        // so say where the file comes from rather than raising an error.
+        const QString remote = QString(original).replace("omnisim://", OmUrl::remoteAssetPrefix());
+        OmLog::info(QObject::tr("URL '%1' is not in this installation; fetching it from this release on GitHub: %2")
+                      .arg(original, remote));
+        return remote;
+      }
     }
 
     // infer URL based on parent's url

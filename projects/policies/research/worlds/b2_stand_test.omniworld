@@ -10,6 +10,9 @@ EXTERNPROTO "omnisim://projects/objects/lights/protos/OmniSimSun.proto"
 EXTERNPROTO "omnisim://projects/objects/lights/protos/OmniSimSunMarker.proto"
 
 WorldInfo {
+  # Policies here were trained on first-shape-only calf contact (foot sphere);
+  # keep that until a retrain (newtonCompoundShapes, 2026-10-09).
+  newtonCompoundShapes FALSE
   newtonSolver "mujoco"
   basicTimeStep 16
   title "B2 stand test"

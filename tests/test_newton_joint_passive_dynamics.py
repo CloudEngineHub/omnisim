@@ -152,7 +152,8 @@ class JointPassiveDynamicsTest(unittest.TestCase):
         os.environ["OMNISIM_NEWTON_JOINT_DYNAMICS"] = "0"
         w = self._world()
         slot = w.add_joint_revolute(*WHEEL)
-        w.set_joint_passive_dynamics(slot, 1.0, 1.0)
+        # 1 = queued but not applied: the engine logs "NOT applied" on it, never "applied".
+        self.assertEqual(w.set_joint_passive_dynamics(slot, 1.0, 1.0), 1)
         _kind, kw = self._build_last(w)
         self.assertNotIn("damping", kw, "OMNISIM_NEWTON_JOINT_DYNAMICS=0 must drop it")
         self.assertNotIn("friction", kw, "OMNISIM_NEWTON_JOINT_DYNAMICS=0 must drop it")
@@ -161,7 +162,7 @@ class JointPassiveDynamicsTest(unittest.TestCase):
         os.environ.pop("OMNISIM_NEWTON_JOINT_DYNAMICS", None)
         w = self._world()
         slot = w.add_joint_revolute(*WHEEL)
-        w.set_joint_passive_dynamics(slot, 1.0, 1.0)
+        self.assertEqual(w.set_joint_passive_dynamics(slot, 1.0, 1.0), 1)
         _kind, kw = self._build_last(w)
         self.assertNotIn("damping", kw, "joint dynamics must be OFF by default (2026-10-03)")
         self.assertNotIn("friction", kw, "joint dynamics must be OFF by default (2026-10-03)")

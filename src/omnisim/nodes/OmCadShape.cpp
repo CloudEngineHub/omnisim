@@ -17,6 +17,7 @@
 #include "OmCadShape.hpp"
 
 #include "OmApplicationInfo.hpp"
+#include "OmAssimpIoSystem.hpp"
 #include "OmBackground.hpp"
 #include "OmBoundingSphere.hpp"
 #include "OmDownloadManager.hpp"
@@ -409,8 +410,10 @@ void OmCadShape::createWrenObjects() {
     }
 
     scene = importer.ReadFileFromMemory(data.constData(), data.size(), flags, extension.toUtf8().constData());
-  } else
+  } else {
+    importer.SetIOHandler(new OmAssimpIoSystem);  // long Windows paths; the importer owns it
     scene = importer.ReadFile(completeUrl.toStdString().c_str(), flags);
+  }
 
   if (!scene) {
     warn(tr("Invalid data, please verify mesh file: %1").arg(importer.GetErrorString()));

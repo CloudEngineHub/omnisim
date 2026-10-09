@@ -15,6 +15,7 @@
 #include "OmCloth.hpp"
 
 #include "OmAppearance.hpp"
+#include "OmAssimpIoSystem.hpp"
 #include "OmLog.hpp"
 #include "OmMFString.hpp"
 #include "OmMatrix3.hpp"
@@ -246,6 +247,7 @@ bool OmCloth::loadMeshFromUrl() {
                                 aiComponent_COLORS | aiComponent_BONEWEIGHTS |
                                 aiComponent_ANIMATIONS | aiComponent_TEXTURES | aiComponent_LIGHTS |
                                 aiComponent_CAMERAS);
+  importer.SetIOHandler(new OmAssimpIoSystem);  // long Windows paths; the importer owns it
   const aiScene *const scene =
     importer.ReadFile(path.toUtf8().constData(), aiProcess_ValidateDataStructure | aiProcess_Triangulate |
                                                    aiProcess_JoinIdenticalVertices |

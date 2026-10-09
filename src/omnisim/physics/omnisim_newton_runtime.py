@@ -373,6 +373,9 @@ class World:
         # stable "slot id" so they can address the joint for target_vel
         # writes; finalize() maps slot -> real builder joint index.
         self.pending_revolutes = []    # list of dicts (one per add_joint_revolute call)
+        # Capsule stand-ins for Cylinder colliders, (shape, body, radius, half_height):
+        # finalize() turns the ones not on a joint's child body into real cylinders.
+        self._cylinder_stand_ins = []
         self.slot_to_real_idx = {}     # slot_id -> builder joint index, set in finalize()
         self.joint_indices = []        # builder joint indices (in articulation order)
 
@@ -1501,6 +1504,33 @@ class World:
             return self._note_shape(body_idx, self._builder_add(_b, self.builder.add_shape_sphere,
                                 xform=_xf,
                 radius=float(radius), cfg=self._shape_cfg()), _loc)
+        # OMNISIM_NEWTON_CYLINDER_NATIVE (2026-10-09). A capsule stand-in is right
+        # for a WHEEL and wrong for almost everything else: when radius >= half
+        # the height (a disc, puck, table top, chassis plate) the stand-in keeps a
+        # hemisphere of radius r at each end, so the body rests r above where it
+        # was authored (an r=0.08 h=0.01 disc rested at z=0.0846, not 0.005), and
+        # even a tall stand-in has rounded ends, so an upright post balances on a
+        # point. A real cylinder (GeoType.CYLINDER -> mjGEOM_CYLINDER) rests at the
+        # authored height in every case. But on wheels it is NOT neutral: an
+        # open-loop Husky pivot (4 s, 2 rad/s, 16 ms step) turned 132 deg on
+        # capsules and 82 deg on real cylinders, drifting 0.62 m off the spot
+        # instead of 0.06 m, and the turning figures the stall-torque work
+        # measured (Husky pivot 0.532) are capsule figures. So:
+        #   unset / "auto"  real cylinder on every body that is NOT a joint's
+        #                   child (props, statics, robot roots); capsule on the
+        #                   rest (wheels, arm links) -- decided in finalize(),
+        #                   where the joint graph is known;
+        #   "0"             capsule everywhere (the behaviour before 2026-10-09);
+        #   "1" / "all"     real cylinder everywhere, wheels included.
+        _cyl_mode = _os.environ.get("OMNISIM_NEWTON_CYLINDER_NATIVE", "").strip().lower()
+        if _cyl_mode in ("1", "true", "on", "yes", "all"):
+            _b, _xf, _loc = self._shape_target(body_idx, cx, cy, cz, qx, qy, qz, qw)
+            return self._note_shape(body_idx, self._builder_add(_b, self.builder.add_shape_cylinder,
+                            xform=_xf,
+                radius=float(radius),
+                half_height=float(half_height),
+                cfg=self._shape_cfg(),
+            ), _loc)
         # ⚠ THIS USED TO APPLY A FIXED -90 DEG ABOUT X AND IT WAS WRONG.
         #
         # The stated premise -- "a Webots Cylinder bounding object extends along
@@ -1578,12 +1608,17 @@ class World:
         if _h_sub > _r_sub:
             _h_sub -= _r_sub
         _b, _xf, _loc = self._shape_target(body_idx, cx, cy, cz, qx, qy, qz, qw)
-        return self._note_shape(body_idx, self._builder_add(_b, self.builder.add_shape_capsule,
+        _sid = self._note_shape(body_idx, self._builder_add(_b, self.builder.add_shape_capsule,
                         xform=_xf,
             radius=_r_sub,
             half_height=_h_sub,
             cfg=self._shape_cfg(),
         ), _loc)
+        if _cyl_mode not in ("0", "false", "off", "no") and _sid is not None and int(_sid) >= 0:
+            # setdefault, not the __init__ list alone: unit tests build a World without __init__.
+            self.__dict__.setdefault("_cylinder_stand_ins", []).append(
+                (int(_sid), int(body_idx), float(radius), float(half_height)))
+        return _sid
 
     def add_shape_capsule(self, body_idx, radius, half_height, cx=0.0, cy=0.0, cz=0.0,
                           qx=0.0, qy=0.0, qz=0.0, qw=1.0):
@@ -3625,7 +3660,9 @@ class World:
         it costs that joint its dynamics (logged), never its registration.
 
         The queued values reach the builder only with OMNISIM_NEWTON_JOINT_DYNAMICS=1
-        (value-parsed, default OFF -- see _joint_passive_dynamics_enabled). Returns 0, or -1
+        (value-parsed, default OFF -- see _joint_passive_dynamics_enabled). Returns 0 when
+        they will be applied, 1 when they are queued but that switch is off (the engine
+        logs which, 2026-10-09: it used to log every declared value as if applied), or -1
         for a slot that is not a queued 1-DoF joint."""
         try:
             j = self.pending_revolutes[int(slot)]
@@ -3635,7 +3672,7 @@ class World:
             return -1
         j["damping"] = max(0.0, float(damping))
         j["friction"] = max(0.0, float(friction))
-        return 0
+        return 0 if self._joint_passive_dynamics_enabled() else 1
 
     @staticmethod
     def _joint_passive_dynamics_enabled():
@@ -6454,6 +6491,26 @@ class World:
                 children_of.setdefault(j["parent"], []).append((slot, j["child"]))
             if j["child"] >= 0:
                 all_children.add(j["child"])
+
+        # ---- Cylinder colliders off the joint graph become real cylinders
+        # (OMNISIM_NEWTON_CYLINDER_NATIVE, add_shape_cylinder). A capsule and a
+        # cylinder share newton's scale layout (radius, half_height) and bounding
+        # radius (r + hh), and _shape_cfg() has density 0 so no shape added mass:
+        # type, the full half-height and the bound are all that change.
+        _cyl_real = 0
+        _stand_ins = getattr(self, "_cylinder_stand_ins", [])
+        for _sid, _cb, _cr, _chh in _stand_ins:
+            if _cb in all_children:
+                continue
+            self.builder.shape_type[_sid] = newton.GeoType.CYLINDER
+            self.builder.shape_scale[_sid] = (_cr, _chh, 0.0)
+            self.builder.shape_collision_radius[_sid] = abs(_cr) + abs(_chh)
+            _cyl_real += 1
+        if _stand_ins:
+            self._newton_log("[OmNewtonBackend] cylinder colliders: %d real cylinder(s) off the joint graph, "
+                             "%d capsule stand-in(s) on jointed links "
+                             "(OMNISIM_NEWTON_CYLINDER_NATIVE=0: all capsules; =1: all real cylinders)"
+                             % (_cyl_real, len(_stand_ins) - _cyl_real))
 
         # ---- FREE joints for the roots (added FIRST so add_articulation
         # sees them at the lowest joint indices). --------------------

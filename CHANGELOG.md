@@ -25,6 +25,60 @@ top of that foundation.
 ---
 
 
+## [v9.2.2] — 2026-10-09
+
+Fixes found running robot makers' published models and a third-party benchmark on the installed
+v9.2.1, plus the first outside fix to the ROS 2 bridge. Each fix has a pin test that fails on the
+old engine; the two behaviour changes carry a value-parsed hatch that restores the old behaviour.
+The engine and the physics runtime both change, so use the v9.2.2 installer (`doctor` must read
+`bundle == source`).
+
+### ⚠️ Behaviour changes — read before upgrading
+
+- **Every collider of a multi-shape `boundingObject` registers by default.** A `Group` of offset
+  primitives, or a URDF link with several `<collision>` elements, collided as its first shape only
+  unless `WorldInfo.newtonCompoundColliders` was `TRUE`, and that field also selects the inertia
+  source, so its default could not change. Leo Rover's wheels rolled on the 0.057 m hub listed
+  before the 0.0625 m tyre; a `Chair` collided as a seat with no legs. Collider registration is now
+  separate from inertia: a body with more than one shape registers all of them, a single-shape body
+  is unchanged, and `newtonCompoundColliders` keeps only its inertia tie-break. A new
+  `WorldInfo.newtonCompoundShapes` field (default `TRUE`) pins one world to the old behaviour. The
+  20 shipped B2 and Go2 policy worlds set it to `FALSE`: their policies were trained with only the
+  foot sphere of each calf colliding, and with the shins colliding too the B2 walk deploy covered
+  0.48 m instead of 2.37 m in 8 s. Measured old against new: the pinned B2/Go2 worlds and the X30,
+  Lite3, G1 and 8-Husky worlds are bit-identical; a bin-picking part and the warehouse forklift end
+  148 mm and 59 mm away. Hatch: `OMNISIM_NEWTON_COMPOUND_SHAPES=0`.
+- **A `Cylinder` collider off the joint graph is a real cylinder.** Every `Cylinder` was a capsule
+  stand-in, so a disc, puck, table top or chassis plate (radius at least half the height) rested one
+  radius above where it was authored: a r=0.08 h=0.01 disc at z=0.0846 instead of 0.005. Props,
+  static geometry and robot roots now collide as true cylinders and rest at the authored height to
+  under 0.2 mm. Wheels and arm links keep the capsule, because there it is not neutral: an open-loop
+  Husky pivot turned 132° on capsules and 82° on true cylinders. The Husky pivot and the 8-Husky
+  drive are bit-identical; a sweep of the 61 hand-authored wheeled worlds keeps the same 22 rolling.
+  Hatches: `OMNISIM_NEWTON_CYLINDER_NATIVE=0` (capsules everywhere) or `=1` (true cylinders
+  everywhere, wheels included).
+
+### Fixed
+
+- **An `omnisim://` asset missing from an installed release is fetched from that release on
+  GitHub.** The installer ships no PROTO files, and a world written with `omnisim://` PROTOs, the
+  form the docs recommend, failed to load on an install: the fallback pointed back at the missing
+  local file (since 2026-04-11). Found running a ghostloop backend on the v9.2.1 installer.
+- **A Collada file that instances geometry loads instead of crashing.** The mesh loader sized its
+  arrays per mesh but wrote each mesh once per node that used it, so a file reusing a mesh overran
+  them and the engine died with no log line. Leo Rover's `Chassis.dae` (27 geometries in 35
+  instances) crashed every load of the robot; it now loads.
+- **A mesh path longer than 260 characters loads on Windows.** Mesh, CAD-shape and cloth files
+  open through the Windows long-path form; a URDF package unpacked a few folders down used to lose
+  that geometry silently.
+- **ROS 2 Tier-2 `/cmd_vel` streaming no longer blocks.** The client called the mobile bridge's
+  `/set_velocity` without `wait`, whose default waits for an achieved-rate measurement, so each
+  command blocked the single-threaded executor and tripped the watchdog: a Husky Nav2 goal took
+  197 s of wall time with 6 recoveries, now 10 s and none. Thanks to @LingZhen07 (#22, #23).
+- **The joint-damping log line says whether damping is applied.** URDF `<dynamics damping
+  friction>` apply only with `OMNISIM_NEWTON_JOINT_DYNAMICS=1` (default off), but the log reported
+  every declared value as applied. It now says "applied" or "NOT applied".
+
 ## [v9.2.1] — 2026-10-09
 
 More of the same work as v9.2.0: robot makers' own published models, run as they ship, kept

@@ -42,6 +42,7 @@ WorldInfo {
   SFBool   newtonStatics                  FALSE      # {TRUE, FALSE} -- SCHEMA default only; the ENGINE default is ON (see below)
   SFBool   newtonRobotColliders           FALSE      # {TRUE, FALSE}
   SFBool   newtonCompoundColliders        FALSE      # {TRUE, FALSE}
+  SFBool   newtonCompoundShapes           TRUE       # {TRUE, FALSE}
   SFString defaultPhysicsBackend          ""         # {"", "ode", "newton"}
   SFString defaultRenderBackend           ""         # {"", "wren", "wgpu"}
 }
@@ -229,7 +230,9 @@ solver's own and is not configurable from the world file.
 
 - The `newtonRobotColliders` field, when `TRUE`, gives robot-wrapper bodies (e.g. a `URDFRobot` chassis [Solid](solid.md)) their own `boundingObject` as a Newton collider, so the robot body — not just its wheels or feet — collides with scene geometry. `FALSE` (default) uses wheel/foot-only collision, avoiding a chassis envelope that would pin the body and starve the wheels of load. The `OMNISIM_NEWTON_WRAPPER_USES_OWN_SHAPE` env var still forces it on. Applies to every world (Newton is the only backend).
 
-- The `newtonCompoundColliders` field, when `TRUE`, registers every collider in a compound `boundingObject` (a `Group` of offset primitives on one rigid body — e.g. a movable bin's floor plus four walls) as its own Newton shape, instead of only the first child. `FALSE` (default) is first-child-only, keeping existing worlds' physics byte-for-byte unchanged. The `OMNISIM_NEWTON_COMPOUND_COLLIDERS` env var still forces it on. Applies to every world (Newton is the only backend).
+- The `newtonCompoundColliders` field no longer decides whether a compound `boundingObject` collides in full. Since 2026-10-09 a `Group` of several offset primitives on one rigid body (e.g. a movable bin's floor plus four walls) registers every one of them by default, and `OMNISIM_NEWTON_COMPOUND_SHAPES=0` restores the old first-child-only registration. When `TRUE`, `newtonCompoundColliders` sends single-shape bodies through the compound walker too, and on a dynamic multi-shape body with no `inertiaMatrix` (robots excluded) it separates equal principal inertias slightly. The `OMNISIM_NEWTON_COMPOUND_COLLIDERS` env var still forces it on.
+
+- The `newtonCompoundShapes` field (default `TRUE`) registers every collider of a multi-shape `boundingObject`, including a URDF link with several `<collision>` elements. `FALSE` keeps only the first, the behaviour before 2026-10-09, for a world whose controller or policy was tuned on it. The shipped B2 and Go2 policy worlds set it, because their policies were trained with only the foot sphere of each calf colliding; with the shins colliding too, the B2 walk deploy covered 0.48 m instead of 2.37 m in 8 s.
 
 - The `defaultPhysicsBackend` field sets a world-level default physics backend. When set, it supplies the backend for any [Solid](solid.md) still on the `"auto"` default with no explicit ancestor choice, letting you pin a whole world without editing every Solid. `""` (default) is inert; an explicit per-Solid `physicsBackend` still wins.
 

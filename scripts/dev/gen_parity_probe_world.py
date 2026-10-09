@@ -51,6 +51,9 @@ EXTERNPROTO "omnisim://projects/objects/lights/protos/OmniSimSunMarker.proto"
 WorldInfo {{
   newtonSolver "mujoco"
   basicTimeStep 16
+  # Policies here were trained on first-shape-only calf contact (foot sphere);
+  # keep that until a retrain (newtonCompoundShapes, 2026-10-09).
+  newtonCompoundShapes FALSE
   title "{robot} deterministic parity probe ({lane} base)"
   contactProperties [
     ContactProperties {{

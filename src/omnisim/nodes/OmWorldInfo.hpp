@@ -176,6 +176,8 @@ public:
   // forces it on). Read by OmSolid's Newton shape attach (per-world, not static,
   // so a world switched in via the launcher reload reads ITS OWN field).
   bool newtonCompoundColliders() const { return mNewtonCompoundColliders->value(); }
+  // Absent in an older world file's parse (field added 2026-10-09) -> the TRUE default.
+  bool newtonCompoundShapes() const { return mNewtonCompoundShapes == nullptr || mNewtonCompoundShapes->value(); }
   // World-level default backends (default-flip-plan.md §3.2). When non-empty ("ode"/"newton" and
   // "wren"/"wgpu" respectively) they supply the choice for any node still on the "auto"/unspecified
   // sentinel — i.e. pin a whole world to one backend without editing every Solid/Viewpoint. An
@@ -262,6 +264,7 @@ private:
   OmSFBool *mNewtonStatics;
   OmSFBool *mNewtonRobotColliders;
   OmSFBool *mNewtonCompoundColliders;
+  OmSFBool *mNewtonCompoundShapes;
   OmSFString *mDefaultPhysicsBackend;
   OmSFString *mDefaultRenderBackend;
   OmSFDouble *mBasicTimeStep;

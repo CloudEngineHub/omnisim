@@ -3086,6 +3086,53 @@ static bool newtonCompoundCollidersOn() {
   return wi != nullptr && wi->newtonCompoundColliders();
 }
 
+// Whether EVERY primitive of a compound boundingObject registers as a collider
+// (2026-10-09). Until then this rode on newtonCompoundCollidersOn() above, which
+// ALSO selects the inertia source, so the default had to stay off and a Group of
+// colliders collided as its first child only: Leo Rover's wheels rolled on the
+// 0.057 m hub instead of the 0.0625 m tyre listed second, TIAGo lost its extra
+// link shapes, a Chair.proto was a floating seat with no legs. The two choices
+// are now separate: colliders register in full by default, and the inertia
+// source still follows newtonCompoundColliders alone, unchanged. Value-parsed
+// OMNISIM_NEWTON_COMPOUND_SHAPES=0 restores first-child-only registration
+// (unless newtonCompoundColliders asks for the compound path anyway).
+//
+// Scoped to boundingObjects that really hold MORE THAN ONE collider: the
+// recursive walker and the single-shape walker do not treat every single shape
+// identically (planes, the URDF inertia placeholder, unwrapping), so a body with
+// one collider keeps the single-shape walker and is byte-identical. With
+// newtonCompoundColliders set, every body takes the compound path, as before.
+static int newtonColliderLeafCount(const OmBaseNode *bo) {
+  if (bo == nullptr)
+    return 0;
+  if (const OmShape *sh = dynamic_cast<const OmShape *>(bo))
+    return newtonColliderLeafCount(sh->geometry());
+  if (const OmGroup *g = dynamic_cast<const OmGroup *>(bo)) {  // OmPose and OmTransform are Groups
+    int n = 0;
+    const OmMFNode &kids = g->children();
+    for (int i = 0; i < kids.size() && n < 2; ++i)
+      n += newtonColliderLeafCount(dynamic_cast<const OmBaseNode *>(kids.item(i)));
+    return n;
+  }
+  return 1;
+}
+
+// Per world: WorldInfo.newtonCompoundShapes FALSE keeps first-child-only for a
+// world whose controller or policy was tuned on it (the shipped B2/Go2 policy
+// worlds: trained on foot-only calf contact; with the shins colliding the B2
+// deploy walked 0.48 m instead of 2.37 m in 8 s).
+static bool newtonCompoundShapesOn(const OmBaseNode *bo) {
+  if (newtonCompoundCollidersOn())
+    return true;
+  const OmWorldInfo *const wi = OmWorld::instance() ? OmWorld::instance()->worldInfo() : nullptr;
+  if (wi != nullptr && !wi->newtonCompoundShapes())
+    return false;
+  // OMNISIM_NEWTON_COMPOUND_SHAPES (value-parsed, default ON since 2026-10-09): every
+  // collider of a multi-shape boundingObject registers; =0 keeps only the first child
+  // in every world, as WorldInfo.newtonCompoundShapes FALSE does for one world.
+  return newtonEnvFlag("OMNISIM_NEWTON_COMPOUND_SHAPES", true) && newtonColliderLeafCount(bo) > 1;
+}
+
 // Compound walker: recurse the WHOLE boundingObject sub-tree and register
 // EVERY primitive as its own Newton shape (accumulating Pose/Transform
 // translation offsets), so a multi-collider rigid body -- a free dynamic bin
@@ -3161,7 +3208,7 @@ static QString attachNewtonShapeFromBoundingObject(OmNewtonBackend *newton, int 
   // no env var. Per-call (NOT static) so a world switched in via the launcher's
   // worldReload reads ITS OWN field; the defaults keep every existing world's
   // physics byte-for-byte unchanged.
-  const bool compound = initialX == nullptr && newtonCompoundCollidersOn();
+  const bool compound = initialX == nullptr && newtonCompoundShapesOn(boundingObjectValue);
   if (compound) {
     const QString d = registerNewtonShapesRec(newton, idx, boundingObjectValue,
                                               OmNewtonShapeXform(), softKe, solidMu,
@@ -3204,14 +3251,12 @@ static QString attachNewtonShapeFromBoundingObject(OmNewtonBackend *newton, int 
       // so -- the world loaded clean, the body had a collider, and only the
       // geometry was wrong.
       //
-      // WARN, do NOT flip the default. WorldInfo.newtonCompoundColliders also
-      // selects the INERTIA source further down, so flipping it silently
-      // changes the inertia tensor of every dynamic multi-collider body in the
-      // tree. Decoupling those two is separate, larger work; until it is done a
-      // named warning is the honest half.
-      // `!compound` matters: with the opt-in ON this walker is only reached
-      // when the recursive registration matched nothing at all, and telling
-      // that author to "set newtonCompoundColliders TRUE" would be nonsense.
+      // Since 2026-10-09 the default registers every collider of a multi-shape
+      // boundingObject (newtonCompoundShapesOn), decoupled from the inertia
+      // source that newtonCompoundColliders still selects, so this drop is
+      // reached only with OMNISIM_NEWTON_COMPOUND_SHAPES=0 -- or when the
+      // recursive registration matched nothing at all, where `!compound` keeps
+      // the warning quiet.
       if (kids.size() > 1 && !compound) {
         static QSet<int> warnedGroupIds;
         const int gid = g->uniqueId();
@@ -3221,9 +3266,8 @@ static QString attachNewtonShapeFromBoundingObject(OmNewtonBackend *newton, int 
           OmLog::warning(
             QObject::tr("The boundingObject of '%1' is a Group of %2 collision shapes, but only the FIRST is "
                         "registered with the physics engine -- the other %3 are silently DROPPED, so this body "
-                        "collides as a fraction of its own shape. Set WorldInfo.newtonCompoundColliders TRUE to "
-                        "register all of them. (That field also switches this body's inertia source, so expect the "
-                        "dynamics to change as well as the collision.)")
+                        "collides as a fraction of its own shape. OMNISIM_NEWTON_COMPOUND_SHAPES=0 is set; unset "
+                        "it to register all of them.")
               .arg(owner != nullptr ? owner->usefulName() : g->usefulName())
               .arg(kids.size())
               .arg(kids.size() - 1),
@@ -3998,7 +4042,7 @@ void OmSolid::flushPendingNewtonRegistrations() {
                   rel.t = bqInv * (sol->matrix().translation() - bt);
                   rel.q = bqInv * OmRotation(sol->rotationMatrix()).toQuaternion();
                   rel.q.normalize();
-                  if (newtonCompoundCollidersOn())
+                  if (newtonCompoundShapesOn(bo))
                     d = registerNewtonShapesRec(newton, bidx, bo, rel, ke, mu, muT, muR);
                   if (d.isEmpty())
                     d = attachNewtonShapeFromBoundingObject(newton, bidx, bo, ke, mu, muT, muR, &rel);
@@ -4546,7 +4590,7 @@ void OmSolid::flushPendingNewtonRegistrations() {
             rel.q = lqInv * OmRotation(sol->rotationMatrix()).toQuaternion();
             rel.q.normalize();
             QString d;
-            if (newtonCompoundCollidersOn())
+            if (newtonCompoundShapesOn(bo))
               d = registerNewtonShapesRec(newton, idx, bo, rel, ke, mu, muT, muR);
             if (d.isEmpty())
               d = attachNewtonShapeFromBoundingObject(newton, idx, bo, ke, mu, muT, muR, &rel);
@@ -4602,7 +4646,7 @@ void OmSolid::flushPendingNewtonRegistrations() {
       if (!shapeDesc.isEmpty() && (shapeDesc.contains("fallback") || shapeDesc.contains("placeholder") ||
                                    shapeDesc.contains("was cylinder"))) {
         OmLog::warning(QObject::tr("Solid '%1': the physics collider is NOT the authored geometry -- using %2. The "
-                                   "body will contact the world at a different size or place than the scene shows. To collide as authored, declare a 'boundingObject' on this Solid (Box, Sphere, Capsule, Cylinder, Plane or a mesh; a Group of several needs WorldInfo.newtonCompoundColliders TRUE) -- a Robot with none gets the 1 mm placeholder by design. See docs/guide/newton-physics-backend.md.")
+                                   "body will contact the world at a different size or place than the scene shows. To collide as authored, declare a 'boundingObject' on this Solid (Box, Sphere, Capsule, Cylinder, Plane or a mesh, or a Group of several) -- a Robot with none gets the 1 mm placeholder by design. See docs/guide/newton-physics-backend.md.")
                          .arg(s->name())
                          .arg(shapeDesc),
                        false, OmLog::ODE);

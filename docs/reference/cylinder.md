@@ -23,6 +23,18 @@ Each part has an associated `SFBool` field that indicates whether the part exist
 Parts which do not exist are not rendered.
 However, all parts are used for collision detection, regardless of their associated `SFBool` field.
 
+#### How a Cylinder collides
+
+Used as a `boundingObject`, a Cylinder collides as a true cylinder on any body that is not a joint's child: props, static geometry, and a robot's root body.
+On a link that hangs off a joint, such as a wheel or an arm link, it collides as a capsule with the same radius whose overall length is kept to the authored height where it can be.
+That substitute keeps wheeled robots turning as they were tuned to.
+When `radius` is at least half the `height`, as on a wheel, the capsule has a rounded cap of that radius at each end of the axis.
+
+For every world with Cylinder colliders, the physics runtime log (`OMNISIM_NEWTON_LOG`, by default `.build_tmp/newton_solver.log`) reports how many of each it used.
+`OMNISIM_NEWTON_CYLINDER_NATIVE=0` makes every Cylinder a capsule, the only behaviour before 2026-10-09.
+`=1` makes every Cylinder a true cylinder, wheels included.
+In an open-loop Husky pivot, true-cylinder wheels turned about a third less than capsule wheels and drifted off the spot.
+
 The `subdivision` field defines the number of polygons used to represent the cylinder and so its resolution.
 More precisely, it corresponds to the number of lines used to represent the bottom or the top of the cylinder.
 

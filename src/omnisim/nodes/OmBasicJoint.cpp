@@ -1002,15 +1002,22 @@ void OmBasicJoint::flushPendingNewtonRegistrations() {
     // dof_frictionloss 0. They now ride a separate runtime verb (so a binary and
     // a runtime of different vintages cannot shift a positional argument),
     // called only for a joint that declares a non-zero value -- every other
-    // joint is registered exactly as before. The runtime applies them unless
-    // OMNISIM_NEWTON_JOINT_DYNAMICS=0 (value-parsed, read there).
+    // joint is registered exactly as before. The runtime applies them only with
+    // OMNISIM_NEWTON_JOINT_DYNAMICS=1 (value-parsed, default OFF, read there) and
+    // says which: 0 applied, 1 queued but off. Until 2026-10-09 this logged every
+    // declared value as "passive damping ..." although the default applies none.
     if (idx >= 0) {
       if (const OmJointParameters *const jp = hinge ? hinge->parameters() : slider->parameters()) {
         const double damping = jp->dampingConstant();
         const double friction = jp->staticFriction();
         if (damping > 0.0 || friction > 0.0) {
-          if (newton->setJointPassiveDynamics(idx, damping, friction) == 0)
-            OmLog::info(QString("[OmNewtonBackend] joint %1 '%2': passive damping %3, Coulomb friction %4")
+          const int rc = newton->setJointPassiveDynamics(idx, damping, friction);
+          if (rc == 0)
+            OmLog::info(QString("[OmNewtonBackend] joint %1 '%2': passive damping %3, Coulomb friction %4 applied")
+                            .arg(idx).arg(p->endPointName()).arg(damping).arg(friction));
+          else if (rc == 1)
+            OmLog::info(QString("[OmNewtonBackend] joint %1 '%2': declares damping %3, Coulomb friction %4 -- NOT "
+                                "applied (OMNISIM_NEWTON_JOINT_DYNAMICS=1 applies them)")
                             .arg(idx).arg(p->endPointName()).arg(damping).arg(friction));
         }
       }

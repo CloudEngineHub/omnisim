@@ -17,6 +17,7 @@
 #include "OmMesh.hpp"
 
 #include "OmApplication.hpp"
+#include "OmAssimpIoSystem.hpp"
 #include "OmBoundingSphere.hpp"
 #include "OmDownloadManager.hpp"
 #include "OmDownloader.hpp"
@@ -189,8 +190,10 @@ void OmMesh::updateTriangleMesh(bool issueWarnings) {
     const QByteArray data = file.readAll();
     const QByteArray hint = filePath.mid(filePath.lastIndexOf('.') + 1).toUtf8();
     scene = importer.ReadFileFromMemory(data.constData(), data.size(), flags, hint.constData());
-  } else
+  } else {
+    importer.SetIOHandler(new OmAssimpIoSystem);  // long Windows paths; the importer owns it
     scene = importer.ReadFile(filePath.toUtf8().constData(), flags);
+  }
 
   if (!scene) {
     warn(tr("Invalid data, please verify mesh file (bone weights, normals, ...): %1").arg(importer.GetErrorString()));
@@ -215,9 +218,6 @@ void OmMesh::updateTriangleMesh(bool issueWarnings) {
     scene->mRootNode->mTransformation =
       aiMatrix4x4(1, 0, 0, 0, 0, 0, -1, 0, 0, 1, 0, 0, 0, 0, 0, 1) * scene->mRootNode->mTransformation;
 
-  // count total number of vertices and faces
-  int totalVertices = 0;
-  int totalFaces = 0;
   for (unsigned int i = 0; i < scene->mNumMeshes; ++i) {
     const aiMesh *mesh = scene->mMeshes[i];
     if (mIsCollada && !mName->value().isEmpty() && mName->value() != mesh->mName.data)
@@ -229,9 +229,34 @@ void OmMesh::updateTriangleMesh(bool issueWarnings) {
     if (mesh->mNumVertices > 100000)
       warn(tr("Mesh '%1' has more than 100'000 vertices, it is recommended to reduce the number of vertices.")
              .arg(mesh->mName.C_Str()));
+  }
 
-    totalVertices += mesh->mNumVertices;
-    totalFaces += mesh->mNumFaces;
+  // Count vertices and faces over the NODE GRAPH, walked exactly as the fill loop
+  // below walks it: a mesh several nodes instance is written once per instance.
+  // Until 2026-10-09 this counted scene->mMeshes, each mesh once, so a file that
+  // instances geometry overran the arrays below and the engine died with an
+  // access violation and no log line -- Leo Rover's Chassis.dae (Blender export,
+  // 27 geometries, 35 instances) crashed every load of the robot.
+  int totalVertices = 0;
+  int totalFaces = 0;
+  {
+    std::list<const aiNode *> countQueue;
+    countQueue.push_back(scene->mRootNode);
+    while (!countQueue.empty()) {
+      const aiNode *countNode = countQueue.front();
+      countQueue.pop_front();
+      for (unsigned int i = 0; i < countNode->mNumMeshes; ++i) {
+        const aiMesh *mesh = scene->mMeshes[countNode->mMeshes[i]];
+        if (mIsCollada && !mName->value().isEmpty() && mName->value() != mesh->mName.data)
+          continue;
+        if (mIsCollada && mMaterialIndex->value() >= 0 && mMaterialIndex->value() != (int)mesh->mMaterialIndex)
+          continue;
+        totalVertices += mesh->mNumVertices;
+        totalFaces += mesh->mNumFaces;
+      }
+      for (unsigned int i = 0; i < countNode->mNumChildren; ++i)
+        countQueue.push_back(countNode->mChildren[i]);
+    }
   }
 
   // Mesh.scale: vertices scale per axis; normals by the inverse (the
@@ -361,7 +386,10 @@ void OmMesh::updateTriangleMesh(bool issueWarnings) {
     return;
   }
 
-  mTriangleMeshError = mTriangleMesh->init(coordData, normalData, texCoordData, indexData, totalVertices, currentIndexIndex);
+  // The vertices actually written, not the allocation: a skipped submesh (no
+  // normals, no faces) leaves the tail of the arrays unset.
+  mTriangleMeshError =
+    mTriangleMesh->init(coordData, normalData, texCoordData, indexData, currentCoordIndex / 3, currentIndexIndex);
 
   if (issueWarnings) {
     foreach (const QString &warning, mTriangleMesh->warnings())

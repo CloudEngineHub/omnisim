@@ -739,6 +739,7 @@ QT_SOURCES = OmAboutBox.cpp \
   OmAddNodeDialog.cpp \
   OmAgentHud.cpp \
   OmAltimeter.cpp \
+  OmAssimpIoSystem.cpp \
   OmAnimationRecorder.cpp \
   OmAppearance.cpp \
   OmApplication.cpp \

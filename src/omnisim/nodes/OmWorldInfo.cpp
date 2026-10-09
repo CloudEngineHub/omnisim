@@ -62,6 +62,7 @@ void OmWorldInfo::init(const OmVersion *version) {
   mNewtonStatics = findSFBool("newtonStatics");
   mNewtonRobotColliders = findSFBool("newtonRobotColliders");
   mNewtonCompoundColliders = findSFBool("newtonCompoundColliders");
+  mNewtonCompoundShapes = findSFBool("newtonCompoundShapes");
   mDefaultPhysicsBackend = findSFString("defaultPhysicsBackend");
   mDefaultRenderBackend = findSFString("defaultRenderBackend");
   mBasicTimeStep = findSFDouble("basicTimeStep");
