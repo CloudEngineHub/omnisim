@@ -14,6 +14,7 @@ Solid {
   SFBool   locked              FALSE         # {TRUE, FALSE}
   SFFloat  radarCrossSection   0.0           # [0, inf)
   MFColor  recognitionColors   []            # any color
+  SFFloat  newtonFriction      -1            # [0, inf); negative = use WorldInfo.newtonGroundMu
   # hidden fields
   SFVec3f  linearVelocity      0 0 0         # any vector
   SFVec3f  angularVelocity     0 0 0         # any vector
@@ -86,6 +87,17 @@ Please find more info in the description of the [Physics](physics.md) node.
 For consecutive solids, e.g., two solids attached to each other with a joint or a solid attached to the static environment with a joint, no collision detection is performed even if the `physics` field is set.
 The reason is that this type of collision detection is usually not wanted by the user, because a very accurate design of the bounding objects of the solids would be required.
 To prevent two consecutive solid nodes from penetrating each other, the `minStop` and `maxStop` fields of the corresponding joint node should be adjusted accordingly.
+
+- `newtonFriction`: the contact friction of this Solid's colliders, in place of the world's `WorldInfo.newtonGroundMu`.
+A negative value (the default) means unset; `0` is frictionless, and is applied as 0.001: at exactly 0 the solver threw sliding bodies off the surface.
+Since 2026-10-10 a Solid that sets it uses its own value against every surface that does not, so a low value works too: a caster meant to roll, or a box meant to slide.
+Before, MuJoCo's rule of taking the larger of the two surfaces' frictions meant the field could only raise friction.
+When both surfaces set it, the larger value is used.
+`OMNISIM_NEWTON_FRICTION_PRIORITY=0` restores the larger-value rule everywhere.
+It applies to every collider type. Until 2026-10-10 a `Cylinder` or `Capsule` collider used the world value; `OMNISIM_NEWTON_ROUND_SOLID_FRICTION=0` restores that.
+`newtonFrictionTorsional` and `newtonFrictionRolling` reach the same collider types.
+The URDF importer sets it on a link from that link's Gazebo `<mu1>`/`<mu2>` tags, taking the smaller and importing values above 2 as 2.
+It does not set it on the robot's root link. `OMNISIM_URDF_GAZEBO_FRICTION=0` makes the importer ignore those tags.
 
 - `locked`: if `TRUE`, the solid object cannot be moved using the mouse.
 This is useful to prevent moving an object by mistake.

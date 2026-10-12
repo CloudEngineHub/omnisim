@@ -25,6 +25,61 @@ top of that foundation.
 ---
 
 
+## [v9.2.3] — 2026-10-12
+
+Friction and motor fixes found running robot makers' published models (Neobotix MP-400, Clearpath
+Jackal, Ekumen's Andino), the second outside fix to the ROS 2 bridge, and an outside Nav2
+benchmark. Each fix has a pin test that fails on the old engine, and each behaviour change carries a
+value-parsed hatch that restores the old behaviour. The engine and the physics runtime both change,
+so use the v9.2.3 installer (`doctor` must read `bundle == source`).
+
+### ⚠️ Behaviour changes — read before upgrading
+
+- **A Solid's own low friction is used.** MuJoCo combines two surfaces' friction by taking the
+  larger, so `Solid.newtonFriction` could only ever raise friction: a box at `newtonFriction 0` on a
+  20° ramp stuck exactly like a box at 1. A shape that states its own friction now wins against a
+  surface that does not; two stated surfaces still take the larger, so only a stated friction LOWER
+  than the other side changes anything. Hatch: `OMNISIM_NEWTON_FRICTION_PRIORITY=0`.
+- **URDF `<gazebo reference="LINK">` `<mu1>`/`<mu2>` reach the link.** They were ignored; they now
+  become the link's `newtonFriction` (the smaller of the two, which keeps a caster's free direction
+  free). Values above 2 import as 2 and are logged, because MuJoCo's friction cone degenerates at
+  Gazebo's "never slip" 100: Neobotix MP-400 wheels at 100 spun while the body moved 0 m. The
+  MP-400 as published now drives 0.842 of commanded travel and turns 0.914 of the commanded angle
+  (was 0.48 and −0.89). Hatch: `OMNISIM_URDF_GAZEBO_FRICTION=0`.
+- **`Cylinder` and `Capsule` colliders take the Solid's own friction.** Only Box, Sphere and mesh
+  colliders did, so the wheel friction imported from `<gazebo>` tags (Husky 1.0, Jackal 0.5) was
+  inert. Measured against the hatch: a Jackal's open-loop 4 s pivot 337° → 364° and no longer
+  depends on the world friction (pivot drift 63 mm → 6 mm); its straight line is unchanged
+  (1.957 → 1.959 m, kinematic 1.96). The four-Husky `husky_one_passage` run still succeeds with no
+  robot contacts and finishes in 106.1 s instead of 102.9 s. Hatch:
+  `OMNISIM_NEWTON_ROUND_SOLID_FRICTION=0`.
+- **A motor with zero torque is passive.** A URDF `<limit effort="0">` imports as `maxTorque 0`,
+  which the Newton bridge drove at `maxVelocity` from the first step: Andino's passive swivel caster
+  spun at ~112 rad/s before the drive wheels moved, and the robot turned −72° to +154° for a
+  commanded 90°. An off motor now commands velocity 0 and its joint is free; Andino turns 80.7°
+  twice and drives 0.995 of its straights. The importer warns on `effort="0"`, because
+  ROS-Industrial descriptions use 0 for "unknown" on joints they do drive: give such a joint a real
+  effort. `OMNISIM_NEWTON_AVAILABLE_TORQUE=0` still reverts the torque push.
+
+### Fixed
+
+- **A stated friction of exactly 0 no longer launches bodies.** On every collider type, MuJoCo
+  clamped it to 1e-5, where its friction cone degenerates, and a sliding box left along the contact
+  normal at ~850 m/s. A stated friction below 0.001 is now applied as 0.001; the 20° ramp slide is
+  2.269 m in 1.2 s (frictionless closed form 2.27 m).
+- **ROS 2 `ClockNode` keeps publishing when the system clock steps back.** Its polling timer ran on
+  the node's default clock, which follows system realtime, so a backward realtime adjustment stalled
+  `/clock`: a −1.9 s step gave a 1.92 s gap with no ticks, and Husky Nav2 runs saw `/clock` and
+  `/odom` gaps of about a second. The timer now runs on a steady clock; the published stamps are
+  still simulator time. Thanks to @LingZhen07 (#24, #25).
+
+### Added
+
+- **A manual Husky Nav2 static-obstacle benchmark** (`tests/benchmarks/husky_nav2_static_obstacle/`):
+  one cold-start trial around a static box with separate navigation (PASS/FAIL) and evidence
+  (PASS/INVALID) verdicts, a contact positive control, and 300 engine-free tests. It needs Linux or
+  WSL2 with ROS 2 Jazzy. Thanks to @LingZhen07 (#27).
+
 ## [v9.2.2] — 2026-10-09
 
 Fixes found running robot makers' published models and a third-party benchmark on the installed

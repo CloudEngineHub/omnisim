@@ -1,8 +1,8 @@
 #OMNISIM R2025a utf8
 
-# Husky Nav2 static-obstacle experiment
-# 4-wheel skid-steer. Prompts: "forward 1 m", "turn left 90 degrees",
-# "back 50 cm", "spin", "stop", "reset".
+# Husky Nav2 static-obstacle benchmark fixture -- NOT a chat demo.
+# Driven by tests/benchmarks/husky_nav2_static_obstacle/run_trial.py, which
+# starts the engine, the ROS sidecar and Nav2 itself (see its README).
 
 EXTERNPROTO "omnisim://projects/samples/demos/protos/OmniLinkStage.proto"
 EXTERNPROTO "omnisim://projects/objects/backgrounds/protos/OmniSimSky.proto"

@@ -166,6 +166,7 @@ struct UrdfLink {
   QList<UrdfVisual> visuals;
   QList<UrdfCollision> collisions;
   UrdfInertial inertial;
+  double gazeboMu = -1.0;  // <gazebo reference="LINK"> <mu1>/<mu2> (the smaller); negative = unset
 };
 
 struct UrdfJoint {
@@ -626,6 +627,14 @@ UrdfJoint parseJoint(const QDomElement &elem) {
     if (limEl.hasAttribute("effort")) {
       j.effort = limEl.attribute("effort").toDouble();
       j.hasEffort = true;
+      // effort 0 imports as maxTorque/maxForce 0: the motor is OFF and the joint
+      // moves freely, as SDF reads it. ROS-Industrial descriptions write 0 for
+      // "unknown" on joints they drive, so say what happened.
+      if (j.effort == 0.0 && (j.type == "revolute" || j.type == "continuous" || j.type == "prismatic"))
+        OmLog::warning(QObject::tr("URDF joint '%1': <limit effort=\"0\"> imports as a motor with no torque, so "
+                                   "the joint is passive and cannot be driven. If it is meant to be driven "
+                                   "(ROS-Industrial descriptions use 0 for \"unknown\"), give it the real effort.")
+                         .arg(j.name));
     }
   }
 
@@ -793,6 +802,51 @@ void parseGazeboExtensions(const QDomElement &robotRoot, UrdfRobot &robot) {
   for (QDomElement g = robotRoot.firstChildElement("gazebo"); !g.isNull();
        g = g.nextSiblingElement("gazebo")) {
     const QString reference = g.attribute("reference");
+    // <gazebo reference="LINK"><mu1>/<mu2></gazebo>: the link's contact friction
+    // (2026-10-09). Both the text form (<mu1>0.2</mu1>) and the attribute form
+    // (<mu1 value="0.5"/>) occur in published URDFs. A link that set it -- a caster
+    // meant to roll at 0.2, a drive wheel at 100 -- used to meet the floor at the
+    // world's newtonGroundMu. It becomes Solid.newtonFriction, which the runtime lets
+    // win the contact against unstated surfaces, as Gazebo's min rule does against its
+    // high-friction ground. A direction-dependent pair (mu1 along fdir1, mu2 across)
+    // takes the smaller, keeping a caster's free direction free. Value-parsed hatch:
+    // OMNISIM_URDF_GAZEBO_FRICTION=0 ignores the tags.
+    static const bool gazeboFriction = [] {
+      const QString v = QString::fromUtf8(qgetenv("OMNISIM_URDF_GAZEBO_FRICTION")).trimmed().toLower();
+      return !(v == "0" || v == "false" || v == "off" || v == "no");
+    }();
+    if (gazeboFriction && !reference.isEmpty() && robot.links.contains(reference)) {
+      double mu = -1.0;
+      for (const char *tag : {"mu1", "mu2"}) {
+        const QDomElement e = g.firstChildElement(tag);
+        if (e.isNull())
+          continue;
+        QString text = e.text().trimmed();
+        if (text.isEmpty())
+          text = e.attribute("value").trimmed();
+        bool ok = false;
+        const double v = text.toDouble(&ok);
+        if (ok && v >= 0.0)
+          mu = (mu < 0.0) ? v : qMin(mu, v);
+      }
+      // Gazebo URDFs write "infinite" friction as mu 100 (ODE takes the min with the
+      // ground, so it only means "never slip"). MuJoCo's friction cone degenerates at
+      // that value: a Neobotix MP-400 with mu1/mu2 100 on its drive wheels spun them at
+      // the commanded rate while the body moved 0 m; at 1.5 it drove 0.871 of command
+      // with its wheels tracking 0.871. Above kGazeboMuCap the value is imported as the
+      // cap, which is already no-slip for a wheel, and the clamp is logged.
+      static constexpr double kGazeboMuCap = 2.0;
+      if (mu > kGazeboMuCap) {
+        OmLog::info(QObject::tr("URDF link '%1': <gazebo> friction %2 imported as %3 (MuJoCo's friction cone "
+                                "degenerates at Gazebo's 'never slip' values; %3 does not slip either)")
+                      .arg(reference)
+                      .arg(mu)
+                      .arg(kGazeboMuCap));
+        mu = kGazeboMuCap;
+      }
+      if (mu >= 0.0)
+        robot.links[reference].gazeboMu = mu;
+    }
     // <gazebo reference="LINK"><sensor>...</sensor></gazebo>
     if (!reference.isEmpty()) {
       for (QDomElement sensor = g.firstChildElement("sensor"); !sensor.isNull();
@@ -1364,6 +1418,15 @@ QString emitLinkChildren(const UrdfLink &link, const QString &indent,
 // it; on Kinova's Gen3 lite (end_effector_link) the gripper and any tool payload
 // vanished from the arm's joint torques. MuJoCo fuses the fixed children into the
 // body instead, which is what the composite merge does once this link has a body.
+// Solid.newtonFriction from a link's <gazebo> <mu1>/<mu2> (parseGazeboExtensions). Emitted on
+// link Solids only: the robot root is a Robot node, which declares no newtonFriction field,
+// so writing it there is a parse error that failed the whole load.
+static QString emitLinkFriction(const UrdfLink &link, const QString &indent) {
+  if (link.gazeboMu < 0.0 || link.collisions.isEmpty())
+    return QString();
+  return indent + QString("newtonFriction %1\n").arg(link.gazeboMu);
+}
+
 QString emitLinkPhysics(const UrdfLink &link, const QString &indent, bool allowSyntheticPhysics = true,
                         const UrdfOrigin *linkOffset = nullptr, bool bodyForFixedSubtree = false) {
   QString out;
@@ -1790,6 +1853,7 @@ QString emitSolidEndPoint(const UrdfLink &link, const UrdfJoint &joint, const QS
   out += indent + "  ]\n";
   out += emitLinkPhysics(link, indent + "  ", true, nullptr,
                          emptyLinkCarriesFixedSubtree(link, jointsByParent, links));
+  out += emitLinkFriction(link, indent + "  ");
   out += indent + "}\n";
   return out;
 }
@@ -1828,6 +1892,7 @@ QString emitJoint(const UrdfJoint &j, const QString &indent,
     // makes ODE fight the fixed-joint constraint under gravity and the
     // child drifts out of position (Panda hand falling off the flange).
     out += emitLinkPhysics(child, indent + "  ", /*allowSyntheticPhysics=*/false);
+    out += emitLinkFriction(child, indent + "  ");
     out += indent + "}\n";
     return out;
   }

@@ -1558,15 +1558,17 @@ int OmNewtonBackend::touchForce(int bodyIdx, double out[6]) const {
 
 int OmNewtonBackend::addShapeCylinder(int bodyIdx, double radius, double halfHeight,
                                       double cx, double cy, double cz,
-                                      double qx, double qy, double qz, double qw) {
+                                      double qx, double qy, double qz, double qw,
+                                      double solidMu, double solidMuT, double solidMuR) {
   if (!mAvailable || mRuntime == nullptr || mRuntime->world == nullptr || !mRuntime->openForBuild)
     return -1;
-  // 1 int + 9 doubles: radius, halfHeight, cx,cy,cz, qx,qy,qz,qw. The quaternion
-  // is the AUTHORED collider orientation (see the header note): the python side
-  // no longer invents a -90 deg about X, so an unrotated Cylinder now stays
+  // 1 int + 12 doubles: radius, halfHeight, cx,cy,cz, qx,qy,qz,qw, mu,mu_t,mu_r. The
+  // quaternion is the AUTHORED collider orientation (see the header note): the python
+  // side no longer invents a -90 deg about X, so an unrotated Cylinder now stays
   // Z-aligned, which is what OmCylinder and URDF both mean by a cylinder.
-  PyObject *r = PyObject_CallMethod(mRuntime->world, "add_shape_cylinder", "(iddddddddd)",
-                                     bodyIdx, radius, halfHeight, cx, cy, cz, qx, qy, qz, qw);
+  PyObject *r = PyObject_CallMethod(mRuntime->world, "add_shape_cylinder", "(idddddddddddd)",
+                                     bodyIdx, radius, halfHeight, cx, cy, cz, qx, qy, qz, qw,
+                                     solidMu, solidMuT, solidMuR);
   if (r == nullptr)
     return reportPyError("add_shape_cylinder");
   Py_DECREF(r);
@@ -1575,13 +1577,15 @@ int OmNewtonBackend::addShapeCylinder(int bodyIdx, double radius, double halfHei
 
 int OmNewtonBackend::addShapeCapsule(int bodyIdx, double radius, double halfHeight,
                                      double cx, double cy, double cz,
-                                     double qx, double qy, double qz, double qw) {
+                                     double qx, double qy, double qz, double qw,
+                                     double solidMu, double solidMuT, double solidMuR) {
   if (!mAvailable || mRuntime == nullptr || mRuntime->world == nullptr || !mRuntime->openForBuild)
     return -1;
-  // Same 1 int + 9 doubles as the cylinder above. An authored Capsule used to
+  // Same 1 int + 12 doubles as the cylinder above. An authored Capsule used to
   // lose BOTH its offset and its rotation here -- the call carried neither.
-  PyObject *r = PyObject_CallMethod(mRuntime->world, "add_shape_capsule", "(iddddddddd)",
-                                     bodyIdx, radius, halfHeight, cx, cy, cz, qx, qy, qz, qw);
+  PyObject *r = PyObject_CallMethod(mRuntime->world, "add_shape_capsule", "(idddddddddddd)",
+                                     bodyIdx, radius, halfHeight, cx, cy, cz, qx, qy, qz, qw,
+                                     solidMu, solidMuT, solidMuR);
   if (r == nullptr)
     return reportPyError("add_shape_capsule");
   Py_DECREF(r);
@@ -3740,7 +3744,7 @@ int OmNewtonBackend::weldBodyToWorld(int) { return -1; }
 int OmNewtonBackend::addShapeBox(int, double, double, double, double, double, double, double,
                                  double, double, double, double, double, double, double) { return -1; }
 int OmNewtonBackend::addShapeCylinder(int, double, double, double, double, double,
-                                      double, double, double, double) { return -1; }
+                                      double, double, double, double, double, double, double) { return -1; }
 int OmNewtonBackend::addBodyForce(int, double, double, double, double, double, double) { return -1; }
 int OmNewtonBackend::setBodyGravcomp(int, double) { return -1; }
 int OmNewtonBackend::setBodyVel(int, double, double, double, int) { return -1; }
@@ -3749,7 +3753,7 @@ int OmNewtonBackend::raycastBatch(int, const double *, OmNewtonRayHit *, const i
 int OmNewtonBackend::solveIk(int, int, const double *, const double *, const std::vector<int> &, const double *, int,
                              std::vector<double> &, std::vector<double> &) const { return -1; }
 int OmNewtonBackend::addShapeCapsule(int, double, double, double, double, double,
-                                     double, double, double, double) { return -1; }
+                                     double, double, double, double, double, double, double) { return -1; }
 int OmNewtonBackend::addShapePlane(int, double, double, double) { return -1; }
 int OmNewtonBackend::addShapeMesh(int, const double *, int, const int *, int,
                                   double, double, double,

@@ -262,13 +262,17 @@ public:
   // divide. NOTE: native Newton cylinder narrow-phase locks wheels (probe 7),
   // so addShapeCylinder substitutes a same-radius/half-height capsule (line
   // contact, robust) -- both therefore land on newton's Z-aligned capsule and
-  // need no axis correction of their own. Returns 0/-1.
+  // need no axis correction of their own. solidMu/MuT/MuR: Solid.newtonFriction*,
+  // NEGATIVE = unset, as on addShapeBox (until 2026-10-10 these two shapes took
+  // the world friction only). Returns 0/-1.
   int addShapeCylinder(int bodyIdx, double radius, double halfHeight,
                        double cx = 0.0, double cy = 0.0, double cz = 0.0,
-                       double qx = 0.0, double qy = 0.0, double qz = 0.0, double qw = 1.0);
+                       double qx = 0.0, double qy = 0.0, double qz = 0.0, double qw = 1.0,
+                       double solidMu = -1.0, double solidMuT = -1.0, double solidMuR = -1.0);
   int addShapeCapsule(int bodyIdx, double radius, double halfHeight,
                       double cx = 0.0, double cy = 0.0, double cz = 0.0,
-                      double qx = 0.0, double qy = 0.0, double qz = 0.0, double qw = 1.0);
+                      double qx = 0.0, double qy = 0.0, double qz = 0.0, double qw = 1.0,
+                      double solidMu = -1.0, double solidMuT = -1.0, double solidMuR = -1.0);
   // Infinite static ground plane (newton-ode-replacement-plan.md W1.1) -- e.g. a Floor's Plane
   // boundingObject. Local normal +Z (the OmPlane convention); (cx,cy,cz) is the local offset, the body's
   // transform orients it. Returns 0/-1.

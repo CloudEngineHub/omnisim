@@ -1379,7 +1379,13 @@ class World:
         # declaring newtonGroundMu 3 and a per-shape ke silently got mu=1.0 on that
         # shape -- the world's own declared friction never reached the solver. That
         # is the "declared but unread" class this runtime warns about elsewhere.
-        _mu_eff = (float(mu) if _mu_set
+        # ⚠ A STATED mu OF EXACTLY 0 LAUNCHES THE BODY. MuJoCo clamps it to 1e-5,
+        # where the pyramidal cone's edge rows are all but parallel to the normal.
+        # Measured 2026-10-10: on a 20 deg ramp, boxes, cylinders and URDF links
+        # at mu 0 left along the ramp normal at ~850 m/s (z 677 m after 0.6 s),
+        # while 0.001 slid 2.269 m in 1.2 s (frictionless closed form 2.27).
+        # So a stated friction below 0.001 is floored there.
+        _mu_eff = (max(float(mu), 0.001) if _mu_set
                    else cls._contact_value("OMNISIM_NEWTON_GROUND_MU", _cw.get("mu"), 1.0))
         if _ke_set:
             import os as _os2
@@ -1427,9 +1433,9 @@ class World:
         SolverMuJoCo.register_custom_attributes(self.builder)
         self._mjc_attrs_registered = True
         self._newton_log(
-            "gravcomp: SolverMuJoCo.register_custom_attributes(builder) -- registered "
-            "LAZILY on the first Solid.newtonGravityCompensation, so a world that does "
-            "not use it carries none of MuJoCo's custom attributes.")
+            "SolverMuJoCo.register_custom_attributes(builder) -- registered LAZILY on the "
+            "first Solid.newtonGravityCompensation or stated Solid.newtonFriction, so a world "
+            "that uses neither carries none of MuJoCo's custom attributes.")
 
     def set_body_gravcomp(self, body_idx, value):
         """Fraction of gravity cancelled on one body. 0 = normal, 1 = hovers."""
@@ -1450,6 +1456,33 @@ class World:
         attrs[key].values[int(body_idx)] = v
         return 0
 
+    def _mark_friction_priority(self, sid, mu):
+        """Let a shape's own friction (Solid.newtonFriction) win its contacts.
+
+        MuJoCo combines two geoms' friction by taking the LARGER unless one geom
+        has a higher priority, so a Solid authored at a LOW friction -- a caster
+        meant to roll, a URDF <gazebo> <mu1>0</mu1> -- still met every default
+        surface at the world's newtonGroundMu. Measured 2026-10-09: a box at
+        newtonFriction 0 on a 20 deg ramp at newtonGroundMu 1 stuck exactly like
+        a box at 1. A shape that states its own friction now gets geom priority 1,
+        so its value is used against every unstated (priority 0) surface; two
+        stated surfaces still combine by MuJoCo's max. A friction HIGHER than the
+        other side already won, so only a stated LOW friction changes behaviour.
+        Value-parsed OMNISIM_NEWTON_FRICTION_PRIORITY=0 restores the max rule.
+        Registers MuJoCo's custom attributes lazily, on the first such shape.
+        """
+        if sid is None or int(sid) < 0 or mu is None or float(mu) < 0.0:
+            return
+        import os as _fpos
+        if (_fpos.environ.get("OMNISIM_NEWTON_FRICTION_PRIORITY") or "").strip().lower() in ("0", "false", "off", "no"):
+            return
+        self._ensure_mujoco_attributes()
+        attrs = getattr(self.builder, "custom_attributes", None)
+        key = "mujoco:geom_priority"
+        if not attrs or key not in attrs:
+            return
+        attrs[key].values[int(sid)] = 1
+
     def add_shape_sphere(self, body_idx, radius, cx=0.0, cy=0.0, cz=0.0, mu=-1.0,
                          mu_t=-1.0, mu_r=-1.0):
         _b, _xf, _loc = self._shape_target(body_idx, cx, cy, cz)
@@ -1458,6 +1491,7 @@ class World:
             radius=float(radius),
             cfg=self._shape_cfg_override(mu=mu, mu_t=mu_t, mu_r=mu_r),
         ), _loc)
+        self._mark_friction_priority(sid, mu)
         # The exact call OmSolid.cpp makes for a Robot wrapper that registers
         # no collider of its own ("sphere r=0.001 (Robot wrapper placeholder)"):
         # remembered so finalize() can stop it carrying contact -- see
@@ -1479,14 +1513,34 @@ class World:
         # layer can't inject launch energy) and/or per-shape friction.
         cfg = self._shape_cfg_override(ke=ke, mu=mu, mu_t=mu_t, mu_r=mu_r)
         _b, _xf, _loc = self._shape_target(body_idx, cx, cy, cz, qx, qy, qz, qw)
-        return self._note_shape(body_idx, self._builder_add(_b, self.builder.add_shape_box,
+        sid = self._note_shape(body_idx, self._builder_add(_b, self.builder.add_shape_box,
                         xform=_xf,
             hx=float(hx), hy=float(hy), hz=float(hz),
             cfg=cfg,
         ), _loc)
+        self._mark_friction_priority(sid, mu)
+        return sid
+
+    @staticmethod
+    def _round_shape_friction(mu, mu_t, mu_r):
+        """Solid.newtonFriction* for a Cylinder/Capsule collider, or all unset.
+
+        Until 2026-10-10 these two shapes always took the world friction: only
+        Box, Sphere and mesh colliders received the Solid's own values, so the
+        wheel friction a URDF <gazebo> tag imports (Husky 1.0, Jackal 0.5) and
+        any newtonFriction on a round prop were inert. Value-parsed
+        OMNISIM_NEWTON_ROUND_SOLID_FRICTION=0 restores that (world value only).
+        """
+        import os as _rfos
+        if (_rfos.environ.get("OMNISIM_NEWTON_ROUND_SOLID_FRICTION") or "").strip().lower() in (
+                "0", "false", "off", "no"):
+            return -1.0, -1.0, -1.0
+        return mu, mu_t, mu_r
 
     def add_shape_cylinder(self, body_idx, radius, half_height, cx=0.0, cy=0.0, cz=0.0,
-                           qx=0.0, qy=0.0, qz=0.0, qw=1.0):
+                           qx=0.0, qy=0.0, qz=0.0, qw=1.0, mu=-1.0, mu_t=-1.0, mu_r=-1.0):
+        mu, mu_t, mu_r = self._round_shape_friction(mu, mu_t, mu_r)
+        _cfg = self._shape_cfg_override(mu=mu, mu_t=mu_t, mu_r=mu_r)
         # W1.2 (newton-ode-replacement-plan.md): Newton's native cylinder narrow-phase locks wheels against
         # the ground (probe 7), so substitute a CAPSULE of the same radius + half_height instead of the old
         # sphere. A capsule's central segment is a true cylinder of the correct rolling radius -- a LINE
@@ -1501,9 +1555,11 @@ class World:
             # Revert lever (matches OMNISIM_NEWTON_MESH_TO_ODE): the pre-W1.2 point-contact sphere, kept so
             # the capsule fit can be A/B'd and disabled if a world ever regresses.
             _b, _xf, _loc = self._shape_target(body_idx, cx, cy, cz)
-            return self._note_shape(body_idx, self._builder_add(_b, self.builder.add_shape_sphere,
+            _sid = self._note_shape(body_idx, self._builder_add(_b, self.builder.add_shape_sphere,
                                 xform=_xf,
-                radius=float(radius), cfg=self._shape_cfg()), _loc)
+                radius=float(radius), cfg=_cfg), _loc)
+            self._mark_friction_priority(_sid, mu)
+            return _sid
         # OMNISIM_NEWTON_CYLINDER_NATIVE (2026-10-09). A capsule stand-in is right
         # for a WHEEL and wrong for almost everything else: when radius >= half
         # the height (a disc, puck, table top, chassis plate) the stand-in keeps a
@@ -1525,12 +1581,14 @@ class World:
         _cyl_mode = _os.environ.get("OMNISIM_NEWTON_CYLINDER_NATIVE", "").strip().lower()
         if _cyl_mode in ("1", "true", "on", "yes", "all"):
             _b, _xf, _loc = self._shape_target(body_idx, cx, cy, cz, qx, qy, qz, qw)
-            return self._note_shape(body_idx, self._builder_add(_b, self.builder.add_shape_cylinder,
+            _sid = self._note_shape(body_idx, self._builder_add(_b, self.builder.add_shape_cylinder,
                             xform=_xf,
                 radius=float(radius),
                 half_height=float(half_height),
-                cfg=self._shape_cfg(),
+                cfg=_cfg,
             ), _loc)
+            self._mark_friction_priority(_sid, mu)
+            return _sid
         # ⚠ THIS USED TO APPLY A FIXED -90 DEG ABOUT X AND IT WAS WRONG.
         #
         # The stated premise -- "a Webots Cylinder bounding object extends along
@@ -1612,8 +1670,9 @@ class World:
                         xform=_xf,
             radius=_r_sub,
             half_height=_h_sub,
-            cfg=self._shape_cfg(),
+            cfg=_cfg,
         ), _loc)
+        self._mark_friction_priority(_sid, mu)
         if _cyl_mode not in ("0", "false", "off", "no") and _sid is not None and int(_sid) >= 0:
             # setdefault, not the __init__ list alone: unit tests build a World without __init__.
             self.__dict__.setdefault("_cylinder_stand_ins", []).append(
@@ -1621,17 +1680,20 @@ class World:
         return _sid
 
     def add_shape_capsule(self, body_idx, radius, half_height, cx=0.0, cy=0.0, cz=0.0,
-                          qx=0.0, qy=0.0, qz=0.0, qw=1.0):
+                          qx=0.0, qy=0.0, qz=0.0, qw=1.0, mu=-1.0, mu_t=-1.0, mu_r=-1.0):
         # An authored Capsule boundingObject used to lose BOTH its offset and its rotation here --
         # this call carried no xform at all, so a capsule authored inside a Pose collided at the
         # body origin, unrotated, however the .wbt placed it. Same Z-aligned convention as the
         # cylinder above (OmCapsule is Z-aligned; so is a newton capsule).
+        mu, mu_t, mu_r = self._round_shape_friction(mu, mu_t, mu_r)
         _b, _xf, _loc = self._shape_target(body_idx, cx, cy, cz, qx, qy, qz, qw)
-        return self._note_shape(body_idx, self._builder_add(_b, self.builder.add_shape_capsule,
+        _sid = self._note_shape(body_idx, self._builder_add(_b, self.builder.add_shape_capsule,
                         xform=_xf,
             radius=float(radius),
             half_height=float(half_height),
-            cfg=self._shape_cfg()), _loc)
+            cfg=self._shape_cfg_override(mu=mu, mu_t=mu_t, mu_r=mu_r)), _loc)
+        self._mark_friction_priority(_sid, mu)
+        return _sid
 
     def add_shape_plane(self, body_idx, cx=0.0, cy=0.0, cz=0.0):
         # Infinite static ground plane (e.g. a Floor's boundingObject), local normal +Z (the OmPlane
@@ -1691,11 +1753,13 @@ class World:
         # which tipped any mesh collision authored inside a rotated Pose -- which the URDF importer
         # emits routinely.
         _b, _xf, _loc = self._shape_target(body_idx, cx, cy, cz, qx, qy, qz, qw)
-        return self._note_shape(body_idx, self._builder_add(_b, self.builder.add_shape_mesh,
+        sid = self._note_shape(body_idx, self._builder_add(_b, self.builder.add_shape_mesh,
                         xform=_xf,
             mesh=mesh,
             cfg=self._shape_cfg_override(mu=mu, mu_t=mu_t, mu_r=mu_r),
         ), _loc)
+        self._mark_friction_priority(sid, mu)
+        return sid
 
     def add_shape_heightfield(self, body_idx, heights, x_dimension, y_dimension,
                               x_spacing, y_spacing, cx=0.0, cy=0.0, cz=0.0):

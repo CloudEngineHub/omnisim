@@ -287,6 +287,10 @@ void OmBasicJoint::pushNewtonAxisTarget(OmNewtonBackend *newton, int jointIdx, i
   }
   if (sForceModeAxes.remove(axisKey))
     newton->setJointForceDof(jointIdx, dof, 0.0);
+  if (motor->availableForceOrTorque() == 0.0) {  // motor off: never maxVelocity (see the 1-DoF push)
+    newton->setJointTargetVelocityDof(jointIdx, dof, 0.0);
+    return;
+  }
   if (motor->isPIDPositionControl()) {
     newton->setJointTargetPositionDof(jointIdx, dof, motor->targetPosition());
     newton->setJointTargetVelocityDof(jointIdx, dof, 0.0);
@@ -1193,11 +1197,14 @@ void OmBasicJoint::pushNewtonMotorTargets() {
     // Available torque: push only CHANGES. The first push is skipped while the
     // motor still has its full maxTorque (the joint was registered with it), so
     // a world that never calls setAvailableTorque() never reaches the runtime.
+    // A maxTorque of 0 is the exception: the runtime cannot register a zero
+    // effort limit (0 there means "unlimited"), so it is pushed on the first tick.
     if (newtonAvailableTorqueEnabled()) {
       const double avail = motor->availableForceOrTorque();
       QHash<int, double> &pushed = pushedAvailableTorque();
       const auto it = pushed.constFind(p->mNewtonJointIndex);
-      const bool changed = (it == pushed.constEnd()) ? (avail != motor->maxForceOrTorque()) : (it.value() != avail);
+      const bool changed = (it == pushed.constEnd()) ? (avail != motor->maxForceOrTorque() || avail == 0.0)
+                                                     : (it.value() != avail);
       if (changed && newton->setJointEffortLimit(p->mNewtonJointIndex, 0, avail) == 0)
         pushed.insert(p->mNewtonJointIndex, avail);
     }
@@ -1254,8 +1261,17 @@ void OmBasicJoint::pushNewtonMotorTargets() {
           promotedServoJointIndices().remove(jIdx);
       }
     }
+    // ⚠ A motor with no available torque is OFF (OmMotor: "no control"), and
+    // isPIDPositionControl() is false for it -- which used to land in the
+    // velocity branch and send targetVelocity(), i.e. maxVelocity until a
+    // controller says otherwise. Measured 2026-10-10: a URDF caster declared
+    // effort="0" (the Gazebo way to leave a joint passive) span at ~112 rad/s
+    // from t=0, with the runtime's default (unlimited) effort behind it, and
+    // the robot drove in random directions. An off motor commands nothing.
     double target;
-    if (motor->isPIDPositionControl()) {
+    if (motor->availableForceOrTorque() == 0.0) {
+      target = 0.0;
+    } else if (motor->isPIDPositionControl()) {
       newton->setJointTargetPositionIfChanged(p->mNewtonJointIndex, motor->targetPosition());
       target = 0.0;
     } else {

@@ -86,9 +86,10 @@ robot classes and four bridge controllers: 7 arms, 7 mobile bases, 6 quadrupeds,
 the 21 is a row below, is a card in the [launcher catalogue](projects/samples/demos/controllers/omnilink_launcher/demos.json),
 and is a row in the [folder index](projects/samples/demos/worlds/chat/OMNILINK_CHAT_DEMOS.md);
 [`tests/test_demo_catalogue.py`](tests/test_demo_catalogue.py) fails if the three disagree.
-`chat/omnilink_husky_langsoak.omniworld` is the 22nd tracked file in that folder and is deliberately **not** one
-of the 21 — it is the [langsoak](tests/benchmarks/langsoak/) benchmark fixture (port 8775), catalogued as
-such in [WORLDS.md §1a](WORLDS.md#1a-chat-demos-one-robot-talk-to-it).
+Two more tracked files in that folder are deliberately **not** among the 21: `chat/omnilink_husky_langsoak.omniworld`,
+the [langsoak](tests/benchmarks/langsoak/) benchmark fixture (port 8775), and `chat/husky_nav2_static_obstacle.omniworld`,
+the [Nav2 static-obstacle](tests/benchmarks/husky_nav2_static_obstacle/) benchmark fixture; both are catalogued as
+fixtures in [WORLDS.md §1a](WORLDS.md#1a-chat-demos-one-robot-talk-to-it).
 
 Connect your OmniKey and a model provider, then right-click the robot → *Show Robot Window*. OmniLink chat requires a connection on every plan. The direct Stop button and ordinary simulator controls remain available independently.
 

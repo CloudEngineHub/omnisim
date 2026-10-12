@@ -9,10 +9,12 @@ the [launcher catalogue](../../controllers/omnilink_launcher/demos.json) and
 [DEMOS.md §1](../../../../../DEMOS.md#1-chat-demos--single-robot-natural-language-console)
 carry the same 21. `tests/test_demo_catalogue.py` fails if the three ever disagree.
 
-`omnilink_husky_langsoak.omniworld` is the 22nd TRACKED `.omniworld` here and is
-**not** one of the 21: it is the fixture the
+Two more TRACKED `.omniworld` files here are **not** among the 21. They are
+benchmark fixtures, not demos: `omnilink_husky_langsoak.omniworld`, which the
 [langsoak](../../../../../tests/benchmarks/langsoak/) language benchmark drives on
-port 8775, not a demo.
+port 8775, and `husky_nav2_static_obstacle.omniworld`, which the manual
+[Nav2 static-obstacle](../../../../../tests/benchmarks/husky_nav2_static_obstacle/)
+benchmark drives.
 
 Each demo opens a robot in a small arena with an **OmniLink robot console** side
 menu attached: right-click the robot in the 3D view → *Show Robot Window*, then

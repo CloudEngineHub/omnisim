@@ -3039,7 +3039,7 @@ static QString addNewtonPrimitive(OmNewtonBackend *newton, int idx,
     // along the shaft -- swept through the parts it was meant to pick.
     const double halfHeight = cyl->height() * 0.5;
     newton->addShapeCylinder(idx, cyl->radius(), halfHeight, off.x(), off.y(), off.z(),
-                             qx, qy, qz, qw);
+                             qx, qy, qz, qw, solidMu, solidMuT, solidMuR);
     return QString("cylinder->capsule r=%1 hh=%2 at (%3,%4,%5) q=(%6,%7,%8,%9)")
         .arg(cyl->radius()).arg(halfHeight)
         .arg(off.x()).arg(off.y()).arg(off.z())
@@ -3049,7 +3049,7 @@ static QString addNewtonPrimitive(OmNewtonBackend *newton, int idx,
     // Was offset-less AND orientation-less: an authored Capsule inside a Pose
     // collided at the body origin, unrotated, however the .wbt placed it.
     newton->addShapeCapsule(idx, cap->radius(), cap->height() * 0.5,
-                            off.x(), off.y(), off.z(), qx, qy, qz, qw);
+                            off.x(), off.y(), off.z(), qx, qy, qz, qw, solidMu, solidMuT, solidMuR);
     return QString("capsule r=%1 hh=%2 at (%3,%4,%5) q=(%6,%7,%8,%9)")
         .arg(cap->radius()).arg(cap->height() * 0.5)
         .arg(off.x()).arg(off.y()).arg(off.z())
@@ -3314,7 +3314,7 @@ static QString attachNewtonShapeFromBoundingObject(OmNewtonBackend *newton, int 
     const double radius = cyl->radius();
     const double halfHeight = cyl->height() * 0.5;
     newton->addShapeCylinder(idx, radius, halfHeight, shapeOffset.x(), shapeOffset.y(), shapeOffset.z(),
-                             sqx, sqy, sqz, sqw);
+                             sqx, sqy, sqz, sqw, solidMu, solidMuT, solidMuR);
     shapeDesc = QString("cylinder->capsule r=%1 hh=%2 at (%3,%4,%5) q=(%6,%7,%8,%9)").arg(radius).arg(halfHeight)
                     .arg(shapeOffset.x()).arg(shapeOffset.y()).arg(shapeOffset.z())
                     .arg(sqx).arg(sqy).arg(sqz).arg(sqw);
@@ -3324,7 +3324,7 @@ static QString attachNewtonShapeFromBoundingObject(OmNewtonBackend *newton, int 
     // Was offset-less AND orientation-less -- an authored Capsule collided at the body origin,
     // unrotated, wherever the .wbt actually put it.
     newton->addShapeCapsule(idx, radius, halfHeight, shapeOffset.x(), shapeOffset.y(), shapeOffset.z(),
-                            sqx, sqy, sqz, sqw);
+                            sqx, sqy, sqz, sqw, solidMu, solidMuT, solidMuR);
     shapeDesc = QString("capsule r=%1 hh=%2 at (%3,%4,%5) q=(%6,%7,%8,%9)").arg(radius).arg(halfHeight)
                     .arg(shapeOffset.x()).arg(shapeOffset.y()).arg(shapeOffset.z())
                     .arg(sqx).arg(sqy).arg(sqz).arg(sqw);
