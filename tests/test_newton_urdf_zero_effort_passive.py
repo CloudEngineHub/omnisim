@@ -27,6 +27,13 @@ Probe: two pendulums on fixed bases, released horizontal. effort="0" swings down
 under gravity and, with no energy input, never rises above its pivot; effort="50" is a
 motor holding its start angle. Before the fix the effort-0 bob went over the top.
 
+Second defect (2026-10-13): the effort-0 joint was free of the actuator but still
+SPEED-CAPPED. The runtime's post-step clamp holds every joint to its URDF velocity limit,
+which models a motor's back-EMF -- and an off motor has none. Dexmate's Vega torso_flip
+(effort 0, velocity 0.1) crept onto its stop at 0.11 rad/s for 9.5 s where plain MuJoCo
+drops it in 0.4 s. A third pendulum carries effort 0 with velocity 0.1: free, it reaches
+the bottom inside the window; capped, it would need ~16 s for the quarter swing.
+
     python -m pytest tests/test_newton_urdf_zero_effort_passive.py -v
 
 OMNISIM_BINARY selects a scratch build. One engine launch, a few seconds.
@@ -45,7 +52,7 @@ PIVOT_Z = 0.5
 ARM = 0.3
 
 
-def _urdf(tag: str, effort: str) -> str:
+def _urdf(tag: str, effort: str, velocity: str = "100") -> str:
     return f"""<?xml version="1.0"?>
 <robot name="pend_{tag}">
   <link name="base_{tag}">
@@ -57,7 +64,7 @@ def _urdf(tag: str, effort: str) -> str:
   </link>
   <joint name="swing_{tag}" type="continuous">
     <parent link="base_{tag}"/><child link="arm_{tag}"/><axis xyz="0 1 0"/>
-    <limit effort="{effort}" velocity="100"/>
+    <limit effort="{effort}" velocity="{velocity}"/>
   </joint>
   <link name="bob_{tag}">
     <inertial><mass value="0.001"/><inertia ixx="1e-7" iyy="1e-7" izz="1e-7" ixy="0" ixz="0" iyz="0"/></inertial>
@@ -84,9 +91,10 @@ pytestmark = pytest.mark.skipif(_binary() is None, reason="no simulator binary i
 
 def _bob_heights(tmp_path: Path) -> dict:
     robots = []
-    for i, (tag, effort) in enumerate((("free", "0"), ("held", "50"))):
+    for i, (tag, effort, velocity) in enumerate((("free", "0", "100"), ("held", "50", "100"),
+                                                 ("slowcap", "0", "0.1"))):
         u = tmp_path / f"pend_{tag}.urdf"
-        u.write_text(_urdf(tag, effort), encoding="utf-8")
+        u.write_text(_urdf(tag, effort, velocity), encoding="utf-8")
         robots.append(f'URDFRobot {{ url "{u.as_posix()}" translation 0 {i * 1.0} {PIVOT_Z} name "pend_{tag}" '
                       f'staticBase TRUE controller "<none>" }}')
     world = tmp_path / "pendulums.omniworld"
@@ -122,3 +130,13 @@ def test_zero_effort_joint_swings_freely_and_is_not_driven(tmp_path):
         f"driven, not passive")
     assert min(held) > PIVOT_Z - 0.05, (
         f"the effort=50 motor should hold its start angle; bob dropped to z {min(held):.3f}")
+
+
+def test_zero_effort_joint_is_not_held_to_its_velocity_limit(tmp_path):
+    z = _bob_heights(tmp_path)
+    assert "bob_slowcap" in z, f"bob missing from the trajectory probe: {sorted(z)}"
+    low = min(z["bob_slowcap"])
+    assert low < PIVOT_Z - 0.8 * ARM, (
+        f"the effort=0 pendulum with a 0.1 rad/s URDF velocity limit should still swing down freely; "
+        f"lowest bob z {low:.3f}. It is being held to the motor's speed limit, which an off motor does "
+        f"not have")

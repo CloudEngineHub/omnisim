@@ -250,6 +250,53 @@ bool urdfUseInertiaEnabled() {
   return value != "0" && value != "false" && value != "off" && value != "no";
 }
 
+// URDF <inertial><origin rpy="..."/> orients the frame the <inertia> tensor is
+// written in; Physics.inertiaMatrix is about the centre of mass but in the
+// Solid's (= the link's) own axes. Until 2026-10-15 the importer used only the
+// origin's xyz (centerOfMass) and dropped the rpy, so a tensor given in a
+// rotated inertial frame reached the solver UNROTATED: mass and COM right, the
+// rotational inertia about every axis wrong (spot_description's hips and lower
+// legs had their principal moments on the wrong axes. PyBullet and Gazebo rotate;
+// plain MuJoCo 3.11's URDF import drops it too). parseLink now re-expresses the tensor in the link
+// frame, I_link = R I R^T with R = Rz(yaw) Ry(pitch) Rx(roll), and clears the
+// rpy. OMNISIM_URDF_INERTIAL_RPY=0 (value-parsed) restores the old import.
+bool urdfInertialRpyEnabled() {
+  static const bool enabled = [] {
+    const QString value = QString::fromUtf8(qgetenv("OMNISIM_URDF_INERTIAL_RPY")).trimmed().toLower();
+    return value.isEmpty() || (value != "0" && value != "false" && value != "off" && value != "no");
+  }();
+  return enabled;
+}
+
+void rpyToMatrix(double r, double p, double y, double &m00, double &m01, double &m02,
+                 double &m10, double &m11, double &m12, double &m20, double &m21, double &m22);
+
+// Re-express a URDF inertia tensor through the rotation `rpy` (URDF fixed-axis
+// convention): I' = R I R^T. Products of inertia use the URDF sign convention
+// (un-negated integrals), which is the one Physics.inertiaMatrix uses too.
+void rotateUrdfInertia(double &ixx, double &ixy, double &ixz, double &iyy, double &iyz, double &izz, double roll,
+                       double pitch, double yaw) {
+  if (roll == 0.0 && pitch == 0.0 && yaw == 0.0)
+    return;
+  double R[3][3];
+  rpyToMatrix(roll, pitch, yaw, R[0][0], R[0][1], R[0][2], R[1][0], R[1][1], R[1][2], R[2][0], R[2][1], R[2][2]);
+  const double I[3][3] = {{ixx, ixy, ixz}, {ixy, iyy, iyz}, {ixz, iyz, izz}};
+  double RI[3][3], Out[3][3];
+  for (int r = 0; r < 3; ++r)
+    for (int c = 0; c < 3; ++c)
+      RI[r][c] = R[r][0] * I[0][c] + R[r][1] * I[1][c] + R[r][2] * I[2][c];
+  for (int r = 0; r < 3; ++r)
+    for (int c = 0; c < 3; ++c)
+      Out[r][c] = RI[r][0] * R[c][0] + RI[r][1] * R[c][1] + RI[r][2] * R[c][2];
+  ixx = Out[0][0];
+  iyy = Out[1][1];
+  izz = Out[2][2];
+  // Symmetrize: R I R^T is symmetric in exact arithmetic only.
+  ixy = 0.5 * (Out[0][1] + Out[1][0]);
+  ixz = 0.5 * (Out[0][2] + Out[2][0]);
+  iyz = 0.5 * (Out[1][2] + Out[2][1]);
+}
+
 // Principal moments (eigenvalues of the symmetric 3x3 inertia tensor), ascending.
 // Closed form (Smith 1961) -- the C++ mirror of `principal_moments()` in
 // scripts/dev/urdf_import.py, so the offline preflight and the native importer
@@ -573,6 +620,15 @@ UrdfLink parseLink(const QDomElement &elem, QHash<QString, UrdfMaterial> &materi
         link.inertial.iyz = iyz;
         link.inertial.izz = izz;
         link.inertial.hasInertiaMatrix = true;
+        // The tensor is written in the inertial frame; inertiaMatrix takes it in
+        // the link's axes (urdfInertialRpyEnabled). Rotation preserves positive
+        // definiteness and the principal moments, so the gate above still holds.
+        UrdfOrigin &io = link.inertial.origin;
+        if (urdfInertialRpyEnabled() && (io.roll != 0.0 || io.pitch != 0.0 || io.yaw != 0.0)) {
+          rotateUrdfInertia(link.inertial.ixx, link.inertial.ixy, link.inertial.ixz, link.inertial.iyy,
+                            link.inertial.iyz, link.inertial.izz, io.roll, io.pitch, io.yaw);
+          io.roll = io.pitch = io.yaw = 0.0;
+        }
       } else if (ixx > 0.0 || iyy > 0.0 || izz > 0.0) {
         OmLog::warning(QObject::tr("URDF link '%1': inertia tensor is not positive definite "
                                    "(ixx=%2 iyy=%3 izz=%4 ixy=%5 ixz=%6 iyz=%7); "
@@ -2143,31 +2199,20 @@ QString emitRobot(const UrdfRobot &robot) {
     for (UrdfCollision &c : rootLink.collisions)
       c.origin = composeUrdfOrigins(rerootOffset, c.origin);
     if (rootLink.inertial.present) {
-      // Only the inertial origin's xyz is emitted (centerOfMass); its rpy is
-      // not consumed by emitLinkPhysics, so it is left as authored. A rotated
-      // offset re-expresses the tensor itself: I' = R I R^T.
+      // Only the inertial origin's xyz is emitted (centerOfMass). Its rpy was
+      // already folded into the tensor by parseLink (urdfInertialRpyEnabled),
+      // so the tensor here is in the promoted link's axes; a rotated offset
+      // re-expresses it in the Robot's: I' = R I R^T.
       UrdfOrigin com = rootLink.inertial.origin;
       com.roll = com.pitch = com.yaw = 0.0;
       com = composeUrdfOrigins(rerootOffset, com);
       rootLink.inertial.origin.x = com.x;
       rootLink.inertial.origin.y = com.y;
       rootLink.inertial.origin.z = com.z;
-      if (rootLink.inertial.hasInertiaMatrix &&
-          (rerootOffset.roll != 0.0 || rerootOffset.pitch != 0.0 || rerootOffset.yaw != 0.0)) {
-        double R[3][3];
-        rpyToMatrix(rerootOffset.roll, rerootOffset.pitch, rerootOffset.yaw, R[0][0], R[0][1], R[0][2], R[1][0],
-                    R[1][1], R[1][2], R[2][0], R[2][1], R[2][2]);
+      if (rootLink.inertial.hasInertiaMatrix) {
         UrdfInertial &in = rootLink.inertial;
-        const double I[3][3] = {{in.ixx, in.ixy, in.ixz}, {in.ixy, in.iyy, in.iyz}, {in.ixz, in.iyz, in.izz}};
-        double RI[3][3], Out[3][3];
-        for (int r = 0; r < 3; ++r)
-          for (int c = 0; c < 3; ++c)
-            RI[r][c] = R[r][0] * I[0][c] + R[r][1] * I[1][c] + R[r][2] * I[2][c];
-        for (int r = 0; r < 3; ++r)
-          for (int c = 0; c < 3; ++c)
-            Out[r][c] = RI[r][0] * R[c][0] + RI[r][1] * R[c][1] + RI[r][2] * R[c][2];
-        in.ixx = Out[0][0]; in.iyy = Out[1][1]; in.izz = Out[2][2];
-        in.ixy = Out[0][1]; in.ixz = Out[0][2]; in.iyz = Out[1][2];
+        rotateUrdfInertia(in.ixx, in.ixy, in.ixz, in.iyy, in.iyz, in.izz, rerootOffset.roll, rerootOffset.pitch,
+                          rerootOffset.yaw);
       }
     }
     if (jointsByParent.contains(rootName)) {

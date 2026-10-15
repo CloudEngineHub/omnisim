@@ -89,6 +89,11 @@ These fields are described in more detail in the [Motor Limits section](#motor-l
 It is expressed in *meter per second* [m/s] for linear motors and in *radian per second* [rad/s] for rotational motors.
 The *velocity* can be changed at run-time with the `wb_motor_set_velocity` function.
 The value should always be positive (the default is 10).
+Under Newton the joint's speed is also capped at this value after every physics step (a motor's top speed).
+On a free-floating robot (no `staticBase`, not welded to the world) that cap conserves the robot's momentum (since 2026-10-15): the reaction to capping a joint goes to the robot's floating base, as it goes to the world on a fixed base, and every other joint keeps its velocity.
+Before, the momentum the cap removed reappeared as base motion: a free-falling UR10e whose saturated shoulder servo was held to its `maxVelocity` spun at 10.7 rad/s within 25 ms.
+On the `mujoco_warp` solver, which has no CPU solver data to compute the reaction from, a floating robot's joints are not capped at all.
+`OMNISIM_NEWTON_CLAMP_MOMENTUM=0` restores the old cap.
 
 - The `multiplier` field specifies the factor by which position, velocity and force/torque commands sent by the controller are multiplied.
 Only the following API functions are affected by this field: `wb_motor_set_position`, `wb_motor_set_velocity`, `wb_motor_set_torque` and `wb_motor_set_force`.
@@ -487,6 +492,7 @@ The specified acceleration overwrites the `acceleration` field value and can be 
 
 ✅ **Setting the available force to `0` makes the joint passive** (engine built after 2026-10-03). The available force/torque is pushed to the solver as the joint's total actuator limit (MuJoCo `jnt_actfrcrange`); at `0` the runtime also zeroes the servo gains and removes the wheel armature, so the joint moves only under its authored damping, friction and the forces acting on it -- the way to make a URDF passive joint passive (every revolute/continuous URDF joint is imported with a motor). A non-zero value caps the motor at that torque; restoring it restores the servo. Before that build the value never reached the solver: a motor at `0` was a velocity servo targeting 0, i.e. a brake. `OMNISIM_NEWTON_AVAILABLE_TORQUE=0` restores that behaviour.
 A motor whose `maxTorque` / `maxForce` is `0` from the start is passive the same way (since 2026-10-10). This is what a URDF `<limit effort="0">` imports as, and the importer warns about it, because ROS-Industrial descriptions write `0` for "unknown" on joints they drive. Before that, such a motor was driven at `maxVelocity` with no torque limit: a URDF caster declared passive this way spun at about 112 rad/s from the first step.
+While a motor's available torque is `0` its joint is also exempt from the `maxVelocity` speed cap (since 2026-10-13), since that cap models a motor's top speed and an off motor has none; its range limits still apply. Before, a passive joint could move no faster than `maxVelocity` (a URDF `velocity` of 0.1 rad/s let a 15 kg torso creep onto its stop over 9.5 s where it falls in 0.4 s). `OMNISIM_NEWTON_PASSIVE_VEL_CLAMP=1` keeps the cap.
 
 The `wb_motor_set_available_force` (resp. `wb_motor_set_available_torque`) function specifies the maximum force (resp. torque) that will be available to the motor to carry out the requested motion.
 The force is expressed in *newton* [N].

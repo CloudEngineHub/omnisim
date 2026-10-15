@@ -8821,6 +8821,7 @@ class World:
                     qs = self.model.joint_q_start.numpy()
                     qds = self.model.joint_qd_start.numpy()
                     qi, qdi, vlim, lo, hi = [], [], [], [], []
+                    _exempt = getattr(self, "_vel_clamp_exempt_slots", ())
                     for _sl, _rl in self.slot_to_real_idx.items():
                         try:
                             spec = self.pending_revolutes[_sl]
@@ -8833,7 +8834,7 @@ class World:
                             break
                         qi.append(int(mjq[_rl]))
                         qdi.append(int(mjqd[_rl]))
-                        vlim.append(float(spec["velocity_limit"]))
+                        vlim.append(0.0 if _sl in _exempt else float(spec["velocity_limit"]))
                         lo.append(float(spec["limit_lower"]))
                         hi.append(float(spec["limit_upper"]))
                     else:
@@ -8858,6 +8859,144 @@ class World:
             return False
         except Exception:
             return True                      # never trade enforcement for speed
+
+    def _floating_clamp_joints(self):
+        """Newton joint indices whose articulation tree hangs off a FREE root joint.
+
+        Walks joint_parent up to the world through joint_child, once per model.
+        A staticBase root, a world weld or a kinematic body is FIXED-rooted and
+        is not in the set: there the world absorbs whatever the clamp removes.
+        """
+        cached = self.__dict__.get("_floating_clamp_cache")
+        if cached is not None and cached[0] is self.model:
+            return cached[1]
+        floating = set()
+        try:
+            jp = self.model.joint_parent.numpy()
+            jc = self.model.joint_child.numpy()
+            jt = self.model.joint_type.numpy()
+            free_t = int(newton.JointType.FREE)
+            joint_of_child = {int(c): j for j, c in enumerate(jc)}
+            for j in range(len(jt)):
+                k, hops = j, 0
+                while int(jp[k]) >= 0 and hops <= len(jt):
+                    nxt = joint_of_child.get(int(jp[k]))
+                    if nxt is None:
+                        break
+                    k, hops = nxt, hops + 1
+                if int(jp[k]) < 0 and int(jt[k]) == free_t and k != j:
+                    floating.add(j)
+        except Exception:
+            floating = set()
+        self._floating_clamp_cache = (self.model, floating)
+        return floating
+
+    def _clamp_momentum_fix(self, qd_arr, dqd):
+        """Give a floating base the reaction to the post-step joint clamp.
+
+        ⚠ THE CLAMP IS AN INTERNAL ACTION (2026-10-15). Capping a joint's speed
+        (or zeroing its velocity into a stop) changes the RELATIVE velocity of the
+        two bodies the joint connects -- a motor's back-EMF or an end-stop, both
+        internal to the robot. Internal actions cannot change a system's momentum,
+        but the clamp overwrote the joint's qvel and left the free joint alone, so
+        on a free-floating robot the clipped momentum went into the base: a
+        free-falling UR10e whose saturated shoulder-pan servo was capped spun at
+        10.7 rad/s about z within 25 ms and drifted 1.7 m in 0.5 s, where plain
+        MuJoCo just falls (DLR lane, 2026-10-14).
+
+        The cap itself is unchanged; the free joint of the same tree now takes the
+        reaction. With M the joint-space inertia at the current pose, F the six
+        free DoFs and C the clamped ones, the free joint's generalized momentum
+        (M v)_F -- the tree's total linear and angular momentum -- is held fixed:
+            dv_F = -M_FF^-1 M_FC dv_C
+        Every other joint keeps its velocity, exactly as on a fixed base, where
+        the same rule degenerates to the old clamp (no free joint, the world takes
+        the reaction). A momentum-conserving alternative that also moves the other
+        joints (the M-metric projection, i.e. an impulsive brake torque on the
+        clamped joint) was not chosen because it would change fixed-base robots.
+
+        ``dqd`` maps newton joint index -> the delta the clamp applied to its
+        scalar DoF; ``qd_arr`` (newton joint_qd) gets the free-joint deltas in
+        place. Returns the number of floating trees corrected, or None when there
+        is no CPU MjData to read the inertia from (the caller then exempts those
+        joints from the cap instead).
+        """
+        sv = self._mjc_solver()
+        m = getattr(sv, "mj_model", None) if sv is not None else None
+        d = getattr(sv, "mj_data", None) if sv is not None else None
+        if m is None or d is None or not getattr(sv, "use_mujoco_cpu", False):
+            return None
+        import numpy as _np
+        import mujoco as _mj
+        cache = self.__dict__.get("_clamp_momentum_cache")
+        if cache is None or cache[0] is not m:
+            mjqd = sv.mj_qd_start.numpy()
+            jt = self.model.joint_type.numpy()
+            free_t = int(newton.JointType.FREE)
+            free_of_dof = {int(mjqd[j]): j for j in range(min(len(jt), len(mjqd)))
+                           if int(jt[j]) == free_t and int(mjqd[j]) >= 0}
+            cache = (m, mjqd, free_of_dof, _mj.MjData(m),
+                     self.model.joint_qd_start.numpy(), self.model.joint_child.numpy(),
+                     self.model.body_com.numpy(), self.model.joint_X_p.numpy())
+            self._clamp_momentum_cache = cache
+        _m, mjqd, free_of_dof, s, jqds, jchild, bcom, jxp = cache
+        trees = {}                                   # free dofadr -> [(mj dof, delta)]
+        for j, dv in dqd.items():
+            if j >= len(mjqd) or int(mjqd[j]) < 0:
+                continue
+            dof = int(mjqd[j])
+            root = int(m.body_rootid[int(m.dof_bodyid[dof])])
+            if int(m.body_jntnum[root]) < 1:
+                continue
+            jr = int(m.body_jntadr[root])
+            if int(m.jnt_type[jr]) != int(_mj.mjtJoint.mjJNT_FREE):
+                continue
+            fa = int(m.jnt_dofadr[jr])
+            if fa in free_of_dof:
+                trees.setdefault(fa, (jr, []))[1].append((dof, float(dv)))
+        if not trees:
+            return 0
+        # Inertia at the CURRENT pose, on a scratch MjData: mj_data's own qM is
+        # from the start of the step, and the solver's arrays must not move.
+        s.qpos[:] = d.qpos
+        _mj.mj_kinematics(m, s)
+        _mj.mj_comPos(m, s)
+        if hasattr(_mj, "mj_makeM"):
+            _mj.mj_makeM(m, s)
+        else:
+            _mj.mj_crb(m, s)
+        nv = int(m.nv)
+        vec, res = _np.zeros(nv), _np.zeros(nv)
+        rot = _np.zeros(9)
+        for fa, (jr, lst) in trees.items():
+            vec[:] = 0.0
+            for dof, dv in lst:
+                vec[dof] += dv
+            _mj.mj_mulM(m, s, res, vec)
+            rhs = res[fa:fa + 6].copy()
+            mff = _np.empty((6, 6))
+            for k in range(6):
+                vec[:] = 0.0
+                vec[fa + k] = 1.0
+                _mj.mj_mulM(m, s, res, vec)
+                mff[:, k] = res[fa:fa + 6]
+            dvf = -_np.linalg.solve(mff, rhs)        # MuJoCo free coords
+            # -> newton's free-joint convention (convert_mj_coords_to_warp_kernel):
+            # MuJoCo: origin velocity in world, angular velocity in the body frame;
+            # newton: child-COM velocity and angular velocity, in the parent frame.
+            j = free_of_dof[fa]
+            qa = int(m.jnt_qposadr[jr])
+            _mj.mju_quat2Mat(rot, _np.asarray(d.qpos[qa + 3:qa + 7], dtype=float))
+            r_w = rot.reshape(3, 3).copy()
+            px, py, pz, pw = (float(v) for v in jxp[j][3:7])
+            _mj.mju_quat2Mat(rot, _np.array([pw, px, py, pz]))
+            r_p = rot.reshape(3, 3).copy()
+            dw_world = r_w @ dvf[3:6]
+            dv_com = dvf[0:3] + _np.cross(dw_world, r_w @ _np.asarray(bcom[int(jchild[j])], dtype=float))
+            q0 = int(jqds[j])
+            qd_arr[q0:q0 + 3] += r_p.T @ dv_com
+            qd_arr[q0 + 3:q0 + 6] += r_p.T @ dw_world
+        return len(trees)
 
     def _contact_friction_probe(self):
         """OMNISIM_NEWTON_CONTACT_FRICTION_PROBE=1: print live contact params.
@@ -10872,6 +11011,16 @@ class World:
             self._joint_clamp_on = (_bnos.environ.get(
                 "OMNISIM_NEWTON_DISABLE_JOINT_CLAMP", "0") == "0")
             self._joint_clamp_slack = self._joint_clamp_slack_from_env()
+            # ⚠ ON A FLOATING BASE THE CLAMP CONSERVES MOMENTUM (2026-10-15). The
+            # velocity cap and the stop's velocity zeroing are internal actions;
+            # their reaction now goes to the tree's free joint
+            # (_clamp_momentum_fix) instead of vanishing, which spun a free-falling
+            # UR10e at 10.7 rad/s. Fixed-base robots are unchanged. Hatch,
+            # value-parsed: OMNISIM_NEWTON_CLAMP_MOMENTUM=0 restores the old
+            # overwrite of the joint velocity alone.
+            self._clamp_momentum_on = (_bnos.environ.get(
+                "OMNISIM_NEWTON_CLAMP_MOMENTUM", "1").strip().lower()
+                not in ("0", "false", "off", "no"))
         # ⚠ SKIPPED ON MAXIMAL-COORDINATE SOLVERS. There the clamp is dead for
         # dynamics -- VBD never reads state.joint_q, and enforces limits itself
         # through its own limit slot -- but it is NOT harmless: it costs two
@@ -10916,6 +11065,27 @@ class World:
                 _bh2_clamp = self.ball_hinge2_enabled()
                 _slack_rot, _slack_lin = self._joint_clamp_slack
                 _rb_fix = []          # (q index, value) the READBACK reports
+                _vel_exempt = getattr(self, "_vel_clamp_exempt_slots", ())
+                # Floating-base trees: the clamp's reaction goes to the free joint
+                # (see _clamp_momentum_fix). Without CPU MjData to read the inertia
+                # from (mujoco_warp) their joints are exempt from the speed cap
+                # instead: an unenforced cap is better than injected momentum.
+                _float_js = (self._floating_clamp_joints()
+                             if getattr(self, "_clamp_momentum_on", True) else ())
+                _float_nocap = False
+                if _float_js:
+                    _msv = self._mjc_solver()
+                    _float_nocap = not (_msv is not None
+                                        and getattr(_msv, "use_mujoco_cpu", False)
+                                        and getattr(_msv, "mj_data", None) is not None)
+                    if _float_nocap and not getattr(self, "_clamp_momentum_warned", False):
+                        self._clamp_momentum_warned = True
+                        self._newton_log(
+                            "joint clamp: no CPU mj_data on this solver -- the velocity "
+                            "cap is NOT applied to joints of floating-base robots (it "
+                            "would inject momentum). OMNISIM_NEWTON_CLAMP_MOMENTUM=0 "
+                            "restores the old cap.")
+                _qd_before = {}       # real joint -> (qd index, value before the clamp)
                 for _slot, _real in self.slot_to_real_idx.items():
                     _spec = self.pending_revolutes[_slot]
                     # Multi-DoF (ball / hinge2) and 0-DoF (fixed) specs carry no
@@ -10937,6 +11107,12 @@ class World:
                     _qdi = int(self._qd_start_cache[_real])
                     # Velocity-limit clamp.
                     _vlim = _spec["velocity_limit"]
+                    if _slot in _vel_exempt:
+                        _vlim = 0.0      # an off motor (available torque 0) has no speed cap
+                    elif _float_nocap and _real in _float_js:
+                        _vlim = 0.0      # no inertia to conserve momentum with: leave it
+                    if _float_js and _real in _float_js and 0 <= _qdi < len(_qd_arr):
+                        _qd_before[_real] = (_qdi, float(_qd_arr[_qdi]))
                     if _vlim > 0.0 and 0 <= _qdi < len(_qd_arr):
                         _v = float(_qd_arr[_qdi])
                         if _v > _vlim:
@@ -10978,6 +11154,31 @@ class World:
                                 if 0 <= _qdi < len(_qd_arr) and _qd_arr[_qdi] > 0.0:
                                     _qd_arr[_qdi] = 0.0
                                     _qd_changed = True
+                if _qd_changed and _qd_before and not _float_nocap:
+                    _dqd = {}
+                    for _real, (_qdi, _v0) in _qd_before.items():
+                        _dv = float(_qd_arr[_qdi]) - _v0
+                        if _dv != 0.0:
+                            _dqd[_real] = _dv
+                    if _dqd:
+                        try:
+                            _nfix = self._clamp_momentum_fix(_qd_arr, _dqd)
+                        except Exception as _cme:
+                            # Never lose the clamp itself to the correction.
+                            _nfix = 0
+                            if not getattr(self, "_clamp_momentum_failed", False):
+                                self._clamp_momentum_failed = True
+                                self._newton_log("joint clamp: momentum correction failed "
+                                                 "(%r); the plain clamp applies." % (_cme,))
+                        if _nfix:
+                            self._clamp_momentum_fixes = (
+                                getattr(self, "_clamp_momentum_fixes", 0) + 1)
+                            if self._clamp_momentum_fixes == 1:
+                                self._newton_log(
+                                    "joint clamp: velocity clamped on a floating-base "
+                                    "robot; the reaction goes to its free joint so "
+                                    "momentum is conserved (OMNISIM_NEWTON_CLAMP_MOMENTUM=0 "
+                                    "restores the old clamp).")
                 if _q_changed:
                     self.state_a.joint_q.assign(_q_arr)
                 if _qd_changed:
@@ -11515,6 +11716,23 @@ class World:
             zero.add(dof_m)
         else:
             zero.discard(dof_m)
+        # ⚠ AN OFF MOTOR HAS NO SPEED LIMIT EITHER (2026-10-13). The post-step
+        # clamp holds every scalar joint to its URDF velocity limit, which models
+        # the motor's back-EMF; with the actuator switched off the joint is a
+        # free hinge and nothing caps its speed. Measured: Dexmate Vega's
+        # torso_flip (effort 0, velocity 0.1) crept onto its stop at 0.11 rad/s
+        # for 9.5 s where plain MuJoCo drops it in 0.4 s. The slot is exempted
+        # from the VELOCITY clamp only (the range clamp still applies) while its
+        # torque is 0. Hatch: OMNISIM_NEWTON_PASSIVE_VEL_CLAMP=1 keeps the cap.
+        if _os.environ.get("OMNISIM_NEWTON_PASSIVE_VEL_CLAMP", "0") == "0" and int(dof) == 0:
+            passive = self.__dict__.setdefault("_vel_clamp_exempt_slots", set())
+            before = len(passive)
+            if e == 0.0:
+                passive.add(int(slot_id))
+            else:
+                passive.discard(int(slot_id))
+            if len(passive) != before:
+                self.__dict__.pop("_fastclamp", None)    # rebuild the pre-check's limits
         self._sync_passive_armature(m, None)
         # ⚠ THE FORCE CLAMP ALONE IS NOT PASSIVE. MuJoCo's implicit integrators
         # put the velocity actuator's d(force)/d(qvel) = -kv into the

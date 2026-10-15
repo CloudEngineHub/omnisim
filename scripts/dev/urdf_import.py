@@ -42,6 +42,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import struct
 import sys
@@ -937,6 +938,26 @@ def rotate_vector_by_rpy(vector: tuple[float, float, float], rpy: tuple[float, f
     return normalize_vector(rotated)
 
 
+def inertia_in_link_frame(inertial: Inertial) -> tuple[float, float, float, float, float, float]:
+    """The declared tensor re-expressed in the link's axes: I' = R I R^T, R from the
+    <inertial><origin rpy>. Mirrors rotateUrdfInertia in OmUrdfImporter.cpp, which does
+    this since 2026-10-15 (before, the rpy was dropped and a tensor written in a rotated
+    inertial frame reached the solver unrotated). OMNISIM_URDF_INERTIAL_RPY=0 restores
+    the unrotated tensor, as it does in the engine. Returns (ixx, ixy, ixz, iyy, iyz, izz)."""
+    i = inertial
+    declared = (i.ixx, i.ixy, i.ixz, i.iyy, i.iyz, i.izz)
+    rpy = inertial.origin.rpy
+    hatch = os.environ.get("OMNISIM_URDF_INERTIAL_RPY", "").strip().lower()
+    if rpy == (0.0, 0.0, 0.0) or hatch in ("0", "false", "off", "no"):
+        return declared
+    r = rpy_to_matrix(rpy)
+    t = ((i.ixx, i.ixy, i.ixz), (i.ixy, i.iyy, i.iyz), (i.ixz, i.iyz, i.izz))
+    ri = [[sum(r[a][k] * t[k][b] for k in range(3)) for b in range(3)] for a in range(3)]
+    o = [[sum(ri[a][k] * r[b][k] for k in range(3)) for b in range(3)] for a in range(3)]
+    return (o[0][0], 0.5 * (o[0][1] + o[1][0]), 0.5 * (o[0][2] + o[2][0]),
+            o[1][1], 0.5 * (o[1][2] + o[2][1]), o[2][2])
+
+
 def joint_axis_in_parent_frame(joint: Joint) -> tuple[float, float, float]:
     return rotate_vector_by_rpy(joint.axis, joint.origin.rpy)
 
@@ -1178,10 +1199,11 @@ def emit_link_physics_and_bounding(link: Link, indent: str) -> str:
             cx, cy, cz = link.inertial.origin.xyz
             out.append(f"{indent}  centerOfMass [{cx} {cy} {cz}]\n")
         if has_urdf_inertia:
-            i = link.inertial
+            # In the link's axes: the <inertial> origin's rpy is folded in here.
+            ixx, ixy, ixz, iyy, iyz, izz = inertia_in_link_frame(link.inertial)
             out.append(f"{indent}  inertiaMatrix [\n")
-            out.append(f"{indent}    {i.ixx} {i.iyy} {i.izz}\n")
-            out.append(f"{indent}    {i.ixy} {i.ixz} {i.iyz}\n")
+            out.append(f"{indent}    {ixx} {iyy} {izz}\n")
+            out.append(f"{indent}    {ixy} {ixz} {iyz}\n")
             out.append(f"{indent}  ]\n")
         out.append(f"{indent}}}\n")
     return "".join(out)

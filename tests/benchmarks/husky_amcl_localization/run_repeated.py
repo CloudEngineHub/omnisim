@@ -24,9 +24,13 @@ import statistics
 import subprocess
 import sys
 
-from run_trial import PORTS, json_safe, pose_errors, score_trial, world_to_map
-
 HERE = Path(__file__).resolve().parent
+# Run as a script, this folder is already on sys.path; loaded by file path (as
+# test_measurement.py does, under the repo's pytest import mode) it is not.
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+from run_trial import PORTS, json_safe, pose_errors, score_trial, world_to_map  # noqa: E402
 MINIMUM_RUNS = 3
 
 

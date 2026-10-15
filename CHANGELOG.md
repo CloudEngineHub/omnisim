@@ -25,6 +25,65 @@ top of that foundation.
 ---
 
 
+## [v9.2.4] — 2026-10-15
+
+Three physics-runtime and importer fixes found running research labs' and robot makers' published
+models, and an outside AMCL localization benchmark. Each fix has a pin test that fails on the old
+engine and a value-parsed hatch that restores the old behaviour. The engine and the physics runtime
+both change, so use the v9.2.4 installer (`doctor` must read `bundle == source`).
+
+### ⚠️ Behaviour changes — read before upgrading
+
+- **A URDF `<inertial>` origin's `rpy` rotates the inertia tensor.** Both URDF importers (the
+  engine's and `scripts/dev/urdf_import.py`) used only the origin's `xyz` as the centre of mass and
+  dropped its `rpy`, so a tensor written in a rotated inertial frame reached the solver unrotated:
+  mass and centre of mass were right, the rotational inertia about each axis was not. The tensor is
+  now expressed in the link's axes (I' = R I R^T, URDF fixed-axis roll-pitch-yaw), as the URDF spec,
+  Gazebo and PyBullet do. Plain MuJoCo 3.11's own URDF import drops the `rpy` as well, so on these
+  models OmniSim and plain MuJoCo now differ. Probe: a 1 kg pendulum whose inertial frame is yawed
+  90°, released horizontal, fell 8.7 mm in its first 100 ms, like a body with the tensor unrotated;
+  it now falls 45.3 mm, exactly like the same body written pre-rotated (PyBullet: 43.7 mm for both).
+  Shipped robots that change: UR3e, UR5e and UR10e (3 of 7 links; tensor entries move by up to 39% of
+  the link's largest moment), the Trossen ALOHA arms (9 of 10 links, up to 89%), and the Deep Robotics X30
+  (three hips rolled by π, which only flips the signs of two products of inertia). Hatch:
+  `OMNISIM_URDF_INERTIAL_RPY=0`.
+- **The joint speed cap no longer pushes a free-floating robot around.** After every step the
+  physics runtime caps each joint at its `maxVelocity` (URDF `velocity`), and zeroes a joint's
+  velocity into a stop it has overrun, by overwriting that joint's velocity. On a fixed base the
+  world takes the reaction; on a floating base nothing did, so the momentum the cap removed came
+  back as base motion. A free-falling UR10e whose saturated shoulder-pan servo was capped spun at
+  10.7 rad/s about z within 25 ms and slid 2.1 m sideways in 0.5 s, where plain MuJoCo just falls.
+  The robot's floating base now takes the reaction: the correction holds the robot's linear and
+  angular momentum and leaves every other joint's velocity as before. The same UR10e now falls
+  straight (base 0.0 mm sideways at 0.5 s, wrist below 0.13 rad/s), and a two-link probe's angular
+  momentum ends at 5e-4 kg·m²/s instead of 3.3. Fixed-base robots are bit-identical. On
+  `mujoco_warp` a floating robot's joints are not speed-capped instead. Hatch:
+  `OMNISIM_NEWTON_CLAMP_MOMENTUM=0`.
+- **A motor with zero torque is not held to its speed limit.** v9.2.3 made a motor with zero
+  available torque passive, but the runtime's post-step cap still held its joint to `maxVelocity`,
+  which models a motor's top speed; an off motor has none. Found re-running Dexmate's Vega-1u: its
+  passive `torso_flip` (URDF effort 0, velocity 0.1, 15.7 kg above it) crept onto its stop at
+  0.11 rad/s for 9.5 s, where plain MuJoCo drops it in 0.4 s. A joint whose available torque is 0
+  is now exempt from the speed cap (its range limits still apply); restoring torque restores the
+  cap. Hatch: `OMNISIM_NEWTON_PASSIVE_VEL_CLAMP=1` keeps the cap.
+
+### Added
+
+- **A manual Husky AMCL localization benchmark** (`tests/benchmarks/husky_amcl_localization/`):
+  stock ROS 2 Jazzy AMCL on the known-wall Husky world, with initial and post-motion stationary
+  localization errors measured against independent harness poses, convergence and jitter, and a
+  sequential cold-start repeat runner. AMCL gets simulator ground-truth odometry, so it does not
+  measure robustness to wheel-odometry drift. It needs Linux or WSL2 with ROS 2 Jazzy. Thanks to
+  @LingZhen07 (#28).
+
+### Known issues
+
+- Two tests fail, and neither is caused by this release's fixes:
+  `tests/test_newton_ik_slots.py::test_reachable_target_is_actually_solved` (a floating-base IK
+  target is solved to 0.157 m instead of 1 mm; identical with the v9.2.3 runtime) and the engine
+  test `tests/test_urdf_empty_link_carries_fixed_subtree.py` (2.4 mm against a 1 mm tolerance;
+  identical with both new hatches set).
+
 ## [v9.2.3] — 2026-10-12
 
 Friction and motor fixes found running robot makers' published models (Neobotix MP-400, Clearpath
