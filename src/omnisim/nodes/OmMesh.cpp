@@ -286,13 +286,9 @@ void OmMesh::updateTriangleMesh(bool issueWarnings) {
     node = queue.front();
     queue.pop_front();
 
-    // compute absolute transform of this node from all the parents
-    aiMatrix4x4 transform;
-    const aiNode *current = node;
-    while (current != NULL) {
-      transform *= current->mTransformation;
-      current = current->mParent;
-    }
+    // absolute transform of this node: root * ... * parent * node (it was
+    // composed leaf-first until 2026-10-15, see omAssimpNodeWorldTransform)
+    const aiMatrix4x4 transform = omAssimpNodeWorldTransform(node);
 
     // merge all the meshes of this node
     for (unsigned int i = 0; i < node->mNumMeshes; ++i) {

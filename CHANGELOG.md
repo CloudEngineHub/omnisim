@@ -25,6 +25,83 @@ top of that foundation.
 ---
 
 
+## [v9.2.5] — 2026-10-17
+
+Two fixes found running robot makers' published models: OmniLink arms now hold the pose they are given
+under gravity and lift clear between targets, and a Collada mesh with instanced geometry lands where
+the file puts it. Each has a pin test and a value-parsed hatch. The arm bridge and the engine both
+change, so use the v9.2.5 installer.
+
+### ⚠️ Behaviour changes — read before upgrading
+
+- **OmniLink arm bridges hold the commanded pose under gravity, and report honestly when they don't.**
+  The engine's position servo is a spring (stiffness 10 × the URDF effort, no integral term), and the
+  bridge never closed the loop, so every arm sagged: HEBI's A-2240-06 hovered 21-22 mm below a 5 cm
+  target, the UR5e chat arm reached 10-11 mm off and sat 0.027 rad low at home, OmniArm 6 15-16 mm and
+  0.016 rad. The bridge now integrates each joint's error into a bounded setpoint offset (a 0.05 rad
+  sag band, per-arm `gravity_trim_band_rad`; torque still capped at the URDF effort) that only
+  integrates inside the settle window, rolls back to the last converged value if a hold never
+  converges (a joint blocked by contact no longer winds up), and never carries into the next motion.
+  `settled` now means every joint is within 1.5 mrad (before: "0.15 s went by"); a hold that doesn't
+  get there reports `settled: false` with the measured error, and one cut short by the next command
+  reports `settled: null, cut_short: true` with no `motion.unsettled` event (`get_robot_state.settling`
+  says a window is open). `set_tcp_target` / `set_tcp_pose` solve to 0.2 mm and report
+  `within_tolerance` against 3 mm and the residuals of the solve actually used. Measured after: HEBI
+  hovers 4.96 / 5.00 cm (0.38 / 0.17 mm), UR5e reaches 0.67 / 0.50 mm, OmniArm 6 0.44 / 0.32 mm,
+  homes within ~1 mrad; the 2F-140 pick error fell from 37.7 to 5.1 mm and it still picks, holds and
+  places (machine 9722d23d12a3). Hatch: `OMNISIM_ARM_GRAVITY_TRIM=0`.
+- **Arms lift before a lateral move.** Joint-space moves skimmed: HEBI's tool passed 0.8-0.9 mm above
+  the tags and its housing went inside them. A move more than 4 cm sideways now goes up (6 cm,
+  `lift_height_m`), across and down, `reset_to_home` from a low pose retreats straight up first, and
+  each result reports the lowest tool height on the way, measured at the commanded tool offset. There
+  is no obstacle model: an arm under a shelf can hit it on the lift. On a connected REAL arm the path
+  is not forwarded (the hardware API takes no waypoints); results say so in `hardware_path`. Hatch:
+  `OMNISIM_ARM_LIFT_BEFORE_MOVE=0`. With both hatches at 0 the old behaviour returns exactly.
+- **A stop, reset or preempt that arrives while a goal is being planned now wins.** Planning a coordinate
+  verb takes ~0.1-0.4 s; the slot is held as `planning` and the plan is committed only if no newer
+  command arrived, otherwise the verb returns `superseded: true, started: false`. A second goal verb
+  during planning gets a 409.
+
+### Added
+
+- `locate_objects` returns each object in both the world and the arm-base frame (a model had put a
+  world height into the base frame, hovering 7 cm while reporting 5); reach results report the measured
+  height over the object below. `OMNISIM_ARM_TCP_TRACE=<file>` writes a per-tick trace with the robot id.
+  Pins: `packages/omnisim-bridges/tests/test_arm_gravity_trim_and_lift.py` (21 engine-free tests: sag,
+  windup, carry-over, stop-during-plan, cut-short, honest residuals, trace).
+
+### Fixed
+
+- **A Collada mesh with instanced geometry under a translated node lands where the file puts it.**
+  `OmMesh` (every `Mesh` geometry, so every mesh collider the solver sees) and `OmCadShape` composed a
+  node's absolute transform leaf-first (`node * parent * ... * root`, inherited from Webots) where the
+  vertices need `root * ... * parent * node`. The two agree only when one level carries a transform,
+  and a Collada file always has two: the up-axis rotation on the root, and the node of any geometry
+  instanced more than once, which `aiProcess_OptimizeGraph` keeps. Found on Rover Robotics' MEGA
+  (`roverrobotics_ros2` @ `c7c2d0d`): `mega_wheels.dae` reached the solver 26.5 mm off its axle and
+  `mega_payload.dae` up to 0.96 m out of place. Measured on the MEGA as published, 0.5 m/s commanded
+  at the plugin's 0.155 m wheel radius, CPU MuJoCo, 1 ms step: before, the wheels stalled at 1.21 of
+  3.23 rad/s against the 10 N·m default torque, the base made 0.244 m/s and tilted 3.2°; after, the
+  wheels reach 3.225 rad/s and the base makes **0.843 m/s** (the 1.69× the URDF's copied wheel radius
+  implies; plain MuJoCo 0.845), level within 0.04° and 0.23 mm. At the mesh's own radius it makes
+  0.4983 m/s (before 0.258), the figure plain MuJoCo gives on the same hull, and on its wheels alone
+  the base rides within 0.28 mm (before ±2.7 cm). None of the 82 Collada files in this
+  repository moves (each is one node deep or its transforms commute). Both node walks now share
+  `omAssimpNodeWorldTransform()` (`OmAssimpIoSystem.cpp`); `OMNISIM_MESH_NODE_TRANSFORM_FIX=0`
+  (value-parsed) restores the leaf-first product. Pins: `tests/test_mesh_collada_node_transform_order.py`
+  (reads the collider back from the solver model; the hatch run reproduces the old placement) and the
+  engine-free `tests/test_mesh_node_transform_order_source.py`.
+
+### Documented
+
+- `docs/developer/urdf-import-debugging.md`: a driven URDF joint with no `<limit>` imports with the
+  `RotationalMotor` defaults (10 N·m, 10 rad/s); and a chassis promoted to the Robot root past an
+  empty root frame (Rover MEGA / MAX 150, TurtleBot3 Burger) is the Robot's own `boundingObject`, so
+  `newtonRobotColliders FALSE` keeps it off the solver by design — links fixed below it still collide.
+
+---
+
+
 ## [v9.2.4] — 2026-10-15
 
 Three physics-runtime and importer fixes found running research labs' and robot makers' published

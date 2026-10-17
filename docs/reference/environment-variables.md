@@ -13,7 +13,7 @@ read anywhere in the engine files it under **Engine** even when scripts read it 
 its **Kind** is decided by the read sites in that layer (a test asserting on an env dict
 or a shell pass-through is listed, but does not outvote the engine).
 
-**Summary:** 505 variables, 54 presence-gated, 13 mixed, 227 documented nowhere before this page.
+**Summary:** 509 variables, 54 presence-gated, 13 mixed, 227 documented nowhere before this page.
 
 **Kind** is a heuristic read of the code around each read site:
 
@@ -35,7 +35,7 @@ carries no comment there.
 
 ## Engine (`src/omnisim`)
 
-301 variables.
+302 variables.
 
 | Variable | Kind | Read at | Description |
 |---|---|---|---|
@@ -102,6 +102,7 @@ carries no comment there.
 | `OMNISIM_LOCK_INSTALLATION` *(undocumented elsewhere)* | value | `src/omnisim/core/OmFileUtil.cpp:174` | OmniSim is a developer- and agent-oriented distribution: its sample worlds and projects live in the repository and are meant to be edited in place (and... |
 | `OMNISIM_LOG_PATH` | string | `src/omnisim/core/OmLog.cpp:77`, `omnisim/conformance/checks.py:89`, `scripts/harness/omnisim_harness.py:2690`, `scripts/dev/headless_runner.py:1173`, `scripts/dev/run_g1_parity_probe.ps1:89` (+22 more) | Honour OMNISIM_LOG_PATH: the engine writes its log there when set (OmLog reads it as an override), so the harness must read the same file or... |
 | `OMNISIM_LOG_TIMESTAMPS` | value | `src/omnisim/core/OmLog.cpp:60` | Per-call flush so the log file is observable from outside the process between writes (headless_runner tails it; debugging sessions follow it live). The... |
+| `OMNISIM_MESH_NODE_TRANSFORM_FIX` | value | `src/omnisim/nodes/OmAssimpIoSystem.cpp:167` | OMNISIM_MESH_NODE_TRANSFORM_FIX: compose node transforms root-first (the fix, default) or leaf-first (=0, the pre-2026-10-15 product). Value-parsed. |
 | `OMNISIM_MPM_ALLOW_CPU` *(undocumented elsewhere)* | value | `src/omnisim/physics/omnisim_newton_runtime.py:7086` | ---- MPM REQUIRES CUDA, AND THIS REFUSES RATHER THAN DEGRADES ----- ⚠ THE ONLY HARD DEVICE REQUIREMENT IN THIS FILE, and it is a refusal because the CPU... |
 | `OMNISIM_MPM_MAX_ACTIVE_CELLS` *(undocumented elsewhere)* | int | `src/omnisim/physics/omnisim_newton_runtime.py:5659` |  |
 | `OMNISIM_MPM_PROXY_MASS_SCALE` *(undocumented elsewhere)* | int | `src/omnisim/physics/omnisim_newton_runtime.py:6143` | ---- MPM: ONE MORE ENTRY AND ONE MORE PROXY ---------------------- A bed adds an "mpm" entry owning only its own particles, plus a mjc -&gt; mpm proxy so... |
@@ -372,7 +373,7 @@ carries no comment there.
 
 | Variable | Kind | Read at | Description |
 |---|---|---|---|
-| `OMNISIM_BINARY` | string | `scripts/harness/omnisim_harness.py:1767`, `scripts/dev/headless_runner.py:108`, `scripts/dev/measure_urdf_lidar.py:166`, `scripts/dev/render_ab.py:194`, `scripts/dev/render_ab.py:370` (+29 more) | OMNISIM_BINARY: an explicit engine path wins, exactly as it does for run-headless (scripts/dev/headless_runner.py find_binary) -- so a scratch build (make... |
+| `OMNISIM_BINARY` | string | `scripts/harness/omnisim_harness.py:1767`, `scripts/dev/headless_runner.py:108`, `scripts/dev/measure_urdf_lidar.py:166`, `scripts/dev/render_ab.py:194`, `scripts/dev/render_ab.py:370` (+30 more) | OMNISIM_BINARY: an explicit engine path wins, exactly as it does for run-headless (scripts/dev/headless_runner.py find_binary) -- so a scratch build (make... |
 | `OMNISIM_HARNESS_ENGINE_MODE` | string | `scripts/harness/omnisim_harness.py:6615` |  |
 
 ## Scripts (`scripts/`)
@@ -457,11 +458,12 @@ carries no comment there.
 
 ## Packages (`packages/`)
 
-20 variables.
+21 variables.
 
 | Variable | Kind | Read at | Description |
 |---|---|---|---|
 | `OMNISIM_ALLOWED_ORIGINS` | string | `packages/omnisim-bridges/src/omnisim_bridges/http_security.py:89` |  |
+| `OMNISIM_ARM_TCP_TRACE` | string | `packages/omnisim-bridges/tests/test_arm_gravity_trim_and_lift.py:200`, `projects/samples/demos/controllers/omnilink_arm_bridge/omnilink_arm_bridge.py:1862` | Per-tick TCP trace for measuring a path's clearance offline: a JSONL file path, unset = off. One line per sim tick (robot id, sim time, motion kind + seq... |
 | `OMNISIM_BRIDGE_EVENT_CAPACITY` | int | `packages/omnisim-bridges/src/omnisim_bridges/events.py:93` | 512 events at the ~1-5 events/second a bridge actually produces is minutes of headroom, and the ring is per-bridge-process rather than per-world, so the... |
 | `OMNISIM_BRIDGE_HARNESS_EVENTS` | value | `packages/omnisim-bridges/src/omnisim_bridges/events.py:782` | Start a feed iff `OMNISIM_HARNESS_URL` names one. `OMNISIM_BRIDGE_HARNESS_EVENTS=0` opts out (value-parsed) for a session that wants the harness attached... |
 | `OMNISIM_BRIDGE_HOLD_LEASE_MS` | int | `packages/omnisim-bridges/src/omnisim_bridges/hold.py:139` | OMNISIM_BRIDGE_HOLD_LEASE_MS overrides how long a lockstep hold may keep the world frozen before it lifts itself, in milliseconds. A hold is leased rather... |
@@ -484,10 +486,12 @@ carries no comment there.
 
 ## Everything else (tests, samples, resources, CI workflows)
 
-105 variables.
+107 variables.
 
 | Variable | Kind | Read at | Description |
 |---|---|---|---|
+| `OMNISIM_ARM_GRAVITY_TRIM` | value | `projects/samples/demos/controllers/omnilink_arm_bridge/omnilink_arm_bridge.py:1826` | Gravity-sag trim: an integral setpoint offset that cancels the engine servo's sag under load, and `settled` as a convergence verdict (see TRIM_KI).... |
+| `OMNISIM_ARM_LIFT_BEFORE_MOVE` | value | `projects/samples/demos/controllers/omnilink_arm_bridge/omnilink_arm_bridge.py:1833` | Lift before a lateral move: Cartesian up/across/down paths for set_tcp_target / set_tcp_pose and a straight-up retreat before reset_to_home (see LIFT_H_M).... |
 | `OMNISIM_BENCH_BINARY` *(undocumented elsewhere)* | string | `tests/benchmarks/optim_bench.py:60` | --- binary discovery ---------------------------------------------------- |
 | `OMNISIM_BH2_PROBE_OUT` *(undocumented elsewhere)* | string | `tests/physics/controllers/ball_hinge2_probe/ball_hinge2_probe.py:150` |  |
 | `OMNISIM_BUMPER_PROBE_OUT` *(undocumented elsewhere)* | string | `tests/physics/controllers/touch_bumper_probe/touch_bumper_probe.py:74` | A bumper is a per-step latch that resets once read, so a settled contact can still miss the odd sample; the DUTY over a resting window is the honest... |

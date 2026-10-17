@@ -45,6 +45,54 @@ interpreter by 23 points. With the case corrected the parser scores 90.0% with
 
 This guide uses a **wheeled mobile base** as the example — the class with the fully generic, config-driven bridge, and the one a new URDF robot most often lands in.
 
+### If your robot is an arm: how the bridge holds a pose and moves between points
+
+The engine's position servo is a spring-damper (stiffness 10 x the URDF effort) with no
+integral term, so an arm under gravity used to sit short of every commanded pose and still
+report `settled: true`. Since 2026-10-17 the arm bridge fixes that itself, with no config
+field needed:
+
+- **Gravity-sag trim.** While the arm holds, each joint's measured error is integrated into an
+  offset on the setpoint the bridge writes, so the joint converges on the commanded angle. The
+  torque this asks for is still clipped at the URDF effort limit. The trim is bounded by an
+  expected sag band (0.05 rad per joint; per-arm `gravity_trim_band_rad`): only errors inside
+  the band are integrated and the trim never exceeds it. A hold integrates for at most 3 s of
+  sim time after it settles; if it has not converged by then (a joint pressed against
+  something), the trim rolls back to its last converged value and stops integrating, and a new
+  motion that starts from a hold that had not converged rolls it back too.
+- **`settled` is a convergence verdict.** It means every joint got within 1.5 mrad (`settle` in
+  the result carries the measured worst error); a pose the arm cannot reach in 3 s of sim time
+  is reported `settled: false`. A result whose settle window was cut short by the next command
+  reports `settled: null` with `cut_short: true` (not measured, no `motion.unsettled` event);
+  `get_robot_state.settling` is true while a result is still being measured. A joint commanded
+  exactly at its declared limit with gravity pulling it off the stop cannot be trimmed past the
+  limit, so it reports `settled: false` -- that is the true answer and is left as is.
+- **TCP accuracy.** `set_tcp_target` (and `set_tcp_pose`) is solved to 0.2 mm and reports
+  `within_tolerance` against a 3 mm `tcp_tolerance_m`.
+- **Lift before a lateral move.** A `set_tcp_target` / `set_tcp_pose` more than 4 cm sideways
+  goes straight up (`lift_height_m`, default 6 cm above the lower end), across, and straight
+  down, instead of a joint-space line that can dip; `reset_to_home` from a low pose retreats
+  straight up first. Each such result carries `path` (the plan) and `path_min_tcp_z_m`, the
+  lowest the commanded tool point went, measured every sim tick. There is **no obstacle
+  model**: `lift_height_m` is the only clearance control. The path runs in the simulation only:
+  a real arm attached through a hardware backend is sent one straight `move_linear` (or its own
+  `reset_to_home`), because the hardware API takes no waypoints, and the reply's
+  `hardware_path` says so.
+- **Stops win.** A coordinate verb plans its path (~0.1-0.4 s of IK) behind a busy `planning`
+  placeholder; a `stop_robot` or `reset_to_home` that lands meanwhile cancels it, and the
+  dropped command reports `superseded: true, started: false` -- the arm never moves for it.
+
+Measured on the shipped chat worlds (UR5e, OmniArm 6, Newton CPU solver, machine
+`9722d23d12a3` -- RTX 3060 laptop, `python projects/policies/common/env_fingerprint.py`): the
+home pose went from 0.027 / 0.016 rad of shoulder sag to under 1.5 mrad, and a
+`set_tcp_target` reach from 10-16 mm of error to under 1 mm; on the UR5e the move home from a
+0.15 m hover used to pass 1.8 cm below it and now never goes below it. Hatches, both
+value-parsed: `OMNISIM_ARM_GRAVITY_TRIM=0` (old servo, old settle verdict, old IK tolerance)
+and `OMNISIM_ARM_LIFT_BEFORE_MOVE=0` (old joint-space moves); the old behaviour exactly needs
+**both** at 0, because the lift path is independent of the trim. `OMNISIM_ARM_TCP_TRACE=<file>`
+writes one JSONL line per sim tick (robot id, measured joints, FK tool point, trim) for
+checking a path's clearance yourself.
+
 ---
 
 ## Step 2 — add a config entry

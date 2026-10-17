@@ -39,7 +39,7 @@ The recorded result is simulation, not a hardware demonstration.
   the driver itself is yours to wire, and no policy trained here has been validated on hardware —
   see the [sim-to-real guide](docs/guide/omnilink-sim-to-real.md).
 - **Don't know how to program it?** Let an agent help build and debug it. The first-party
-  [MCP server](packages/omnisim-mcp/) gives Claude Code and Cursor 37 tools onto a running
+  [MCP server](packages/omnisim-mcp/) gives Claude Code and Cursor 46 tools onto a running
   simulation, and when the robot misbehaves the agent can ask what actually happened — every
   contact, every joint limit, every grip, every line your controller printed, on one cursor-paged
   HTTP stream. On the CPU solver (`newtonSolver "mujoco"`, the default) the same scene runs
@@ -235,7 +235,7 @@ The first two rows are the debugger; the rest are how an agent reaches it.
 | Typed runtime events | **10**, with drop counters | — | — |
 | Structured load diagnostics | **50+ codes** (open enum; `GET /capabilities` serves the live set) | — | — |
 | First-party HTTP/JSON scene API | **38 endpoints** | none | none |
-| First-party MCP server | **37 tools**, stdio, zero deps — each one HTTP call to the same harness a human drives | none | **5 tools — docs search; none touch a running sim** |
+| First-party MCP server | **46 tools**, stdio, zero deps — each one HTTP call to the same harness a human drives | none | **5 tools — docs search; none touch a running sim** |
 | Typed external control | 38 harness + 15 capture verbs, **plus ROS 2 `simulation_interfaces` (15 svc + 1 action) and a `ros2_control` `SystemInterface`** | ROS 2 `simulation_interfaces` (18 svc + 1 action) + `ros2_control` | ROS 2 + `ros2_control`, **plus raw Python over TCP :8226** |
 | `AGENTS.md` at repo root | **701 lines** | none | **yes, + 25 `SKILL.md` skills** |
 

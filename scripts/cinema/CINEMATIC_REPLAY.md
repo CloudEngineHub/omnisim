@@ -63,12 +63,16 @@ python -m omnisim cinema replay-review film.json --notes "Describe the actual re
 python -m omnisim cinema render film.json --profile final --blender "/path/to/blender" --device OPTIX
 ```
 
-Blender on PATH is discovered automatically, as are standard Windows installs.
+Blender on PATH is discovered automatically, as are standard Windows installs
+(the installer under Program Files and the per-user portable layout under
+`%LOCALAPPDATA%\Programs\Blender Foundation`; the highest version wins).
 `--device CPU` is the portable default; select OPTIX/CUDA/HIP/METAL/ONEAPI when
 available. A requested unavailable device fails explicitly. Install Blender and
 ffmpeg locally; the CLI does not install software, spend cloud credits or launch
-a simulation. The implementation was exercised with Blender 4.4.3; other
-versions need a short local smoke render before a large production.
+a simulation. The implementation was exercised with Blender 4.4.3 and passed a
+proxy smoke render on Blender 5.2.2 LTS (2026-10-15: zero bake drift over 24
+frames, slotted actions); other versions need a short local smoke render before
+a large production.
 
 `render` defaults to the **proxy**, at 50% resolution and eight Cycles samples.
 Final uses the manifest resolution and 32 samples. Both use the same frame rate,

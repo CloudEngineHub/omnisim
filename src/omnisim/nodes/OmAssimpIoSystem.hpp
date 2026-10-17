@@ -31,6 +31,9 @@
 
 #include <assimp/IOStream.hpp>
 #include <assimp/IOSystem.hpp>
+#include <assimp/matrix4x4.h>
+
+struct aiNode;
 
 class OmAssimpIoSystem : public Assimp::IOSystem {
 public:
@@ -39,5 +42,20 @@ public:
   Assimp::IOStream *Open(const char *file, const char *mode = "rb") override;
   void Close(Assimp::IOStream *stream) override;
 };
+
+// The absolute (scene-root) transform of an Assimp node: root * ... * parent * node,
+// the order that maps the node's mesh vertices into the scene frame. Shared by
+// OmMesh and OmCadShape, which both walk the node graph.
+//
+// Both used to compose it leaf-first (node * parent * ... * root, inherited from
+// Webots), which is the right answer only when at most one level carries a
+// transform. Collada always has two: the importer's own up-axis rotation on the
+// root, and any node translation that aiProcess_OptimizeGraph cannot bake away
+// (it keeps the node of every mesh that is instanced more than once). Found
+// 2026-10-15 on Rover Robotics' MEGA: mega_wheels.dae came out 26.5 mm off its
+// axle (the base bounced +/-2.7 cm and the wheels stalled), mega_payload.dae
+// up to 0.96 m out of place. OMNISIM_MESH_NODE_TRANSFORM_FIX=0 (value-parsed)
+// restores the leaf-first product.
+aiMatrix4x4 omAssimpNodeWorldTransform(const aiNode *node);
 
 #endif

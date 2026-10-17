@@ -1598,6 +1598,9 @@ class ArmBridge:
         # so a refusal can say WHICH motion it is waiting on (see
         # _begin_motion); `ticks` is only read for diagnostics.
         self.motion_seq = 0
+        # The verb of the most recent slot claim (names who superseded a
+        # motion that was dropped while it was being planned).
+        self._claim_verb = None
         # ACTION RESULT CONTRACT (PROTOCOL.md 5.4.1), the completion half.
         # `_begin_motion` already claims the slot; this is where tick() writes
         # what the motion ACTUALLY did once it ends. `accepted: true` plus the
@@ -1815,6 +1818,54 @@ class ArmBridge:
                  and _os.environ.get("OMNILINK_INTENTS", "1")
                  .strip() not in ("0", "false", "no")) else None)
 
+        # Gravity-sag trim: an integral setpoint offset that cancels the engine
+        # servo's sag under load, and `settled` as a convergence verdict (see
+        # TRIM_KI). Value-parsed: =0/false/off/no restores the pre-2026-10-17
+        # servo, settle verdict and IK tolerance exactly.
+        self.gravity_trim_on = (
+            _os.environ.get("OMNISIM_ARM_GRAVITY_TRIM", "1").strip().lower()
+            not in ("0", "false", "off", "no"))
+        # Lift before a lateral move: Cartesian up/across/down paths for
+        # set_tcp_target / set_tcp_pose and a straight-up retreat before
+        # reset_to_home (see LIFT_H_M). Value-parsed: =0 restores the old
+        # joint-space moves exactly.
+        self.lift_on = (
+            _os.environ.get("OMNISIM_ARM_LIFT_BEFORE_MOVE", "1").strip().lower()
+            not in ("0", "false", "off", "no"))
+        self._trim = [0.0] * len(self.joint_names)
+        # The trim as it stood the last time a hold CONVERGED. A hold that
+        # does not converge (a joint pressed against something, a pose the
+        # servo cannot hold) rolls back to this, so a trim wound up against
+        # an obstruction is never carried into the next motion.
+        self._trim_good = [0.0] * len(self.joint_names)
+        # The expected gravity-sag band: only errors inside it are
+        # integrated, and the trim is clamped to it (see TRIM_BAND_RAD).
+        self.trim_band = float(cfg.get("gravity_trim_band_rad",
+                                       self.TRIM_BAND_RAD))
+        self.lift_h = float(cfg.get("lift_height_m", self.LIFT_H_M))
+        # Motor velocity caps, read ONCE here on the sim thread: the path
+        # planner runs on HTTP threads and must not issue device reads.
+        self._vmax = []
+        for m in self.motors:
+            v = None
+            try:
+                v = float(m.getMaxVelocity()) if m is not None else None
+            except Exception:
+                v = None
+            self._vmax.append(v if (v and v > 0 and math.isfinite(v))
+                              else 2.0)
+        # Per-tick TCP trace for measuring a path's clearance offline: a JSONL
+        # file path, unset = off. One line per sim tick (robot id, sim time,
+        # motion kind + seq, measured q, FK TCP in the arm base frame, trim),
+        # flushed per line and closed at world shutdown.
+        self._trace_f = None
+        _trace = _os.environ.get("OMNISIM_ARM_TCP_TRACE", "").strip()
+        if _trace:
+            try:
+                self._trace_f = open(_trace, "a", encoding="utf-8")
+            except OSError as e:
+                print(f"[omnilink_arm_bridge] OMNISIM_ARM_TCP_TRACE: {e}")
+
         # Apply home pose immediately so we don't drop under gravity
         # before the first command lands.
         for motor, q in zip(self.motors, self.home_pose):
@@ -1976,12 +2027,194 @@ class ArmBridge:
             q.append(fallback)
         return q
 
-    def _set_q(self, q: List[float]) -> List[float]:
+    def _set_q(self, q: List[float], trim: bool = True) -> List[float]:
+        """Write a joint setpoint. Returns the COMMANDED (clamped) vector.
+
+        With the gravity trim on, what reaches the motors is commanded +
+        trim (clamped again to the limits) -- the offset that makes a
+        spring-damper servo converge on the commanded angle under load. The
+        return value is still the commanded vector, so every caller's notion
+        of "what was asked for" is unchanged."""
         clamped = clamp_q(q, self.joint_limits)
-        for motor, qi in zip(self.motors, clamped):
+        out = clamped
+        if trim and self.gravity_trim_on:
+            out = clamp_q([c + t for c, t in zip(clamped, self._trim)],
+                          self.joint_limits)
+        for motor, qi in zip(self.motors, out):
             if motor is not None:
                 motor.setPosition(qi)
         return clamped
+
+    def _trim_update(self, q_cmd: List[float]) -> None:
+        """One integral step of the gravity-sag trim, from this tick's
+        measured joints (self.last_q) toward the commanded hold `q_cmd`.
+
+        The trim is for GRAVITY SAG and nothing else, so it is bounded by the
+        sag band (TRIM_BAND_RAD, per-arm `gravity_trim_band_rad`) twice over:
+        an error outside the band is not integrated at all (the arm is
+        travelling, or held off by something bigger than gravity), and the
+        trim itself is clamped to +-band. Commanded + trim may also not leave
+        the joint's declared range (a joint parked on its stop must not wind
+        a trim it can never use).
+
+        ⚠️ A joint held off by CONTACT by less than the band (pressing on a
+        bench, a part, another link) DOES integrate, up to the band -- an
+        integrator cannot tell a small obstruction from sag. What stops that
+        windup reaching the next motion is the hold's integration window and
+        the roll-back to the last converged trim (_trim_hold_tick), not this
+        function."""
+        dt = self.timestep / 1000.0
+        k = self.TRIM_KI * dt
+        band = self.trim_band
+        for j, (c, m) in enumerate(zip(clamp_q(q_cmd, self.joint_limits),
+                                       self.last_q)):
+            if j >= len(self._trim) or self.sensors[j] is None:
+                continue
+            e = c - m
+            if not math.isfinite(e) or abs(e) > band:
+                continue
+            t = clamp(self._trim[j] + k * e, -band, band)
+            lo, hi = self.joint_limits[j]
+            self._trim[j] = clamp(c + t, lo, hi) - c
+
+    def _hold_worst_err(self, q_cmd: List[float]) -> float:
+        cmd = clamp_q(q_cmd, self.joint_limits)
+        return max((abs(c - m) for c, m, s in
+                    zip(cmd, self.last_q, self.sensors) if s is not None),
+                   default=0.0)
+
+    def _trim_rollback(self) -> None:
+        """Back to the trim of the last CONVERGED hold. Called when a hold
+        gives up (SETTLE_MAX_S without converging) and when a new external
+        motion starts from a hold that had not converged: whatever the
+        integrator wound up against there is not gravity, and must not ride
+        into the next motion as a feed-forward."""
+        self._trim = list(self._trim_good)
+
+    def _trim_hold_tick(self, hold: dict, sim_time_s: float) -> None:
+        """The trim's per-tick work for a hold (sim thread, under the lock).
+
+        Integrates only inside the hold's window -- SETTLE_S + SETTLE_MAX_S
+        of sim time from the moment it began holding, extended with the
+        settle deadline by a TCP correction. A hold that is converged when
+        the window closes keeps its trim (and the trim is remembered as the
+        last good one every converged tick); a hold that is NOT rolls back
+        to the last good trim and stops integrating, so a joint pressed
+        against an obstruction cannot keep winding a setpoint offset for as
+        long as it is left there."""
+        if hold.get("_trim_frozen"):
+            return
+        until = hold.get("_trim_until_s")
+        if until is None:
+            until = sim_time_s + self.SETTLE_S + self.SETTLE_MAX_S
+            hold["_trim_until_s"] = until
+        worst = self._hold_worst_err(hold["q"])
+        if sim_time_s >= until:
+            hold["_trim_frozen"] = True
+            if worst > self.SETTLE_TOL_RAD:
+                self._trim_rollback()
+                hold["_trim_rolled_back"] = True
+            return
+        self._trim_update(hold["q"])
+        if worst <= self.SETTLE_TOL_RAD:
+            self._trim_good = list(self._trim)
+
+    def _settle_check(self, hold: dict, q_cmd: List[float],
+                      sim_time_s: float) -> Optional[dict]:
+        """Has the arm CONVERGED on its hold? None = keep waiting; a dict =
+        the settle verdict to record (converged true, or false at the
+        SETTLE_MAX_S deadline). Called once SETTLE_S has elapsed.
+
+        ⚠️ KNOWN, DOCUMENTED FALSE NEGATIVE: a joint commanded exactly AT its
+        declared limit, with gravity pulling it off the stop, cannot be
+        trimmed past the limit (commanded + trim is clamped to the range), so
+        it stays short and the verdict is settled: false. That is the true
+        answer about the joint -- it is not where it was told to be -- and it
+        is left that way on purpose."""
+        worst = self._hold_worst_err(q_cmd)
+        if worst <= self.SETTLE_TOL_RAD:
+            hold["_streak"] = hold.get("_streak", 0) + 1
+        else:
+            hold["_streak"] = 0
+        converged = hold["_streak"] >= self.SETTLE_STREAK
+        deadline = hold.get("_settle_deadline_s")
+        if deadline is None:
+            deadline = hold.get("_trim_until_s",
+                                sim_time_s + self.SETTLE_MAX_S)
+            hold["_settle_deadline_s"] = deadline
+        if not converged and sim_time_s < deadline:
+            return None
+        if not converged and not hold.get("_trim_frozen"):
+            # Gave up: stop integrating, and do not keep what was wound up.
+            hold["_trim_frozen"] = True
+            self._trim_rollback()
+            hold["_trim_rolled_back"] = True
+        out = {
+            "converged": bool(converged),
+            "tolerance_rad": self.SETTLE_TOL_RAD,
+            "max_abs_joint_error_rad": round(worst, 6),
+            "settle_s": round(sim_time_s - hold.get("_ended_s", sim_time_s), 4),
+            "trim_rad": [round(t, 5) for t in self._trim],
+            "basis": ("joint sensors vs the commanded hold, every sim tick; "
+                      "the bridge's integral trim cancels the servo's "
+                      "gravity sag (OMNISIM_ARM_GRAVITY_TRIM)"),
+        }
+        if hold.get("_trim_rolled_back"):
+            out["trim_rolled_back"] = True
+            out["trim_note"] = ("the hold did not converge, so the trim was "
+                                "rolled back to the last converged value "
+                                "(whatever held the joint off is not gravity "
+                                "sag, and is not carried into the next "
+                                "motion)")
+        return out
+
+    # A re-solve has to move SOME joint by more than this to count as a
+    # correction (a "correction" that changed nothing is not reported).
+    TCP_CORRECTION_MIN_DQ_RAD = 1e-4
+
+    def _tcp_correction(self, hold: dict) -> bool:
+        """A converged set_tcp_target whose measured tool point is still
+        outside TCP_TOL_M: re-solve the position IK SEEDED FROM THE MEASURED
+        JOINTS toward the commanded point plus the measured miss
+        (cmd + (cmd - measured)), so whatever the joints still leave short
+        -- an IK residual, a joint error inside the settle tolerance on a
+        long lever -- is aimed through rather than repeated. Holds the new
+        solution and returns True only when it actually changed the
+        setpoint (the settle restarts); False otherwise, and nothing is
+        counted."""
+        p = hold.get("_pending") or {}
+        m = p.get("measure") or {}
+        ik = self.cfg.get("ik")
+        if (p.get("verb") != "set_tcp_target" or m.get("kind") != "tcp"
+                or not ik or hold.get("_tcp_corrections", 0)
+                >= self.TCP_MAX_CORRECTIONS):
+            return False
+        cmd = [float(v) for v in m["commanded"]]
+        q_meas = list(self.last_q)
+        got = forward_kinematics(ik["chain"], q_meas, ik["tcp_offset"])
+        err = math.sqrt(sum((g - c) ** 2 for g, c in zip(got, cmd)))
+        if err <= self.TCP_TOL_M:
+            return False
+        aim = [c + (c - g) for c, g in zip(cmd, got)]
+        cfg = dict(ik, tol=self.IK_REFINE_TOL_M,
+                   max_iters=max(60, int(ik.get("max_iters", 80))))
+        q_new, res, _it = dls_ik(ik["chain"], q_meas, aim, cfg,
+                                 self.joint_limits)
+        q_new = clamp_q(q_new, self.joint_limits)
+        dq = max((abs(a - b) for a, b in zip(q_new, hold["q"])), default=0.0)
+        if res > self.TCP_TOL_M or dq < self.TCP_CORRECTION_MIN_DQ_RAD:
+            return False
+        hold["q"] = list(q_new)
+        hold["_tcp_corrections"] = hold.get("_tcp_corrections", 0) + 1
+        hold.setdefault("_tcp_correction_log", []).append(
+            {"measured_miss_m": round(err, 5),
+             "max_joint_change_rad": round(dq, 6)})
+        hold["_streak"] = 0
+        ext = 0.5 * self.SETTLE_MAX_S
+        hold["_settle_deadline_s"] = hold.get("_settle_deadline_s", 0.0) + ext
+        hold["_trim_until_s"] = hold.get("_trim_until_s", 0.0) + ext
+        hold.pop("_trim_frozen", None)   # converged, so nothing was rolled back
+        return True
 
     def tcp_xyz(self) -> Optional[Tuple[float, float, float]]:
         ik_cfg = self.cfg.get("ik")
@@ -2208,6 +2441,26 @@ class ArmBridge:
     def _hw_connected(self) -> bool:
         return self.hw is not None and getattr(self.hw, "connected", False)
 
+    def _hw_path_note(self, forwarded: str = "move_linear") -> dict:
+        """What an attached real arm was ACTUALLY sent for a planned path.
+        HardwareBackend takes fire-and-forget move_linear(xyz) /
+        reset_to_home() and no waypoints, so the planned path never reaches
+        it. While mirroring, the simulated arm follows the real one, so the
+        path ran NOWHERE."""
+        where = ("NOWHERE: the simulated arm is mirroring the real one, so "
+                 "the local plan is bypassed too" if self.hw_mirror
+                 else "in the SIMULATION only")
+        what = ("ONE move_linear straight to the target (a straight "
+                "Cartesian line does not dip below its lower end, but it "
+                "does not lift either)" if forwarded == "move_linear"
+                else "its own vendor reset_to_home, which is not known to "
+                     "retreat straight up first")
+        return {"forwarded": forwarded, "path_on_hardware": False,
+                "mirroring": bool(self.hw_mirror),
+                "note": (f"the attached real arm was sent {what}: the "
+                         "hardware API takes no waypoints, so the planned "
+                         f"`path` ran {where}.")}
+
     def _hw_fwd(self, method: str, *args):
         """Forward a command to the attached real arm, if a hardware backend is
         connected. No-op in pure sim. Errors are swallowed -- the sim stays the
@@ -2292,28 +2545,65 @@ class ArmBridge:
                 # Digital twin: drive the sim motors straight from the real
                 # arm's measured joints; the local motion plan is bypassed
                 # (the hardware IS the plan while mirroring).
-                self._set_q(mirror_q)
+                self._set_q(mirror_q, trim=False)
                 kind = None
             else:
                 kind = motion[0]
             params = motion[1]
+            # The lowest TCP point of a measured motion, every tick (the
+            # lift-before-move feature's own evidence; see LIFT_H_M).
+            if self.lift_on:
+                _pm = (params if (kind in self.BUSY_MOTION_KINDS
+                                  and kind != "planning")
+                       else params.get("_pending") if kind == "hold" else None)
+                if _pm is not None and _pm.get("seq"):
+                    self._track_path_min(_pm)
+            if self._trace_f is not None:
+                self._trace_tick(sim_time_s, kind, params)
 
             if kind == "hold":
                 # Re-apply target each tick so motors don't drift.
                 self._set_q(params["q"])
+                if self.gravity_trim_on:
+                    self._trim_hold_tick(params, sim_time_s)
                 # SETTLE-AND-MEASURE. A motion that just ended parked its plan
                 # here rather than being measured on the spot: the final
                 # setpoint had only just been written and the position servo
                 # has not tracked it yet, so reading the sensors in the same
                 # tick would report the arm short of where it ends up. Give it
-                # SETTLE_S of sim time holding still, THEN measure.
+                # SETTLE_S of sim time holding still, THEN measure -- and,
+                # with the gravity trim on, keep holding until every joint has
+                # CONVERGED (or SETTLE_MAX_S says it will not).
                 pending = params.get("_pending")
                 if pending is not None and sim_time_s >= params.get(
                         "_settle_until_s", 0.0):
-                    params.pop("_pending", None)
-                    self._record_completion(
-                        pending, timed_out=bool(params.pop("_pending_timed_out",
-                                                           False)))
+                    settle = None
+                    if self.gravity_trim_on:
+                        settle = self._settle_check(params, params["q"],
+                                                    sim_time_s)
+                        if (settle is not None and settle["converged"]
+                                and self._tcp_correction(params)):
+                            settle = None
+                    if settle is not None or not self.gravity_trim_on:
+                        params.pop("_pending", None)
+                        if settle is not None:
+                            settle["tcp_corrections"] = params.get(
+                                "_tcp_corrections", 0)
+                            if params.get("_tcp_correction_log"):
+                                settle["tcp_correction_log"] = list(
+                                    params["_tcp_correction_log"])
+                            pending["_settle"] = settle
+                            pending["_hold_q"] = list(params["q"])
+                        self._record_completion(
+                            pending,
+                            timed_out=bool(params.pop("_pending_timed_out",
+                                                      False)))
+
+            elif kind == "planning":
+                # A coordinate verb is solving its path: hold still where the
+                # claim froze the arm (no trim integration -- this is not a
+                # settle, and the plan replaces it within a few ticks).
+                self._set_q(params["q"])
 
             elif kind == "interp":
                 # Linear interp between params["from_q"] and ["to_q"]
@@ -2736,7 +3026,12 @@ class ArmBridge:
     # (set_joint_positions et al.) arriving while a servo stream is live
     # gets the ordinary 409, but a servo command NEVER 409s -- it retargets
     # the live stream in place (see act_servo_joint_positions).
-    BUSY_MOTION_KINDS = ("interp", "wave", "sequence", "traj", "servo")
+    # "planning" is the placeholder a coordinate verb holds while its path
+    # is solved (~0.1-0.4 s of IK on an HTTP thread): busy, so a second goal
+    # verb is refused 409 instead of racing it, and overridable, so a
+    # stop_robot / reset_to_home that lands mid-plan cancels it for good.
+    BUSY_MOTION_KINDS = ("interp", "wave", "sequence", "traj", "servo",
+                         "planning")
 
     # ── servo_joint_positions: the streaming setpoint lane ────────
     # A trajectory controller (MoveIt's joint_trajectory_controller, any
@@ -2799,6 +3094,85 @@ class ArmBridge:
     # the position servo has not tracked it yet; measuring immediately
     # would report the arm short of where it actually settles.
     SETTLE_S = 0.15
+
+    # ── Gravity-sag trim + converge-before-settled (2026-10-17) ───
+    #
+    # THE DEFECT. The engine's position servo is a pure spring-damper
+    # (ke = 10 x the URDF effort, OmBasicJoint::newtonAxisSpec) with no
+    # integral term and no gravity feed-forward, so an arm holding a pose
+    # under gravity sits short of its setpoint by tau_gravity / ke -- for
+    # ever. MEASURED on the HEBI A-2240-06 (ke 440 on the R8-16 shoulder):
+    # J2 held 0.028 rad (1.6 deg) below commanded home, and every 5 cm hover
+    # landed 20-22 mm LOW at the tool. And the completion recorded it as
+    # `settled: true`, because "settled" meant "SETTLE_S elapsed", not "the
+    # arm got there" -- the tool reported a sagged pose as a finished move.
+    #
+    # THE FIX, in the bridge (the controller of a real arm does the same
+    # job): an integral SETPOINT TRIM. While the arm holds, each joint's
+    # measured error is integrated into an offset added to the setpoint it
+    # writes, so the spring stretches exactly as far as gravity needs and
+    # the joint converges on the commanded angle. The torque this asks for
+    # is ke x trim, which the engine still clips at the URDF effort limit --
+    # the arm gets no strength it does not have. The trim also rides along
+    # every motion as a feed-forward (it is the gravity offset measured at
+    # the pose the motion started from), and a motion is only recorded as
+    # settled once every joint is within SETTLE_TOL_RAD; if that never
+    # happens within SETTLE_MAX_S it is recorded settled: false and says
+    # so. ANTI-WINDUP: only errors inside the sag band are integrated and
+    # the trim is clamped to the band; a hold integrates only for
+    # SETTLE_S + SETTLE_MAX_S, and one that has not converged by then (a
+    # joint held off by contact) rolls back to the last converged trim, as
+    # does a new external motion that starts from such a hold -- so what
+    # was wound up against an obstruction never rides into the next move.
+    # OMNISIM_ARM_GRAVITY_TRIM=0 restores the old servo, the old
+    # SETTLE_S-only verdict and the old IK tolerance exactly.
+    TRIM_KI = 5.0              # 1/s: integral gain (servo poles are 20-40/s)
+    # The expected gravity-sag band, per joint (per-arm override:
+    # `gravity_trim_band_rad`). Only an error inside it is integrated, and
+    # the trim is clamped to it. Measured sags: HEBI J2 0.028, UR5e 0.027,
+    # OmniArm 6 0.016 rad. The servo stiffness is 10 x the URDF effort
+    # (OmBasicJoint.cpp), so a full-band trim asks for 0.5 x effort -- and
+    # the engine still clips the torque at the effort limit.
+    TRIM_BAND_RAD = 0.05
+    SETTLE_TOL_RAD = 1.5e-3     # every joint within this to count as converged
+    SETTLE_STREAK = 3           # ...for this many consecutive ticks
+    SETTLE_MAX_S = 3.0          # sim s after SETTLE_S before giving up honestly
+    # The achieved-TCP tolerance a set_tcp_target is held to, and how many
+    # times the bridge re-solves the IK from where the arm actually is when
+    # a converged joint vector still leaves the tool outside it.
+    TCP_TOL_M = 0.003
+    TCP_MAX_CORRECTIONS = 2
+    # The IK the coordinate verbs solve to. The per-arm config `tol` (5 mm on
+    # every shipped arm) is the ACCEPTANCE gate for a solve; the move itself
+    # is refined to this from the accepted solution.
+    IK_REFINE_TOL_M = 2e-4
+
+    # ── Lift before a lateral move (2026-10-17) ───────────────────
+    #
+    # THE DEFECT. set_tcp_target interpolated LINEARLY IN JOINT SPACE from
+    # wherever the arm stood to the solved target. A joint-space line is not
+    # a Cartesian line: leaving a 5 cm hover over one tag for the next, the
+    # HEBI's tool dipped to 1.2 cm above the bench, ~2 mm over the tag it
+    # had just inspected (2 Hz samples, so the true minimum was lower). On a
+    # real bench with a tool fitted, that path grazes.
+    #
+    # THE FIX. A move whose start and end are more than LIFT_MIN_XY_M apart
+    # sideways is planned as a CARTESIAN path: straight up to a travel
+    # height (LIFT_H_M above the lower end, never below the higher end),
+    # straight across at that height, straight down onto the target --
+    # IK-solved every PATH_STEP_M and replayed as a fixed-dt trajectory. A
+    # reset_to_home from a low pose retreats straight up first. Each such
+    # motion's completion carries the MEASURED lowest TCP point of the path
+    # (`path_min_tcp_z_m`), sampled every sim tick. OMNISIM_ARM_LIFT_BEFORE_MOVE=0
+    # restores the old joint-space moves exactly.
+    LIFT_H_M = 0.06
+    LIFT_MIN_XY_M = 0.04
+    PATH_STEP_M = 0.01
+    PATH_DT_S = 0.02
+    PATH_VERT_SPEED = 0.15      # m/s on a vertical leg (peak 1.5x under the ease)
+    PATH_MIN_LEG_S = 0.5
+    PATH_MAX_JUMP_RAD = 0.35    # a bigger step between path samples is a branch flip
+    PATH_IK_TOL_M = 0.004       # per-sample acceptance on the path legs
 
     # ── stop_robot: measured rest + operator hold ─────────────────
     # How long a stop watches the JOINTS before it will say the arm is at
@@ -2897,7 +3271,61 @@ class ArmBridge:
             hold["_pending"] = p
             hold["_pending_timed_out"] = bool(timed_out)
             hold["_settle_until_s"] = sim_time_s + self.SETTLE_S
+            hold["_ended_s"] = sim_time_s
+            hold["_trim_until_s"] = (sim_time_s + self.SETTLE_S
+                                     + self.SETTLE_MAX_S)
         self.motion = ("hold", hold)
+
+    def _track_path_min(self, p: dict) -> None:
+        """Keep the LOWEST measured TCP point (arm base frame) of motion `p`,
+        from this tick's joint sensors. Sim thread, under self.lock."""
+        ik = self.cfg.get("ik")
+        if not ik:
+            return
+        # The point the motion COMMANDS: set_tcp_pose can retarget the tool
+        # point (a grasp aims the finger throat), and the clearance that
+        # matters is that point's, measured with the same offset as `error`.
+        off = list(ik["tcp_offset"])
+        oz = (p.get("measure") or {}).get("tcp_offset_z")
+        if oz is not None:
+            off[2] = float(oz)
+        try:
+            tcp = forward_kinematics(ik["chain"], self.last_q, tuple(off))
+        except Exception:
+            return
+        cur = p.get("_path_min")
+        n = p.get("_path_samples", 0) + 1
+        p["_path_samples"] = n
+        if cur is None or tcp[2] < cur[2]:
+            p["_path_min"] = [float(v) for v in tcp]
+
+    def _trace_tick(self, sim_time_s: float, kind, params: dict) -> None:
+        """One OMNISIM_ARM_TCP_TRACE line. Never raises into the tick."""
+        try:
+            ik = self.cfg.get("ik")
+            tcp = (forward_kinematics(ik["chain"], self.last_q,
+                                      ik["tcp_offset"]) if ik else None)
+            seq = params.get("seq") or (params.get("_pending") or {}).get("seq")
+            self._trace_f.write(json.dumps({
+                "robot": self.robot_id,
+                "t": round(sim_time_s, 4), "kind": kind, "seq": seq,
+                "q": [round(v, 6) for v in self.last_q],
+                "tcp": None if tcp is None else [round(v, 5) for v in tcp],
+                "trim": [round(v, 5) for v in self._trim],
+            }) + "\n")
+            self._trace_f.flush()
+        except Exception:
+            pass
+
+    def close_trace(self) -> None:
+        """Flush and close the OMNISIM_ARM_TCP_TRACE file (world shutdown)."""
+        f, self._trace_f = self._trace_f, None
+        if f is not None:
+            try:
+                f.flush()
+                f.close()
+            except Exception:
+                pass
 
     def _flush_pending(self) -> None:
         """Measure a completion still sitting out its settle window.
@@ -2913,10 +3341,32 @@ class ArmBridge:
                 return
             pend = p.pop("_pending", None)
             timed_out = bool(p.pop("_pending_timed_out", False))
+            if pend is not None and self.gravity_trim_on:
+                # CUT SHORT: the next command arrived before the settle
+                # window could deliver a verdict, so convergence was NOT
+                # MEASURED -- `settled` is null, never a false failure (a
+                # client that sends commands back to back, as the 409 hint
+                # and /action invite, would otherwise see every motion
+                # "fail" and a motion.unsettled event per command). What
+                # the joints read at the cut is reported beside it.
+                worst = self._hold_worst_err(p["q"])
+                pend["_settle"] = {
+                    "converged": None,
+                    "cut_short": True,
+                    "tolerance_rad": self.SETTLE_TOL_RAD,
+                    "max_abs_joint_error_rad": round(worst, 6),
+                    "within_tolerance_at_cut": worst <= self.SETTLE_TOL_RAD,
+                    "trim_rad": [round(t, 5) for t in self._trim],
+                    "note": ("a new command arrived during the settle "
+                             "window; convergence was not measured"),
+                }
+                pend["_hold_q"] = list(p["q"])
         if pend is not None:
+            # Off the sim thread (an HTTP / relay thread): no scene reads.
             self._record_completion(pend, timed_out=timed_out,
                                     note="measured early: a new command "
-                                         "arrived during the settle window")
+                                         "arrived during the settle window",
+                                    scene_reads=False)
 
     def _measure_motion(self, p: dict) -> dict:
         """What the finished motion ACTUALLY did, read from sensors and the
@@ -3042,10 +3492,15 @@ class ArmBridge:
             return None
 
     def _record_completion(self, p: dict, timed_out: bool = False,
-                           note: str = "") -> None:
+                           note: str = "", scene_reads: bool = True) -> None:
         """The ONLY place a motion result is written, and it writes what was
         MEASURED. Called from the tick when a motion ends (or from
-        _flush_pending when a new command lands inside the settle window)."""
+        _flush_pending when a new command lands inside the settle window).
+
+        `scene_reads=False` (the _flush_pending path, which runs on an HTTP
+        or relay thread) skips the supervisor scene walk behind
+        `nearest_object` and any uncached base-pose read: supervisor calls
+        off the sim thread stall the step exchange (MainThreadCalls)."""
         seq = p.get("seq")
         if not seq:
             # An idle-loop plan. Nothing claimed it and nothing waits on it,
@@ -3060,6 +3515,63 @@ class ArmBridge:
             "superseded": False,
         }
         rec.update(self._measure_motion(p))
+        settle = p.get("_settle")
+        if settle is not None:
+            # ⚠️ `settled` IS A CONVERGENCE VERDICT now, not "SETTLE_S went
+            # by": a sagged arm used to be reported settled: true. False here
+            # means every joint did NOT get within tolerance in SETTLE_MAX_S,
+            # and `settle` carries the measured worst joint error.
+            if settle.get("cut_short"):
+                # Not measured, so not a verdict either way (and no
+                # motion.unsettled event: emit_motion_outcome only fires on
+                # settled is False).
+                rec["settled"] = None if not timed_out else False
+                rec["cut_short"] = True
+            else:
+                rec["settled"] = ((not timed_out)
+                                  and bool(settle.get("converged")))
+            rec["settle"] = dict(settle)
+            if p.get("_hold_q") is not None:
+                rec["final_commanded_q"] = [round(float(v), 6)
+                                            for v in p["_hold_q"]]
+            if rec.get("error_m") is not None and (p.get("measure") or {}).get(
+                    "kind") == "tcp":
+                rec["tcp_tolerance_m"] = self.TCP_TOL_M
+                rec["within_tolerance"] = bool(rec["error_m"] <= self.TCP_TOL_M)
+                # The same measured point in WORLD coordinates, so a caller
+                # that planned in world (locate_objects' world_xyz) can check
+                # the frame it actually commanded in.
+                # Only when the base pose is actually KNOWN: _base_to_world
+                # falls back to the identity, and a world point silently
+                # equal to the base-frame one is a wrong number, not a
+                # missing one. Off the sim thread only a cached pose counts.
+                pose = (self._base_world_pose() if scene_reads
+                        else getattr(self, "_base_world_cache", None))
+                if pose is not None:
+                    try:
+                        rec["achieved_world_xyz"] = [
+                            round(v, 5)
+                            for v in self._base_to_world(rec["achieved"])]
+                        if scene_reads:
+                            near = self._nearest_graspable(
+                                rec["achieved_world_xyz"])
+                            if near is not None:
+                                rec["nearest_object"] = near
+                    except Exception:
+                        pass
+                if not scene_reads:
+                    rec["nearest_object_note"] = (
+                        "not measured: this result was taken early, off the "
+                        "simulation thread, where the scene is not read")
+        pmin = p.get("_path_min")
+        if pmin is not None:
+            # MEASURED, not planned: the lowest the tool point went, from the
+            # joint sensors on every sim tick of this motion (arm base frame).
+            rec["path_min_tcp_z_m"] = round(pmin[2], 5)
+            rec["path_min_tcp_xyz"] = [round(v, 5) for v in pmin]
+            rec["path_samples"] = int(p.get("_path_samples", 0))
+        if p.get("_path_plan"):
+            rec["path"] = dict(p["_path_plan"])
         # D1: the SIM window this result was measured over, in sim seconds
         # and in steps. The wall clock says how loaded the machine was, not
         # what the arm did. (It is also no longer a supervisor read: the
@@ -3285,7 +3797,10 @@ class ArmBridge:
                     "details": {
                         "current": kind,
                         "current_seq": p.get("seq"),
-                        "hint": ("wait for get_robot_state.mode == 'hold', "
+                        "hint": ("wait for get_robot_state.mode == 'hold' "
+                                 "(and settling == false, or the running "
+                                 "motion's result is measured early and "
+                                 "reports settled: null, cut_short: true), "
                                  "then send this again; or call stop_robot "
                                  "first if you mean to abandon the motion "
                                  "that is running."),
@@ -3295,8 +3810,17 @@ class ArmBridge:
                             "again once I've finished, or tell me to stop."),
                 }
             superseded = p if busy else None
+            if (kind == "hold" and self.gravity_trim_on
+                    and not p.get("_trim_frozen")
+                    and self._hold_worst_err(p["q"]) > self.SETTLE_TOL_RAD):
+                # A NEW MOTION FROM A HOLD THAT HAD NOT CONVERGED: whatever
+                # the integrator was winding against there (contact, an
+                # obstruction, a pose still settling) is not the gravity
+                # offset of the next pose, so do not carry it as one.
+                self._trim_rollback()
             self.motion_seq += 1
             seq = self.motion_seq
+            self._claim_verb = verb
         if superseded is not None:
             # The idle loop's plans carry no seq (it writes the slot directly),
             # so only quote one when there is one to quote.
@@ -3356,6 +3880,57 @@ class ArmBridge:
                          "how far it got was not measured"),
             }
         return out
+
+    # ── plan-then-commit: a motion planned off the sim thread ────────
+    #
+    # ⚠️ THE RACE THIS CLOSES. A coordinate verb claims its seq, then spends
+    # ~0.1-0.4 s solving a path on its HTTP thread. A stop_robot landing in
+    # that window used to write its hold and then be OVERWRITTEN by the
+    # plan -- the arm moved after the operator stopped it. Now the claim
+    # parks a busy, overridable "planning" placeholder in the slot, and the
+    # plan is only committed if nothing has claimed the slot since
+    # (motion_seq == seq, checked under the lock). Otherwise it is DROPPED:
+    # the arm never moves for it, and its result says so.
+
+    def _hold_for_plan(self, seq, slot: dict) -> Optional[List[float]]:
+        """Right after a successful claim: park the "planning" placeholder
+        and return the MEASURED joints to plan from (self.last_q, taken by
+        the tick -- no device read on this thread). None when another claim
+        already landed (the caller must drop its plan)."""
+        with self.lock:
+            if self.motion_seq != seq:
+                return None
+            kind, p = self.motion
+            q_meas = list(self.last_q)
+            # Keep holding the commanded pose of a free hold (holding the
+            # MEASURED, sagged pose would sag it again); freeze a motion
+            # this claim cancelled where it actually is.
+            q_hold = (list(p["q"]) if kind in ("hold", "planning")
+                      and p.get("q") is not None else list(q_meas))
+            self.motion = ("planning", dict(slot, q=q_hold))
+            return q_meas
+
+    def _commit_motion(self, seq, kind: str, params: dict) -> bool:
+        """Write a planned motion into the slot iff `seq` still owns it."""
+        with self.lock:
+            if self.motion_seq != seq:
+                return False
+            self.motion = (kind, params)
+            return True
+
+    def _dropped_result(self, seq, verb: str, commanded, unit: str) -> dict:
+        """The honest result of a motion dropped before it started."""
+        by = getattr(self, "_claim_verb", None)
+        return {"accepted": True, "seq": seq, "verb": verb,
+                "commanded": commanded, "unit": unit,
+                "achieved": None, "error": None,
+                "settled": False, "timed_out": False, "superseded": True,
+                "superseded_by_verb": by,
+                "started": False,
+                "note": (f"a {by or 'later command'} arrived while this "
+                         f"{verb} was still being planned, so it was "
+                         "DROPPED before it started: the arm did not move "
+                         "for it, and nothing was sent to hardware")}
 
     # ── stop_robot ────────────────────────────────────────────────
 
@@ -3575,17 +4150,40 @@ class ArmBridge:
         seq, superseded = self._begin_motion("reset_to_home", override=True)
         home = [float(v) for v in clamp_q(list(self.home_pose),
                                           self.joint_limits)]
+        slot = self._slot(seq, "reset_to_home",
+                          measure={"kind": "joints", "unit": "rad",
+                                   "commanded": home})
+        traj = info = None
+        eta = duration_s
+        if self.lift_on:
+            # Plan-then-commit: a stop that lands while the retreat is being
+            # solved wins (see _hold_for_plan).
+            q_meas = self._hold_for_plan(seq, slot)
+            if q_meas is None:
+                return self._note_superseded(self._dropped_result(
+                    seq, "reset_to_home", home, "rad"), superseded)
+            traj, info = self._plan_home_retreat(home, duration_s, q_meas)
         with self.lock:
-            from_q = self._read_q()
-            self.motion = ("interp", dict(
-                self._slot(seq, "reset_to_home",
-                           measure={"kind": "joints", "unit": "rad",
-                                    "commanded": home}),
-                from_q=from_q,
-                to_q=list(self.home_pose),
-                start_s=self.robot.getTime(),
-                duration_s=duration_s,
-            ))
+            from_q = list(self.last_q)
+            if traj is not None:
+                eta = info["duration_s"]
+                plan = ("traj", dict(
+                    slot, traj=traj, dt=self.PATH_DT_S, gevents=[],
+                    start_s=self.sim_time, _path_plan=info))
+            else:
+                if info is not None:
+                    slot["_path_plan"] = info
+                plan = ("interp", dict(
+                    slot,
+                    from_q=from_q,
+                    to_q=list(self.home_pose),
+                    start_s=self.sim_time,
+                    duration_s=duration_s,
+                ))
+            committed = self._commit_motion(seq, *plan)
+        if not committed:
+            return self._note_superseded(self._dropped_result(
+                seq, "reset_to_home", home, "rad"), superseded)
         self._hw_fwd("reset_to_home")
         # PROTOCOL.md 5.4.1 rule 1: this used to return {"q": home_pose} --
         # the COMMANDED pose under `q`, the identical key get_state() uses for
@@ -3593,13 +4191,69 @@ class ArmBridge:
         # motion has not even started when this returns. Commanded is named
         # commanded, and `achieved` is either MEASURED (wait=true) or null.
         out = self._wait_result(seq, "reset_to_home", wait,
-                                budget_s=duration_s * 3.0 + 6.0,
-                                eta_s=duration_s, commanded=home, unit="rad")
+                                budget_s=eta * 3.0 + 6.0 + (
+                                    self.SETTLE_MAX_S if self.gravity_trim_on
+                                    else 0.0),
+                                eta_s=eta, commanded=home, unit="rad")
         out["commanded_q"] = home
         out["q_at_command"] = from_q
         out["duration_s"] = duration_s
         out["joint_names"] = list(self.joint_names)
+        if traj is not None and self._hw_connected():
+            out["hardware_path"] = self._hw_path_note("reset_to_home")
         return self._note_superseded(out, superseded)
+
+    def _plan_home_retreat(self, home, duration_s: float, q_meas=None):
+        """reset_to_home from a LOW pose: straight up first (LIFT_H_M, capped
+        at home's own TCP height), then the usual joint-space move home.
+        (None, None) when the arm is already high or close to home; (None,
+        info) with `lift_skipped` when the retreat cannot be solved."""
+        ik = self.cfg.get("ik")
+        if not ik:
+            return None, None
+        if q_meas is None:
+            with self.lock:
+                q_meas = list(self.last_q)
+        try:
+            p0 = forward_kinematics(ik["chain"], q_meas, ik["tcp_offset"])
+            ph = forward_kinematics(ik["chain"], home, ik["tcp_offset"])
+        except Exception:
+            return None, None
+        if (p0[2] >= ph[2] - 0.01
+                or math.hypot(ph[0] - p0[0], ph[1] - p0[1]) < self.LIFT_MIN_XY_M):
+            return None, None
+        zr = min(ph[2], p0[2] + self.lift_h)
+        if zr - p0[2] <= 0.005:
+            return None, None
+        up = [p0[0], p0[1], zr]
+        info = {"kind": "retreat_then_home", "retreat_to_base_xyz":
+                [round(v, 4) for v in up]}
+        if self._outside_envelope(up) is not None:
+            info["lift_skipped"] = ("the retreat point is outside the "
+                                    "envelope; went home in joint space")
+            return None, info
+
+        def _solve(pt, seed):
+            q2, e2, _ = dls_ik(ik["chain"], seed, pt, dict(ik, tol=1e-3),
+                               self.joint_limits)
+            return q2, e2
+
+        qs, worst, why = self._solve_leg(p0, up, q_meas, _solve,
+                                         self.PATH_IK_TOL_M)
+        if qs is None:
+            info["lift_skipped"] = why
+            return None, info
+        T1 = self._leg_duration(qs, zr - p0[2], 0.0, self.PATH_VERT_SPEED)
+        traj = [list(q_meas)] + self._resample_leg(qs, T1)
+        q_up = list(home)   # exactly home, as the plain interp always went
+        T2 = self._leg_duration([qs[-1], q_up], 0.0, duration_s, 1.0)
+        traj += self._resample_leg([qs[-1], q_up], T2)
+        info["legs"] = [{"to": info["retreat_to_base_xyz"],
+                         "duration_s": round(T1, 3),
+                         "ik_worst_residual_m": round(worst, 5)},
+                        {"to": "home (joint space)", "duration_s": round(T2, 3)}]
+        info["duration_s"] = round(self.PATH_DT_S * (len(traj) - 1), 3)
+        return traj, info
 
     def act_set_joint_positions(self, q: List[float], duration_s: float = 1.2,
                                 slot: Optional[dict] = None) -> dict:
@@ -3610,7 +4264,14 @@ class ArmBridge:
         if len(q) != len(self.joint_names):
             return {"error": f"q must have {len(self.joint_names)} entries"}
         clamped = clamp_q(q, self.joint_limits)
+        seq = (slot or {}).get("seq")
         with self.lock:
+            if seq and self.motion_seq != seq:
+                # A later claim (stop_robot, reset_to_home, a servo stream)
+                # owns the slot now: this plan is dropped, never written over
+                # it -- and nothing goes to hardware either.
+                return {"accepted": False, "dropped": True,
+                        "clamped_q": clamped}
             from_q = self._read_q()
             self.motion = ("interp", dict(
                 slot or {},
@@ -3685,6 +4346,11 @@ class ArmBridge:
             slot=self._slot(seq, "set_joint_positions",
                             measure={"kind": "joints", "unit": "rad",
                                      "commanded": commanded}))
+        if inner.get("dropped"):
+            out = self._dropped_result(seq, "set_joint_positions",
+                                       commanded, "rad")
+            out["joint_names"] = list(self.joint_names)
+            return out
         # `moved` is GONE. It was `bool(accepted)` -- an assertion of motion
         # made at submission, before a single tick had run, in a key that
         # reads as an observation. `achieved` (measured joint angles) and
@@ -3806,6 +4472,16 @@ class ArmBridge:
         preempted = (superseded.get("verb", "motion")
                      if superseded is not None else None)
         with self.lock:
+            if self.motion_seq != seq:
+                # A stop / reset claimed the slot between our claim and this
+                # write: it wins, this setpoint is not adopted.
+                out = _reply(seq, superseded_previous=superseded is not None,
+                             preempted=preempted, updates=0)
+                out.update(accepted=False, dropped=True,
+                           note=self._dropped_result(
+                               seq, "servo_joint_positions", clamped,
+                               "rad")["note"])
+                return out
             self.motion = ("servo", dict(
                 self._slot(seq, "servo_joint_positions",
                            measure={"kind": "joints", "unit": "rad",
@@ -4039,6 +4715,24 @@ class ArmBridge:
             return self._refuse_target(xyz_base, r, "below_floor", verb)
         return None
 
+    def _outside_envelope(self, xyz_base) -> Optional[str]:
+        """The reach gate's numbers WITHOUT the refusal: which limit a
+        base-frame point breaks ("too_far" / "too_close" / "below_floor"),
+        or None. For path planning, where a point outside the shell means
+        "fall back to the old move", not "refuse" -- so it must not write a
+        "REFUSED ... arm did not move" line to the operator log."""
+        ik_cfg = self.cfg.get("ik")
+        if not ik_cfg:
+            return None
+        r = math.sqrt(sum(float(v) ** 2 for v in xyz_base[:3]))
+        if r > ik_cfg["workspace_max_radius"]:
+            return "too_far"
+        if r < ik_cfg["workspace_min_radius"]:
+            return "too_close"
+        if xyz_base[2] < ik_cfg["workspace_min_z"]:
+            return "below_floor"
+        return None
+
     def _log_refusal(self, msg: str) -> None:
         loop = getattr(self, "idle_loop", None)
         if loop is not None and hasattr(loop, "_log"):
@@ -4085,6 +4779,157 @@ class ArmBridge:
     # ordinary in-reach targets converge to millimetres.
     IK_ACCEPT_TOL_M = 0.05
 
+    # ── Cartesian paths: lift before a lateral move ───────────────
+
+    def _refine_ik(self, q, xyz_base):
+        """Polish an ACCEPTED position solve down to IK_REFINE_TOL_M. Returns
+        (q, residual); falls back to the input when polishing does not help."""
+        ik = self.cfg["ik"]
+        q0 = list(q)
+        r0 = math.sqrt(sum((a - b) ** 2 for a, b in zip(
+            forward_kinematics(ik["chain"], q0, ik["tcp_offset"]), xyz_base)))
+        if not self.gravity_trim_on:
+            return q0, r0
+        cfg = dict(ik, tol=self.IK_REFINE_TOL_M,
+                   max_iters=max(60, int(ik.get("max_iters", 80))))
+        q1, r1, _it = dls_ik(ik["chain"], q0, list(xyz_base), cfg,
+                             self.joint_limits)
+        return (q1, r1) if r1 < r0 else (q0, r0)
+
+    def _motor_vmax(self) -> List[float]:
+        """Per-joint velocity caps, cached at init (no device read here: the
+        planner runs on HTTP threads)."""
+        return list(self._vmax)
+
+    def _lift_waypoints(self, p0, p1):
+        """Up / across / down waypoints (arm base frame) for a move from TCP
+        p0 to TCP p1, or None when the move is not lateral enough to need
+        one. The travel height is LIFT_H_M above the LOWER end, never below
+        the higher end -- so a move from a high home straight down onto a
+        hover arrives from above without first climbing."""
+        x0, y0, z0 = (float(v) for v in p0)
+        x1, y1, z1 = (float(v) for v in p1)
+        if math.hypot(x1 - x0, y1 - y0) < self.LIFT_MIN_XY_M:
+            return None, None
+        zt = max(z0, z1, min(z0, z1) + self.lift_h)
+        wps = [[x0, y0, z0]]
+        if zt - z0 > 0.005:
+            wps.append([x0, y0, zt])
+        if zt - z1 > 0.005:
+            wps.append([x1, y1, zt])
+        wps.append([x1, y1, z1])
+        return wps, zt
+
+    def _solve_leg(self, a, b, seed, solve, tol):
+        """IK samples every PATH_STEP_M along the straight segment a->b.
+        Returns (qs, worst_residual, reason); qs is None on failure."""
+        L = math.sqrt(sum((bb - aa) ** 2 for aa, bb in zip(a, b)))
+        n = max(1, int(math.ceil(L / self.PATH_STEP_M)))
+        qs = [list(seed)]
+        q = list(seed)
+        worst = 0.0
+        for i in range(1, n + 1):
+            s = i / n
+            pt = [aa + (bb - aa) * s for aa, bb in zip(a, b)]
+            limit = self._outside_envelope(pt) if i < n else None
+            if limit is not None:
+                return None, worst, (f"path point "
+                                     f"{[round(v, 3) for v in pt]} is outside "
+                                     f"the envelope ({limit})")
+            q2, err = solve(pt, q)
+            if err is None or err > tol:
+                return None, worst, (f"no IK solution within {tol * 1000:.0f} "
+                                     f"mm at path point "
+                                     f"{[round(v, 3) for v in pt]}")
+            if max(abs(u - v) for u, v in zip(q2, q)) > self.PATH_MAX_JUMP_RAD:
+                return None, worst, "IK branch flip along the path"
+            worst = max(worst, err)
+            qs.append(list(q2))
+            q = q2
+        return qs, worst, None
+
+    def _leg_duration(self, qs, length_m: float, base_s: float,
+                      speed: float) -> float:
+        """Shortest eased duration that keeps the TCP under `speed` and every
+        joint under 70% of its motor's velocity cap (the smooth cubic ease
+        peaks at 1.5x the mean rate)."""
+        T = max(self.PATH_MIN_LEG_S, base_s, 1.5 * length_m / max(speed, 1e-3))
+        vmax = self._motor_vmax()
+        for j in range(len(self.joint_names)):
+            span = sum(abs(qs[i + 1][j] - qs[i][j]) for i in range(len(qs) - 1))
+            T = max(T, 1.5 * span / (0.7 * vmax[j]))
+        return T
+
+    def _resample_leg(self, qs, T: float) -> List[List[float]]:
+        """Fixed-dt samples of one leg under the smooth cubic ease, linear in
+        between the IK samples (which are evenly spaced in arc length)."""
+        out = []
+        steps = max(1, int(math.ceil(T / self.PATH_DT_S)))
+        n = len(qs) - 1
+        for k in range(1, steps + 1):
+            a = min(1.0, k / steps)
+            a = a * a * (3.0 - 2.0 * a)
+            x = a * n
+            i = min(int(x), n - 1) if n > 0 else 0
+            f = x - i
+            q0, q1 = qs[i], qs[min(i + 1, n)]
+            out.append([u + (v - u) * f for u, v in zip(q0, q1)])
+        return out
+
+    def _plan_lifted(self, q_meas, p0, p1, solve, lateral_s: float,
+                     final_refine=None):
+        """Plan up/across/down to p1. Returns (traj, info) or (None, info)
+        with info["lift_skipped"] saying why -- the caller then falls back to
+        the old joint-space move and REPORTS that it did."""
+        wps, zt = self._lift_waypoints(p0, p1)
+        if wps is None:
+            return None, None
+        info = {"kind": "lift_traverse_lower",
+                "travel_z_m": round(zt, 4),
+                "waypoints_base_xyz": [[round(v, 4) for v in w] for w in wps]}
+        for w in wps[1:-1]:
+            limit = self._outside_envelope(w)
+            if limit is not None:
+                info["lift_skipped"] = (f"travel waypoint "
+                                        f"{[round(v, 3) for v in w]} is outside "
+                                        f"the reach envelope ({limit})")
+                return None, info
+        traj = [list(q_meas)]
+        seed = list(q_meas)
+        legs = []
+        for k in range(len(wps) - 1):
+            a, b = wps[k], wps[k + 1]
+            qs, worst, why = self._solve_leg(a, b, seed, solve,
+                                             self.PATH_IK_TOL_M)
+            if qs is None:
+                info["lift_skipped"] = why
+                return None, info
+            if k == len(wps) - 2 and final_refine is not None:
+                qs[-1] = final_refine(qs[-1])
+            L = math.sqrt(sum((bb - aa) ** 2 for aa, bb in zip(a, b)))
+            vertical = math.hypot(b[0] - a[0], b[1] - a[1]) < 1e-6
+            T = self._leg_duration(
+                qs, L, 0.0 if vertical else lateral_s,
+                self.PATH_VERT_SPEED if vertical else 0.3)
+            traj.extend(self._resample_leg(qs, T))
+            legs.append({"from": [round(v, 4) for v in a],
+                         "to": [round(v, 4) for v in b],
+                         "duration_s": round(T, 3),
+                         "ik_worst_residual_m": round(worst, 5)})
+            seed = qs[-1]
+        info["legs"] = legs
+        info["duration_s"] = round(self.PATH_DT_S * (len(traj) - 1), 3)
+        return traj, info
+
+    def _start_traj(self, slot: dict, traj, info: dict) -> bool:
+        """Hand a planned Cartesian path to the tick as a fixed-dt joint
+        trajectory (the learned-skill replay lane: same clamp, same hold,
+        same measured completion) -- iff the slot is still this plan's
+        (see _hold_for_plan). False = dropped."""
+        return self._commit_motion(slot["seq"], "traj", dict(
+            slot, traj=[list(q) for q in traj], dt=self.PATH_DT_S,
+            gevents=[], start_s=self.sim_time, _path_plan=info))
+
     def act_set_tcp_target(self, xyz: Tuple[float, float, float],
                            frame: str = "base", wait: bool = False,
                            duration_s: float = 1.5) -> dict:
@@ -4116,22 +4961,69 @@ class ArmBridge:
         if seq is None:
             return refusal
         commanded = [float(v) for v in xyz]
+        ik_cfg = self.cfg["ik"]
+        slot = self._slot(seq, "set_tcp_target",
+                          measure={"kind": "tcp", "unit": "m",
+                                   "commanded": commanded})
+        q_meas = None
+        if self.lift_on or self.gravity_trim_on:
+            # Plan-then-commit: the slot holds a "planning" placeholder while
+            # the IK below runs, and a stop that lands meanwhile wins.
+            q_meas = self._hold_for_plan(seq, slot)
+            if q_meas is None:
+                return self._dropped_result(seq, "set_tcp_target",
+                                            commanded, "m")
+        # Polish the accepted solve (the config `tol` is an acceptance gate,
+        # 5 mm on every shipped arm -- not the accuracy a hover should get).
+        q_goal, residual = self._refine_ik(out["q"], commanded)
+        out["q"], out["ik_residual_m"] = q_goal, residual
+        eta = duration_s
+        path_info = None
+        traj = None
+        if self.lift_on:
+            p0 = forward_kinematics(ik_cfg["chain"], q_meas,
+                                    ik_cfg["tcp_offset"])
+
+            def _solve(pt, seed):
+                q2, e2, _ = dls_ik(ik_cfg["chain"], seed, pt,
+                                   dict(ik_cfg, tol=1e-3), self.joint_limits)
+                return q2, e2
+
+            traj, path_info = self._plan_lifted(
+                q_meas, p0, commanded, _solve, duration_s,
+                final_refine=lambda q: self._refine_ik(q, commanded)[0])
+            if traj is not None:
+                q_end = traj[-1]
+                r_end = math.sqrt(sum((a - b) ** 2 for a, b in zip(
+                    forward_kinematics(ik_cfg["chain"], q_end,
+                                       ik_cfg["tcp_offset"]), commanded)))
+                out["q"], out["ik_residual_m"] = q_end, r_end
+                eta = path_info["duration_s"]
         # The real arm uses its OWN cartesian IK via move_linear; the sim uses
         # our DLS solution. Suppress the inner joint forward so we don't also
         # double-command the hardware in joint space.
         self._hw_suppress_joint = True
         try:
-            clamped = self.act_set_joint_positions(
-                out["q"], duration_s=duration_s,
-                slot=self._slot(seq, "set_tcp_target",
-                                measure={"kind": "tcp", "unit": "m",
-                                         "commanded": commanded}))
+            if traj is not None:
+                started = self._start_traj(slot, traj, path_info)
+                clamped = {"accepted": started,
+                           "clamped_q": clamp_q(out["q"], self.joint_limits)}
+            else:
+                if path_info is not None:
+                    slot["_path_plan"] = path_info
+                clamped = self.act_set_joint_positions(
+                    out["q"], duration_s=duration_s, slot=slot)
+                started = not clamped.get("dropped")
         finally:
             self._hw_suppress_joint = False
+        if not started:
+            return self._dropped_result(seq, "set_tcp_target", commanded, "m")
         self._hw_fwd("move_linear", tuple(xyz))
         res = self._wait_result(seq, "set_tcp_target", wait,
-                                budget_s=duration_s * 3.0 + 6.0,
-                                eta_s=duration_s, commanded=commanded,
+                                budget_s=eta * 3.0 + 6.0 + (
+                                    self.SETTLE_MAX_S if self.gravity_trim_on
+                                    else 0.0),
+                                eta_s=eta, commanded=commanded,
                                 unit="m")
         # `moved` is GONE (it was `True`, hardcoded, at submission) and
         # `err_norm` is RENAMED: it is the IK solver's residual for the
@@ -4147,6 +5039,8 @@ class ArmBridge:
                                    "`error_m` for the achieved TCP error.")
         res["target_base_xyz"] = out.get("target_base_xyz")
         res["frame"] = "arm base (the arm's own origin), metres"
+        if traj is not None and self._hw_connected():
+            res["hardware_path"] = self._hw_path_note()
         res["say"] = ("Moving my tool to "
                       f"({xyz[0]:.2f}, {xyz[1]:.2f}, {xyz[2]:.2f}) now.")
         return res
@@ -4173,37 +5067,113 @@ class ArmBridge:
         if seq is None:
             return refusal
         commanded = [float(v) for v in xyz]
+        slot = self._slot(seq, "set_tcp_pose",
+                          measure={"kind": "tcp", "unit": "m",
+                                   "commanded": commanded,
+                                   # MEASURE THE POINT THAT WAS
+                                   # COMMANDED: this verb can retarget
+                                   # the tool point (a grasp aims the
+                                   # finger throat, not the flange), so
+                                   # FK must use the same offset or the
+                                   # "error" is between two different
+                                   # points on the tool.
+                                   "tcp_offset_z": oz})
+        q_meas = None
+        if self.lift_on or self.gravity_trim_on:
+            q_meas = self._hold_for_plan(seq, slot)
+            if q_meas is None:
+                return self._dropped_result(seq, "set_tcp_pose",
+                                            commanded, "m")
+        # The solve the motion ACTUALLY uses, and its own residuals: the
+        # config `tol` (5 mm) is an acceptance gate, but within_tolerance is
+        # judged at TCP_TOL_M (3 mm), so the move is polished like
+        # set_tcp_target's before it is commanded.
+        used = {"q": q, "perr": perr, "rerr": rerr, "iters": iters,
+                "source": "initial solve"}
+
+        def _residuals(qx):
+            pp, RR = forward_kinematics_pose(ik["chain"], list(qx), off)
+            eo = _rotvec(_mat_mul(r_target, _transpose3(RR)))
+            return (math.sqrt(sum((a - b) ** 2 for a, b in zip(pp, commanded))),
+                    math.sqrt(sum(e * e for e in eo)))
+
+        def _polish(q0):
+            if not self.gravity_trim_on:
+                return q0
+            q1, p1, r1, it1 = dls_ik_pose(
+                ik["chain"], list(q0), list(commanded), r_target, off,
+                dict(ik, tol=self.IK_REFINE_TOL_M), self.joint_limits)
+            p0e, _r0e = _residuals(q0)
+            if p1 < p0e and r1 < 0.03:
+                used.update(q=q1, perr=p1, rerr=r1, iters=it1,
+                            source="polished to IK_REFINE_TOL_M")
+                return q1
+            return q0
+
+        q = _polish(q)
+        traj = path_info = None
+        eta = duration_s
+        if self.lift_on:
+            p0 = forward_kinematics(ik["chain"], q_meas, off)
+
+            def _solve(pt, seed):
+                q2, pe, re_, _ = dls_ik_pose(ik["chain"], seed, list(pt),
+                                             r_target, off,
+                                             dict(ik, tol=1e-3),
+                                             self.joint_limits)
+                # The orientation is part of a pose solve's answer: a sample
+                # that kept the position but lost "tool down" is a failure.
+                return q2, (pe if re_ < 0.05 else None)
+
+            traj, path_info = self._plan_lifted(q_meas, p0, commanded,
+                                                _solve, duration_s,
+                                                final_refine=_polish)
+            if traj is not None:
+                q = list(traj[-1])
+                eta = path_info["duration_s"]
+                # The path's last sample is what the motion ends on: report
+                # ITS residuals (FK at the commanded tool offset), whichever
+                # solve produced it.
+                pe_end, re_end = _residuals(q)
+                if (used["q"] is None
+                        or max(abs(a - b) for a, b in zip(used["q"], q)) > 1e-9):
+                    used.update(iters=None,
+                                source="path end (lift_traverse_lower)")
+                used.update(q=q, perr=pe_end, rerr=re_end)
         self._hw_suppress_joint = True
         try:
-            self.act_set_joint_positions(
-                q, duration_s=duration_s,
-                slot=self._slot(seq, "set_tcp_pose",
-                                measure={"kind": "tcp", "unit": "m",
-                                         "commanded": commanded,
-                                         # MEASURE THE POINT THAT WAS
-                                         # COMMANDED: this verb can retarget
-                                         # the tool point (a grasp aims the
-                                         # finger throat, not the flange), so
-                                         # FK must use the same offset or the
-                                         # "error" is between two different
-                                         # points on the tool.
-                                         "tcp_offset_z": oz}))
+            if traj is not None:
+                started = self._start_traj(slot, traj, path_info)
+            else:
+                if path_info is not None:
+                    slot["_path_plan"] = path_info
+                started = not self.act_set_joint_positions(
+                    q, duration_s=duration_s, slot=slot).get("dropped")
         finally:
             self._hw_suppress_joint = False
+        if not started:
+            return self._dropped_result(seq, "set_tcp_pose", commanded, "m")
         self._hw_fwd("move_linear", tuple(xyz))
         res = self._wait_result(seq, "set_tcp_pose", wait,
-                                budget_s=duration_s * 3.0 + 6.0,
-                                eta_s=duration_s, commanded=commanded,
+                                budget_s=eta * 3.0 + 6.0 + (
+                                    self.SETTLE_MAX_S if self.gravity_trim_on
+                                    else 0.0),
+                                eta_s=eta, commanded=commanded,
                                 unit="m")
         res["solved_q"] = q
         # Named for what they are: the pose solver's own leftovers, from
-        # before the motion. `error` / `error_m` above are the measurement.
-        res["ik_residual_m"] = perr
-        res["ik_rot_residual_rad"] = rerr
+        # before the motion -- for the joint vector the motion actually ends
+        # on (`ik_solution` says which solve that was). `error` / `error_m`
+        # above are the measurement.
+        res["ik_residual_m"] = used["perr"]
+        res["ik_rot_residual_rad"] = used["rerr"]
         res["ik_residual_note"] = ("SOLVER residuals, computed before the arm "
                                    "moved -- not measurements.")
-        res["iters"] = iters
+        res["iters"] = used["iters"]
+        res["ik_solution"] = used["source"]
         res["tcp_offset_z"] = oz
+        if traj is not None and self._hw_connected():
+            res["hardware_path"] = self._hw_path_note()
         res["frame"] = "arm base (the arm's own origin), metres"
         return res
 
@@ -4626,6 +5596,11 @@ class ArmBridge:
             rmin = float(env.get("min_radius_m") or 0.0)
         except Exception:
             reach = None
+        # The base pose is what makes base_xyz a DIFFERENT number from
+        # world_xyz. Unknown (no Supervisor self-node, NaN before the first
+        # step) -> _world_to_base falls back to the identity, so base_xyz is
+        # OMITTED rather than published silently equal to world_xyz.
+        base_known = self._base_world_pose() is not None
         for node, tf in self._iter_graspables():
             try:
                 p = [float(v) for v in tf.getSFVec3f()]
@@ -4648,6 +5623,13 @@ class ArmBridge:
             try:
                 pb = self._world_to_base(p)
                 dist = math.sqrt(sum(v * v for v in pb))
+                # BOTH FRAMES. set_tcp_target defaults to the ARM BASE frame,
+                # and this roster used to give world coordinates only: on the
+                # HEBI pilot (base 2 cm above the world origin) a model added
+                # 5 cm to a world z and sent it without frame='world', so the
+                # hover landed 2 cm high with the arm itself accurate to 0.4 mm.
+                if base_known:
+                    item["base_xyz"] = [round(v, 4) for v in pb]
                 item["distance_from_base_m"] = round(dist, 4)
                 if reach:
                     item["within_reach"] = bool(rmin <= dist <= reach)
@@ -4656,6 +5638,14 @@ class ArmBridge:
             out.append(item)
         res = {"objects": out, "count": len(out), "frame": "world, metres",
                "measured": True}
+        if base_known:
+            res["base_xyz_frame"] = ("arm base (this arm's own origin), "
+                                     "metres -- the frame set_tcp_target uses "
+                                     "unless you pass frame='world'")
+        else:
+            res["base_xyz_note"] = ("this arm's base pose is not known yet, "
+                                    "so no base-frame coordinates are given: "
+                                    "use world_xyz with frame='world'")
         if reach:
             res["reach_m"] = round(reach, 4)
         if not out:
@@ -4905,6 +5895,33 @@ class ArmBridge:
             bp[1] + r[3] * lx + r[4] * ly + r[5] * lz,
             bp[2] + r[6] * lx + r[7] * ly + r[8] * lz,
         ]
+
+    def _nearest_graspable(self, tcp_world, max_dxy: float = 0.10):
+        """The scene object the tool ended up over, MEASURED: its name, the
+        sideways distance and the height of the tool point above the object's
+        origin (its translation -- the centre for a primitive, not the top
+        face). None when nothing is within `max_dxy`. This is the number a
+        "hold 5 cm above X" task is actually about, so the reply carries it
+        instead of leaving the agent to redo frame arithmetic."""
+        best = None
+        for node, tf in self._iter_graspables():
+            try:
+                p = [float(v) for v in tf.getSFVec3f()]
+                d = node.getDef() or ""
+                nf = node.getField("name")
+                nm = nf.getSFString() if nf is not None else None
+            except Exception:
+                continue
+            dxy = math.hypot(tcp_world[0] - p[0], tcp_world[1] - p[1])
+            if dxy <= max_dxy and (best is None or dxy < best["dxy_m"]):
+                best = {"name": nm or d.replace("GRASP_", "").lower(),
+                        "def": d, "dxy_m": round(dxy, 4),
+                        "tcp_above_object_origin_m": round(tcp_world[2] - p[2], 4),
+                        "object_world_xyz": [round(v, 4) for v in p]}
+        if best is not None:
+            best["note"] = ("measured from the object's origin (its "
+                            "translation), not its top face")
+        return best
 
     def _iter_graspables(self):
         """Yield (node, translation_field) for every world node whose DEF
@@ -5182,6 +6199,12 @@ class ArmBridge:
             "held": bool(getattr(self.hold, "held", False)),
             "events": events_summary(self),
             "mode": self.motion[0],
+            # True while a finished motion is still being SETTLE-measured in
+            # the hold slot. A command sent now is accepted, but it cuts that
+            # measurement short: the earlier result then reports
+            # settled: null, cut_short: true.
+            "settling": bool(self.motion[0] == "hold"
+                             and self.motion[1].get("_pending") is not None),
             "hardware": self.hw_status(),
             # WHAT THE LAST FINISHED MOTION ACTUALLY DID (PROTOCOL.md 5.4.1).
             # None until one completes. This is how a caller that passed
@@ -7374,7 +8397,17 @@ def build_arm_tools(bridge: ArmBridge) -> List[Any]:
                 "get_robot_state.last_command. This verb OVERRIDES a motion "
                 "already running (it is the recovery verb) rather than "
                 "refusing it; the cancelled motion then reports achieved: "
-                "null, because nobody measured where it got to."),
+                "null, because nobody measured where it got to."
+                + ((" From a low pose the SIMULATED arm first retreats "
+                    "straight UP, then goes home, so it never drags the tool "
+                    "across whatever it was over."
+                    # Unconditional: the tools are built before a hardware
+                    # backend attaches, so this cannot ask whether one has.
+                    + " A real arm attached through a hardware backend is "
+                    "sent its own vendor reset_to_home instead, which is NOT "
+                    "known to retreat first ('hardware_path' in the reply "
+                    "says so when one is connected).")
+                   if bridge.lift_on else "")),
             parameters={"type": "object",
                         "properties": {"wait": dict(_wait_param)}},
             dispatch=lambda args: bridge.act_reset_to_home(
@@ -7603,6 +8636,11 @@ def build_arm_tools(bridge: ArmBridge) -> List[Any]:
                 + (f"; the base sits at world {_env.get('base_world_xyz')}"
                    if _env.get("base_world_xyz") else "")
                 + ". Pass frame='world' to give a world-frame point instead. "
+                "locate_objects gives every object in BOTH frames: use its "
+                "'base_xyz' with the default frame, or its 'world_xyz' with "
+                "frame='world' -- never a world number in the base frame. "
+                "The reply's 'nearest_object' says how high the tool MEASURED "
+                "above the object it ended up over. "
                 f"THIS ARM'S REACH: {_env.get('min_radius_m')} m to "
                 f"{_env.get('max_radius_m')} m from its base, and never below "
                 f"z={_env.get('min_z_m')} m. It is a bolted-down arm with a "
@@ -7626,6 +8664,28 @@ def build_arm_tools(bridge: ArmBridge) -> List[Any]:
                 "moved and achieved is null until you poll "
                 "get_robot_state.last_command. A second motion sent while "
                 "this one runs is REJECTED with 409 busy."
+                + ((" 'settled' true means every joint CONVERGED on the "
+                    "commanded angle (see 'settle'); 'within_tolerance' says "
+                    "whether the measured tool point is inside "
+                    f"'tcp_tolerance_m' ({bridge.TCP_TOL_M * 1000:.0f} mm) of "
+                    "the target. If either is false, say so. 'settled' "
+                    "null with 'cut_short' true means a newer command "
+                    "arrived before the settle window ended, so convergence "
+                    "was not measured -- that is not a failure.")
+                   if bridge.gravity_trim_on else "")
+                + ((" A move to a point more than "
+                    f"{bridge.LIFT_MIN_XY_M * 100:.0f} cm away sideways LIFTS "
+                    f"first ({bridge.lift_h * 100:.0f} cm above the lower "
+                    "end), travels across at that height and comes straight "
+                    "down, so it can take longer than 1.5 s; "
+                    "'path_min_tcp_z_m' is the lowest the tool MEASURED on "
+                    "the way. There is NO obstacle model: the lift height is "
+                    "the only clearance control."
+                    + " A real arm attached through a hardware backend gets "
+                    "ONE straight move_linear instead (the hardware API takes "
+                    "no waypoints), so it does NOT lift -- 'hardware_path' in "
+                    "the reply says so when one is connected.")
+                   if bridge.lift_on else "")
             ),
             parameters={
                 "type": "object",
@@ -8631,6 +9691,7 @@ def main() -> int:
         bridge.tick(sim_t)
 
     # World shutdown: kill the learn runner child cleanly, then the hardware.
+    bridge.close_trace()
     if bridge.learn is not None:
         bridge.learn.shutdown()
     if bridge.hw is not None:

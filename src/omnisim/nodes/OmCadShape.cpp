@@ -446,12 +446,8 @@ void OmCadShape::createWrenObjects() {
         warn(tr("Mesh '%1' has more than 100'000 vertices, it is recommended to reduce the number of vertices.")
                .arg(mesh->mName.C_Str()));
 
-      aiMatrix4x4 transform;
-      const aiNode *current = node;
-      while (current != NULL) {
-        transform *= current->mTransformation;
-        current = current->mParent;
-      }
+      // root * ... * parent * node (leaf-first until 2026-10-15, see omAssimpNodeWorldTransform)
+      const aiMatrix4x4 transform = omAssimpNodeWorldTransform(node);
 
       // create the arrays
       // std::vector, not new[]: the `currentIndexIndex == 0` early-continue below skipped the

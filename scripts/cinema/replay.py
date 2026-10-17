@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 import shutil
 import subprocess
@@ -224,6 +225,12 @@ def validate(manifest: Path) -> dict:
     return data
 
 
+def _blender_version(exe: Path) -> tuple:
+    # "Blender 4.4" (installer) and "blender-5.2.2-windows-x64" (portable zip).
+    match = re.search(r"\d+(?:\.\d+)+", exe.parent.name)
+    return tuple(int(n) for n in match.group().split(".")) if match else ()
+
+
 def find_blender(explicit=None):
     if explicit:
         path = shutil.which(str(explicit))
@@ -233,9 +240,14 @@ def find_blender(explicit=None):
     path = shutil.which("blender")
     if path:
         return path
-    candidates = sorted(Path("C:/Program Files/Blender Foundation").glob("Blender */blender.exe"))
+    # Standard Windows locations: the installer (Program Files) and the
+    # per-user portable/Store layout. Newest version wins, not newest name.
+    roots = [Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Blender Foundation"]
+    if os.environ.get("LOCALAPPDATA"):
+        roots.append(Path(os.environ["LOCALAPPDATA"]) / "Programs" / "Blender Foundation")
+    candidates = [exe for root in roots for exe in root.glob("*/blender.exe")]
     if candidates:
-        return str(candidates[-1])
+        return str(max(candidates, key=_blender_version))
     raise ValueError("Blender is required. Install it locally or pass --blender PATH; no native fallback")
 
 

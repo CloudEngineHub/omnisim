@@ -14,8 +14,12 @@
 
 #include "OmAssimpIoSystem.hpp"
 
+#include <assimp/scene.h>
+
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -140,4 +144,41 @@ Assimp::IOStream *OmAssimpIoSystem::Open(const char *file, const char *mode) {
 
 void OmAssimpIoSystem::Close(Assimp::IOStream *stream) {
   delete stream;
+}
+
+namespace {
+  // An environment variable's value, trimmed and lower-cased ("" when unset).
+  std::string envValueLower(const char *name) {
+    const char *raw = std::getenv(name);
+    std::string v = raw != nullptr ? raw : "";
+    while (!v.empty() && std::isspace(static_cast<unsigned char>(v.back())))
+      v.pop_back();
+    while (!v.empty() && std::isspace(static_cast<unsigned char>(v.front())))
+      v.erase(v.begin());
+    for (char &c : v)
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return v;
+  }
+
+  // OMNISIM_MESH_NODE_TRANSFORM_FIX: compose node transforms root-first (the
+  // fix, default) or leaf-first (=0, the pre-2026-10-15 product). Value-parsed.
+  bool meshNodeTransformFixEnabled() {
+    static const bool on = [] {
+      const std::string v = envValueLower("OMNISIM_MESH_NODE_TRANSFORM_FIX");
+      return v.empty() || (v != "0" && v != "false" && v != "off" && v != "no");
+    }();
+    return on;
+  }
+}  // namespace
+
+aiMatrix4x4 omAssimpNodeWorldTransform(const aiNode *node) {
+  aiMatrix4x4 transform;
+  const bool rootFirst = meshNodeTransformFixEnabled();
+  for (const aiNode *current = node; current != nullptr; current = current->mParent) {
+    if (rootFirst)
+      transform = current->mTransformation * transform;  // parent applied after its child
+    else
+      transform *= current->mTransformation;  // legacy leaf-first product
+  }
+  return transform;
 }

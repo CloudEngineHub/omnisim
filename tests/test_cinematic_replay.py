@@ -179,3 +179,20 @@ def test_recorder_never_commands_nodes_or_overwrites_a_take(tmp_path):
     assert len(replay.read_trace(path, ["body"])) == 2
     with pytest.raises(FileExistsError):
         PoseRecorder(path, {"body": node})
+
+
+def test_find_blender_prefers_newest_version_across_windows_install_roots(tmp_path, monkeypatch):
+    installer = tmp_path / "pf" / "Blender Foundation"
+    portable = tmp_path / "local" / "Programs" / "Blender Foundation"
+    for exe in (installer / "Blender 4.4" / "blender.exe",
+                installer / "Blender 10.0" / "blender.exe",
+                portable / "blender-5.2.2-windows-x64" / "blender.exe"):
+        exe.parent.mkdir(parents=True)
+        exe.write_bytes(b"")
+    monkeypatch.setenv("ProgramFiles", str(tmp_path / "pf"))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+    with mock.patch.object(replay.shutil, "which", return_value=None):
+        # A string sort would pick "Blender 4.4" over "Blender 10.0".
+        assert replay.find_blender() == str(installer / "Blender 10.0" / "blender.exe")
+        (installer / "Blender 10.0" / "blender.exe").unlink()
+        assert replay.find_blender() == str(portable / "blender-5.2.2-windows-x64" / "blender.exe")

@@ -37,7 +37,26 @@ Each config field:
     ik               optional. None means the bridge advertises position
                      control + presets only. A dict with keys
                      {chain, max_iters, tol, damping, max_dq} enables
-                     damped-least-squares IK to a TCP target.
+                     damped-least-squares IK to a TCP target. `tol` is the
+                     ACCEPTANCE gate for a solve; set_tcp_target polishes an
+                     accepted solve to 0.2 mm before it moves.
+    lift_height_m    optional, default 0.06. How far above the LOWER end a
+                     lateral set_tcp_target / set_tcp_pose travels, and how
+                     far reset_to_home retreats straight up from a low pose
+                     first (OMNISIM_ARM_LIFT_BEFORE_MOVE=0 turns the
+                     Cartesian up/across/down path off). There is no
+                     obstacle model: this height is the only clearance
+                     control.
+    gravity_trim_band_rad
+                     optional, default 0.05. The expected per-joint gravity
+                     sag: only joint errors inside it are integrated into
+                     the setpoint trim, and the trim is clamped to it.
+
+The bridge also holds every pose with an integral setpoint trim that cancels
+the engine servo's gravity sag, and reports a motion `settled` only once every
+joint has converged (OMNISIM_ARM_GRAVITY_TRIM=0 turns both off; the old
+behaviour exactly also needs OMNISIM_ARM_LIFT_BEFORE_MOVE=0). Nothing in a
+config entry is needed for that.
 
 The DLS IK chain format (per-joint tuple): (offset_xyz, offset_rpy, axis_xyz)
 in the URDF parent-frame convention. UR5e and OmniArm 6 ship worked
