@@ -70,6 +70,8 @@ can vary; the film removes waiting and compresses motion.
 
 Right-click the robot and choose **Show Robot Window**. When OmniLink is configured, send an instruction such as “Drive forward one meter, turn around, and tell me what you did.” Read the returned result before continuing.
 
+The robot acts only on instructions given in the current session. After a restart it may still remember earlier conversation, but it does not resume or repeat an earlier instruction: send it again if you want it carried out. By default the robot also does not start acting on its own when something happens in the simulation. To let it respond to simulator events without a new instruction, set `OMNILINK_EVENT_WAKE=1` before launching; it still waits for your first instruction in each session and ignores events while the robot settles at startup. Each event response is a model turn and uses your plan.
+
 Without a connection, the chat panel shows a setup link. Missing keys, failed authentication, missing provider credentials and model failures are errors, not a switch to basic command handling. A configured connection is not proof that provider access is valid: the first successful response confirms that.
 
 ## Ordinary simulator controls

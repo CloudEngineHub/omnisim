@@ -25,6 +25,107 @@ top of that foundation.
 ---
 
 
+## [v9.2.6] — 2026-10-18
+
+Light grippers now hold a part by friction, a URDF robot's own root collider is in the solver by
+default, and the OmniLink bridges never start a turn without a fresh prompt. Found running robot
+makers' published models (Robonine SO-ARM 102, Preferred Robotics Kachaka, WIRobotics ALLEX, MAB
+HB50W). Each fix has a pin test and a value-parsed hatch; the engine, runtime and bridges all change,
+so use the v9.2.6 installer. Arm grasps and multi-robot contact change: read the behaviour changes.
+
+### ⚠️ Behaviour changes — read before upgrading
+
+- **Light grippers hold a part by friction: fixed-base position servos carry the rotor inertia their
+  damping implies.** Every position servo is built `ke = effort*10`, `kd = effort*0.5` with no armature,
+  whatever the joint weighs. MuJoCo's implicit integrator applies the damping as `M + dt*kd`, but the
+  constraint solve (contacts, joint limits, a URDF `<mimic>` coupling) sizes its force against the bare
+  `M`, so on a joint with a large `dt*kd/M` every constraint acted at `M/(M+dt*kd)` strength. Measured on
+  Robonine's SO-ARM 102 (7 g jaws, `dt*kd/M` 13.6; wrist 857), OmniSim's own exported model replayed in
+  plain MuJoCo 3.11: the jaws closed 21 mm into a 40 mm cube, ran past their own limits (the mimic
+  follower 43 mm past with no part in the way) and the cube squirted out at lift-off at every jaw force
+  from 3 to 100 N, at 1 and 2 ms. Now every fixed-base position servo over `dt*kd/M = 1` gets exactly
+  `dt*kd - M` of armature (at most a 2× change in the inertia the integrator already applied; a mimic
+  follower gets its leader's), and MuJoCo's constraint weights for those joints are refreshed. Measured
+  after, in-engine through the gated `/prompt` ("Pick up the cube, then go home."): the SO-ARM 102 carries
+  the 40 mm cube 17.8 cm to home, 3.8 mm from the tool point, friction only — also at 1 ms, at 3 N, with
+  a larger cube and with two driven jaws; with the hatch off it drops it, as before. Elsewhere: ladder0
+  rung 8 with `newtonContactKe 4000 / 6000 / 8000` now carries (`carry_rel` 2.0 mm, was ejected at up to
+  2.33 m/s — the "ke trap" in the friction-grasp guide was this dilution); `friction_grasp_minimal` now
+  carries the part between its pads (it rose 0.2025 m for 0.2023 m of wrist travel, where before it was
+  squeezed out onto the wrist plate and read +0.2817 — the pin `tests/test_friction_grasp_holds.py` now
+  asserts the band around the wrist's travel); `omniarm6_real_pick_place` drift 4.8 → 0.7 mm; the TRLC
+  DK1 pilot still lifts its cube 21.1 cm; the UR5e chat arm's wave and home and the 2F-140 chat pick are
+  unchanged; SO-101 pick-place still succeeds and ALOHA's battery is no longer knocked 27 cm. ⚠
+  `omniarm6_physics_pick_place` still passes but its place distance went from 12 to 92 mm (limit 100):
+  the demo releases the cube ~25 cm above the place height (a separate, pre-existing bug in that demo)
+  and the dropped cube now slides further. A gain written after the first step (`setControlPID`, servo
+  promotion) re-judges that joint and its mimic followers. Free-floating robots (legged, humanoid, mobile) are NOT changed by default — their gaits and
+  policies were tuned on the old model, although they carry the same dilution (Go2 73, B2 74, a G1 wrist
+  723): `OMNISIM_NEWTON_SERVO_ARMATURE_SCOPE=all` covers them. Skipped when an RL recipe sets
+  `OMNISIM_NEWTON_TARGET_KD` / `_FINGER_KD` / `_ARM_KD`. Hatch: `OMNISIM_NEWTON_SERVO_ARMATURE_BOUND=0`
+  (a number sets the bound). Pins: `tests/test_newton_servo_armature_bound.py` (9 engine-free tests).
+- **An OmniLink bridge never starts a turn without a fresh operator prompt.** Observed on WIRobotics
+  ALLEX after an engine restart: the relay was woken by a `joint.limit_hit` at startup (the relaxed
+  fingers rest on their stops), short-term memory had restored the previous session's sentence, and the
+  arm re-ran that whole task before anyone typed. Now event-triggered turns are OFF by default
+  (`OMNILINK_EVENT_WAKE=1` opts in, value-parsed); even opted in, no wake fires before this session's
+  first operator turn, startup / settle events (first 5 s of sim or wall time) never wake, and restored
+  history carries a session-boundary note so nothing from a previous session is resumed unless asked
+  again. PROTOCOL.md wake section. Pins: `tests/test_no_unprompted_turns.py`, `test_event_wake.py`.
+- **A Robot's own root collider registers by default unless it would lift the robot off its wheels.**
+  A Robot wrapper with colliding links below it (every URDF mobile base, quadruped and humanoid) used to
+  get a 1 mm placeholder instead of its own `boundingObject` unless `WorldInfo.newtonRobotColliders TRUE`,
+  so a URDF robot's root-link `<collision>` did not exist in the solver and the log told the author to
+  "declare a boundingObject" it already declared. Measured on Preferred Robotics' Kachaka (chassis box
+  underside exactly on the tyre contact plane, no caster): by default the published file tipped onto its
+  nose (pitch 79°) where plain MuJoCo drags the box. Now the root shapes register and stay colliding
+  unless their lowest point is more than 2 mm below the level the robot stands on at the spawn pose
+  (`OMNISIM_NEWTON_ROBOT_ROOT_TOL`), the one envelope that really holds every wheel off the floor. That
+  level is the lowest one shared by at least two branches below the root (each child link and its
+  subtree: a wheel, a leg, a caster), so an arm hanging below the tyres in its zero pose does not set it;
+  the load log reports each verdict and the gap. Kachaka by default now drags at 0.464 of the commanded
+  0.26 m/s (identical to the `TRUE` run), turns at 0.182 of 1 rad/s, and with the box raised 5 mm plus two
+  casters drives at 0.998 / 0.983. Blast radius, open-loop drive A/B against the hatch (straight and pivot,
+  speed / yaw-rate ratio, rest height, min height, max pitch / roll): Husky, Jackal, ROSbot, ROSbot XL,
+  TurtleBot3 Burger and Waffle identical to 5 digits in all 12 cases — their chassis colliders now
+  register but sit 8.5-132 mm above the tyre plane (Burger 8.5, Waffle 10, ROSbot 22.5, XL 30.6, Jackal
+  63.5, Husky 132), so on flat ground they touch nothing; they will now hit an obstacle or a step with
+  the body as the file draws it. Full census (all 219 catalogued worlds, hatch A/B, bitwise-deterministic
+  replays): multi-robot worlds where robots meet (`husky_fleet_arena`, `agent_fleet_collision`) now
+  collide chassis to chassis and diverge after the first contact; `newton_smoke_test`'s robot no longer
+  sinks through the floor (lowest z -0.154 m before, 0.006 m now); the 8-Husky swarm, lidar-walls,
+  Jackal / TurtleBot3 drives and the X30 trot are identical. The warning for a wrapper that is left on the placeholder now says it
+  declares a boundingObject and why it is not registered. `newtonRobotColliders TRUE` still registers it
+  unconditionally. Hatch: `OMNISIM_NEWTON_ROBOT_ROOT_COLLIDER=0` (value-parsed) restores the old skip.
+  Pins: `tests/test_newton_robot_root_collider.py` (12 engine-free tests), `tests/test_newton_urdf_fixed_links.py`.
+
+### Fixed — OmniLink bridges
+
+- **A `/prompt` turn's budget honours `timeout_s` and counts simulated time.** The arm bridge called the
+  relay with a fixed 90 s wall budget and ignored the body; on WIRobotics ALLEX at 0.09-0.18x real time a
+  correct three-hover turn was cancelled after two hovers (`timeout_after_actions`, no reply, no home).
+  All four bridges (arm, mobile, quadruped, drone) now parse `timeout_s` (default 90, at most 600) and an
+  optional `wall_timeout_s` with one helper, and the turn is cancelled only once both the sim and the wall
+  clock have run `timeout_s`; `wall_timeout_s` (default 600) caps the wall clock alone for a sim that stops
+  stepping. A cancelled turn says which clock ran out (`budget.expired_on`). PROTOCOL.md §5.7. Pins:
+  `packages/omnisim-bridges/tests/test_prompt_budget.py`.
+- **`set_tcp_target` no longer reports a slow world as stalled.** The arm's wait called the world stalled
+  after 2 s of wall silence from the sim thread; one ~2.4 s engine tick on ALLEX ended a good hover as
+  `stalled, achieved: None, settled: False`, and the arm had reached the point (1.4 mm). The threshold is
+  10 s on every bridge (`bridge_base.STALL_GRACE_S`), and a wait that does give up now returns the joints'
+  last measured reading (`last_reading`, with the tool point and its error for a TCP verb) while `achieved`
+  stays null. The audit line names `stalled=True`. Pins: `packages/omnisim-bridges/tests/test_arm_slow_world_wait.py`.
+- **The mobile bridge faults a tipped base.** It measured only a planar pose, so the MAB HB50W rolled to a
+  48° tilt and every drive, turn and stop still reported success. It now measures the base tilt every tick
+  (`get_robot_state.tilt_deg`); above 35° it declares `fault: {code: "base_tilt"}`, stops the wheels, ends
+  the motion in flight with `settled: false` and the fault attached, refuses drive/turn until the base is
+  upright again, and the parser's reply says the robot tipped instead of "Drove +1.98 m". Limit:
+  `OMNISIM_MOBILE_TILT_LIMIT_DEG` or a robot config's `tilt_limit_deg`; hatch `OMNISIM_MOBILE_TILT_GUARD=0`
+  (value-parsed). PROTOCOL.md §11. Pins: `packages/omnisim-bridges/tests/test_mobile_tilt_guard.py`.
+
+---
+
+
 ## [v9.2.5] — 2026-10-17
 
 Two fixes found running robot makers' published models: OmniLink arms now hold the pose they are given

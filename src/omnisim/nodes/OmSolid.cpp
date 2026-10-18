@@ -4556,6 +4556,38 @@ void OmSolid::flushPendingNewtonRegistrations() {
               newtonFrictionForSolid(s->mNewtonFrictionTorsional),
               newtonFrictionForSolid(s->mNewtonFrictionRolling));
       }
+      // ROBOT ROOT COLLIDER BY DEFAULT (2026-10-17). The skip above left a
+      // wrapper's OWN boundingObject (a URDF robot's root-link <collision>) out
+      // of the solver whenever the robot had colliding descendants, and the
+      // warning below then told the author to "declare a boundingObject" the
+      // Solid already declares. MEASURED on Preferred Robotics' Kachaka (chassis
+      // box underside exactly on the tyre contact plane, no caster): by default
+      // the robot tipped onto its nose (pitch 79 deg) where OmniSim with the box
+      // registered and plain MuJoCo both drag it. P3.10j's real failure mode is
+      // narrower than "an envelope": a root collider that reaches BELOW the
+      // robot's own wheels holds every wheel off the floor. So the root shapes
+      // are now registered and bracketed, and the runtime keeps them colliding
+      // unless they reach more than 2 mm below the robot's descendant colliders
+      // at the spawn pose (World._resolve_robot_root_shapes), reporting either
+      // verdict. A runtime bundle without the bracket keeps the old placeholder.
+      // OMNISIM_NEWTON_ROBOT_ROOT_COLLIDER=0 restores the old skip (value-parsed).
+      const bool wrapperDeclaresBo = isRobotWrapper && s->mBoundingObject != nullptr &&
+                                     s->mBoundingObject->value() != nullptr &&
+                                     !isQuietUrdfInertiaPlaceholder(s->mBoundingObject->value());
+      bool wrapperRootRegistered = false;
+      if (!useBoundingObject && wrapperDeclaresBo &&
+          // Robot root collider by default (2026-10-17); =0 restores the 1 mm placeholder.
+          newtonEnvFlag("OMNISIM_NEWTON_ROBOT_ROOT_COLLIDER", true) &&
+          newton->markRobotRootShapes(idx, 0) == 0) {
+        shapeDesc = attachNewtonShapeFromBoundingObject(
+            newton, idx, dynamic_cast<OmBaseNode *>(s->mBoundingObject->value()),
+            newtonSoftKeForMaterial(s->mContactMaterial),
+            newtonFrictionForSolid(s->mNewtonFriction),
+            newtonFrictionForSolid(s->mNewtonFrictionTorsional),
+            newtonFrictionForSolid(s->mNewtonFrictionRolling));
+        newton->markRobotRootShapes(idx, 1);
+        wrapperRootRegistered = !shapeDesc.isEmpty();
+      }
       // Fixed-child colliders (see fixedChildOwnsNewtonBody): attach the
       // boundingObject of every joint-free descendant Solid that folds into
       // this body, at its pose relative to the body -- the harvest the
@@ -4643,7 +4675,23 @@ void OmSolid::flushPendingNewtonRegistrations() {
       // by dropping a reference cube beside it and comparing, which is the
       // expensive way to learn something the engine already knew. Warned once
       // per body, naming the solid and the substitution.
-      if (!shapeDesc.isEmpty() && (shapeDesc.contains("fallback") || shapeDesc.contains("placeholder") ||
+      // ⚠ A Robot wrapper that DOES declare a boundingObject and still got the
+      // placeholder was skipped by POLICY (the hatch, or a runtime bundle with no
+      // root-collider bracket), not by omission -- telling its author to "declare
+      // a boundingObject" sent the Kachaka lane after a field that was already
+      // there (2026-10-16). Say which -- also when fixed-child colliders (a lidar,
+      // a caster) attached, so shapeDesc names no placeholder (review, 2026-10-17).
+      const bool wrapperBoSkipped = !useBoundingObject && wrapperDeclaresBo && !wrapperRootRegistered;
+      if (wrapperBoSkipped) {
+        OmLog::warning(QObject::tr("Robot '%1' declares a boundingObject (on a URDF robot: its root link's <collision>), but "
+                                   "it is NOT registered as a collider (OMNISIM_NEWTON_ROBOT_ROOT_COLLIDER=0, or a "
+                                   "staged Newton runtime older than the root-collider rule). Its links and fixed-child "
+                                   "colliders still collide. Set "
+                                   "WorldInfo.newtonRobotColliders TRUE to register it regardless, or re-stage the "
+                                   "runtime (docs/guide/urdf-import.md).")
+                           .arg(s->name()),
+                       false, OmLog::ODE);
+      } else if (!shapeDesc.isEmpty() && (shapeDesc.contains("fallback") || shapeDesc.contains("placeholder") ||
                                    shapeDesc.contains("was cylinder"))) {
         OmLog::warning(QObject::tr("Solid '%1': the physics collider is NOT the authored geometry -- using %2. The "
                                    "body will contact the world at a different size or place than the scene shows. To collide as authored, declare a 'boundingObject' on this Solid (Box, Sphere, Capsule, Cylinder, Plane or a mesh, or a Group of several) -- a Robot with none gets the 1 mm placeholder by design. See docs/guide/newton-physics-backend.md.")

@@ -38,6 +38,19 @@ off for the run. If this test starts failing with SLIPPED again, suspect any
 "optimisation" of the CPU step path first, and read the gate's comment before
 weakening either.
 
+⚠ 2026-10-17: THE +0.2817 REFERENCE WAS THE EJECTION, NOT THE HOLD. The wrist
+only travels 0.205 m (LIFT_M), so a part carried between the pads can rise at
+most ~0.205 m. Measured with a probe copy of this world (wrist and finger
+positions logged per phase), OMNISIM_NEWTON_SERVO_ARMATURE_BOUND=0: the pads
+end 11.8 mm inside each face of the 40 mm part, and the part sits at z 0.3367
+ON TOP OF THE WRIST PLATE (its underside 0.3067 = the plate's top), clear of
+the pads -- the "squeezed out upward" mechanism the omniarm6 pick controllers
+already describe. With the position-servo armature bound (the default since
+2026-10-17) the pads stop 0.6 mm into the faces, the part centre stays 4 mm
+from the pad centre, rises 0.2025 m for 0.2023 m of wrist travel, and is set
+back down on the floor (0.0524) at the end. So the gate is now a BAND around
+the wrist's own travel: above it is physically an ejection, below it a slip.
+
 Skips (not failures) when the engine binary or the Newton runtime is absent,
 same convention as the other engine-driven Newton tests.
 
@@ -58,11 +71,13 @@ WORLD = REPO / "projects/samples/demos/worlds/starter/friction_grasp_minimal.omn
 VERDICT = (REPO / "projects/samples/demos/controllers/friction_grasp_minimal/"
                   "friction_grasp_result.json")
 
-#: The doc's reference is +0.2817 m (July-18 binary: +0.28173; current binary
-#: post-fix: +0.28169, bit-identical across three runs). The broken path reads
-#: -0.0003. 0.25 sits far from both noise bands: a pass means the box really
-#: rode up with the gripper, a fail means it stayed on the table.
-MIN_LIFT_M = 0.25
+#: The wrist travels 0.205 m (the controller's LIFT_M); a part held between the
+#: pads rises with it -- measured +0.2025 m on 2026-10-17. The old +0.2817
+#: reference (any binary before the position-servo armature bound) was the part
+#: ejected upward onto the wrist plate; the broken batch path reads -0.0003.
+#: The band accepts a few mm of slip and rejects both failure modes.
+MIN_LIFT_M = 0.185
+MAX_LIFT_M = 0.215
 
 
 def _binary():
@@ -98,9 +113,12 @@ def test_flagship_pinch_grasp_holds(tmp_path):
         pytest.skip("no verdict written (rc=%s) -- engine bring-up or timeout, "
                     "not a grasp result:\n%s" % (run.returncode, run.stdout[-800:]))
     v = json.loads(VERDICT.read_text())
-    assert v["verdict"] == "HELD" and v["lifted_by_m"] >= MIN_LIFT_M, (
+    assert v["verdict"] == "HELD" and MIN_LIFT_M <= v["lifted_by_m"] <= MAX_LIFT_M, (
         "the flagship pinch demo did not hold: verdict=%s lifted=%.5f m "
-        "(reference +0.2817). If this reads SLIPPED with lifted ~ -0.0003, the "
-        "batched CPU control path is mangling force-mode control again -- see "
-        "the joint_forces gate in _mjc_batch_substeps_ok, OmNewtonBackend.cpp."
+        "(reference +0.2025 for 0.205 m of wrist travel). If this reads SLIPPED "
+        "with lifted ~ -0.0003, the batched CPU control path is mangling "
+        "force-mode control again -- see the joint_forces gate in "
+        "_mjc_batch_substeps_ok, OmNewtonBackend.cpp. If it reads ~+0.28 the "
+        "part was squeezed out onto the wrist plate: the position-servo armature "
+        "bound (OMNISIM_NEWTON_SERVO_ARMATURE_BOUND) is off or not staged."
         % (v["verdict"], v["lifted_by_m"]))

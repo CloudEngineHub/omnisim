@@ -56,7 +56,7 @@ import pytest
 
 from omnisim_bridges import route as _route
 from omnisim_bridges.http_security import (
-    RequestError, finite_number, nonempty_string, require_field)
+    RequestError, finite_number, nonempty_string, prompt_budget, require_field)
 
 ROOT = Path(__file__).resolve().parents[3]
 CONTROLLERS = ROOT / "projects/samples/demos/controllers"
@@ -174,6 +174,7 @@ def _http_prompt(kind: str, text: str, bridge: FakeBridge, relay: Mock):
         "relay": relay, "bridge": bridge,
         "nonempty_string": nonempty_string, "require_field": require_field,
         "finite_number": finite_number, "RequestError": RequestError,
+        "prompt_budget": prompt_budget,
         "shared_short_circuit": _route.short_circuit,
         "_shared_short_circuit": _route.short_circuit,
         "shared_reply_payload": _route.reply_payload,
@@ -258,6 +259,7 @@ def test_the_drone_http_prompt_parses_before_it_pays():
         "state": SimpleNamespace(omnilink_relay=relay),
         "connection_error": lambda: {"error": "omnikey_required"},
         "nonempty_string": nonempty_string, "require_field": require_field,
+        "prompt_budget": prompt_budget,
         "_shared_short_circuit": _route.short_circuit,
         "_reply_payload": _route.reply_payload,
         # §5.7.2 / D3: `via` is stamped on every 200 from /prompt.

@@ -265,6 +265,7 @@ from _omnilink_relay.http_security import (  # noqa: E402
     error_envelope,
     finite_number,
     nonempty_string,
+    prompt_budget,
     read_json,
     require_field,
     validate_request_id,
@@ -1289,6 +1290,26 @@ class MobileBridge:
         self.self_node = robot.getSelf()
         self.start_xyz = list(self.self_node.getPosition())
         self.start_yaw = yaw_from_orientation(self.self_node.getOrientation())
+        # BASE-TILT GUARD (see _tilt_guard). Value-parsed, per AGENTS.md:
+        # OMNISIM_MOBILE_TILT_GUARD=0 turns it off; the limit comes from
+        # OMNISIM_MOBILE_TILT_LIMIT_DEG, else the robot config's
+        # `tilt_limit_deg`, else TILT_LIMIT_DEG. The tilt itself is measured
+        # either way and reported as get_robot_state.tilt_deg.
+        self.tilt_guard_on = (
+            _os.environ.get("OMNISIM_MOBILE_TILT_GUARD", "1").strip().lower()
+            not in ("0", "false", "no", "off"))
+        try:
+            self.tilt_limit_deg = float(
+                _os.environ.get("OMNISIM_MOBILE_TILT_LIMIT_DEG")
+                or cfg.get("tilt_limit_deg") or self.TILT_LIMIT_DEG)
+        except (TypeError, ValueError):
+            self.tilt_limit_deg = self.TILT_LIMIT_DEG
+        if not (5.0 <= self.tilt_limit_deg <= 85.0):
+            print(f"[omnilink_mobile_bridge] WARNING: tilt limit "
+                  f"{self.tilt_limit_deg} deg out of range [5, 85], using "
+                  f"{self.TILT_LIMIT_DEG}", flush=True)
+            self.tilt_limit_deg = self.TILT_LIMIT_DEG
+        self.tilt_deg: Optional[float] = None
         self.last_xy = (self.start_xyz[0], self.start_xyz[1])
         self.last_yaw = wrap_pi(self.start_yaw - self.yaw_offset)
         self.v_linear = 0.0
@@ -1370,7 +1391,7 @@ class MobileBridge:
         self.on_operator_stop: List[Any] = []
         self.motion_seq = 0
         self.last_completion: Optional[dict] = None
-        self.fault: Optional[str] = None
+        self.fault: Optional[dict] = None   # §5.3 object; see _tilt_guard
         self.last_tick_at = time.time()
 
         # ── D1 / D4 / D6: the clock, the ring, the detectors, the hold ──
@@ -2296,6 +2317,160 @@ class MobileBridge:
         return (f"halted at ({x:+.1f},{y:+.1f}): outside the site bounds "
                 f"(|x|<={self.SITE_HALF_X}, |y|<={self.SITE_HALF_Y})")
 
+    # ── Base-tilt guard (2026-10-17) ──────────────────────────────
+    # THE DEFECT. A planar pose difference was the only thing a drive, turn
+    # or stop measured, so a base that had fallen over still reported
+    # success. MEASURED (MAB HB50W wheeled quadruped, installed v9.2.5, a
+    # higher-friction contact setting): the base rolled to a 48 deg tilt,
+    # lost a wheel contact and ended 101 deg off its heading, and the bridge
+    # answered "Drove +1.98 m. Turned +89 deg. Drove +0.92 m. Stopped...
+    # standing still." Nothing in the reply said it was lying on its side.
+    #
+    # The guard measures the angle between the robot node's +Z axis and
+    # world +Z every tick (the same up axis reset_to_home restores). Above
+    # the limit it declares `fault: {code: "base_tilt", ...}` (§5.3, filed
+    # as a fault event by the shared detector), zeroes the wheels, ends any
+    # motion in flight with `settled: false` and the fault attached, and
+    # refuses new drive/turn commands. It is a LATCH like the site fence:
+    # it re-fires every tick until the base is back below
+    # limit - TILT_CLEAR_MARGIN_DEG (reset_to_home rights it), then clears
+    # on its own. Hatch: OMNISIM_MOBILE_TILT_GUARD=0.
+    TILT_LIMIT_DEG = 35.0
+    TILT_CLEAR_MARGIN_DEG = 5.0
+
+    def _read_tilt_deg(self) -> Optional[float]:
+        """SIM THREAD ONLY. Angle between the node's +Z and world +Z."""
+        try:
+            r = self.self_node.getOrientation()
+            c = clamp(float(r[8]), -1.0, 1.0)
+        except Exception:
+            return None
+        return math.degrees(math.acos(c))
+
+    def _tilt_faulted(self) -> bool:
+        f = self.fault
+        return isinstance(f, dict) and f.get("code") == "base_tilt"
+
+    def _tilt_guard(self, x: float, y: float, yaw: float) -> None:
+        """SIM THREAD ONLY. Measure the tilt; trip, hold or clear the fault."""
+        tilt = self._read_tilt_deg()
+        self.tilt_deg = None if tilt is None else round(tilt, 3)
+        if tilt is None or not self.tilt_guard_on:
+            return
+        if self._tilt_faulted():
+            if tilt < self.tilt_limit_deg - self.TILT_CLEAR_MARGIN_DEG:
+                was = self.fault
+                self.fault = None
+                msg = (f"base upright again ({tilt:.1f} deg from upright); "
+                       f"tilt fault cleared after peak "
+                       f"{was.get('peak_tilt_deg', tilt):.1f} deg")
+                self.queue_window("system:" + msg)
+                print(f"[omnilink_mobile_bridge] {self.robot_id}: {msg}",
+                      flush=True)
+                return
+            # The message tracks the CURRENT tilt (a base that tipped at 40
+            # deg may end on its back); `code` stays fixed, so the shared
+            # detector files one fault event, not one per tick.
+            self.fault["tilt_deg"] = round(tilt, 2)
+            self.fault["peak_tilt_deg"] = round(
+                max(tilt, float(self.fault.get("peak_tilt_deg", 0.0))), 2)
+            self.fault["message"] = self._tilt_message(tilt)
+            self._halt_for_fault(x, y, yaw)
+            return
+        if tilt <= self.tilt_limit_deg:
+            return
+        self.fault = {
+            "code": "base_tilt",
+            "message": self._tilt_message(tilt),
+            "since_t": round(self.sim_time, 6),
+            "tilt_deg": round(tilt, 2),
+            "peak_tilt_deg": round(tilt, 2),
+            "limit_deg": self.tilt_limit_deg,
+            "pose_at_fault": {"x": round(x, 4), "y": round(y, 4),
+                              "yaw": round(yaw, 4)},
+        }
+        self.queue_window("error:" + self.fault["message"])
+        print(f"[omnilink_mobile_bridge] {self.robot_id}: FAULT "
+              f"{self.fault['message']}", flush=True)
+        self._halt_for_fault(x, y, yaw)
+
+    def _tilt_message(self, tilt: float) -> str:
+        return (f"base tilted {tilt:.0f} deg from upright (limit "
+                f"{self.tilt_limit_deg:.0f} deg): wheels stopped and "
+                f"drive/turn refused until it is upright again -- "
+                f"reset_to_home rights it")
+
+    def _halt_for_fault(self, x: float, y: float, yaw: float) -> None:
+        """Zero the wheels and end whatever motion is in flight, recording
+        what it MEASURED so far with the fault attached -- so a waiting
+        caller hears "faulted at +1.2 m of 2.0", never a silent idle."""
+        with self.lock:
+            kind, p = self.motion
+            self.motion = ("idle", {})
+        self._command_velocity(0.0, 0.0)
+        if kind == "idle" or not p.get("seq"):
+            return
+        fault = dict(self.fault or {})
+        p_done = dict(p)
+        p_done["completion_reason"] = "fault"
+        if kind == "drive":
+            yaw0 = p.get("yaw0")
+            if yaw0 is None:
+                travelled = math.sqrt((x - p["x0"]) ** 2 + (y - p["y0"]) ** 2)
+                achieved = math.copysign(travelled,
+                                         p.get("commanded", 1.0) or 1.0)
+            else:
+                achieved = ((x - p["x0"]) * math.cos(yaw0)
+                            + (y - p["y0"]) * math.sin(yaw0))
+            self._record_completion(p_done, achieved, settled=False,
+                                    timed_out=False, fault=fault)
+        elif kind == "turn":
+            remaining = float(p.get("remaining", p.get("commanded", 0.0)))
+            if p.get("phase") in ("pulse", "settle") and "pulse_y0" in p:
+                remaining -= wrap_pi(yaw - p["pulse_y0"])
+            self._record_completion(
+                p_done, float(p.get("commanded", 0.0)) - remaining,
+                settled=False, timed_out=False, fault=fault)
+        else:
+            # A motion kind this guard has no measurement rule for: say so,
+            # with achieved null rather than a number nobody measured.
+            self.last_completion = {
+                "bridge_instance_id": self.bridge_instance_id,
+                "seq": int(p.get("seq", 0)),
+                "verb": p.get("verb", kind),
+                "commanded": p.get("commanded"),
+                "achieved": None, "error": None,
+                "unit": p.get("unit", ""),
+                "settled": False, "timed_out": False, "superseded": False,
+                "completion_reason": "fault", "fault": fault,
+                "note": ("ended by the base-tilt guard before it finished; "
+                         "how far it got was not measured -- read "
+                         "get_robot_state for the live pose"),
+                "sim_time": self.sim_time,
+            }
+            if emit_motion_outcome is not None:
+                emit_motion_outcome(self.events, self.last_completion,
+                                    sim_time=self.sim_time,
+                                    step=self.sim_step, robot=self.robot_id)
+        self.queue_window(f"system:{p.get('verb', kind)} ended by the "
+                          f"base-tilt guard")
+
+    def _fault_refusal(self) -> Optional[dict]:
+        """The refusal a drive/turn gets while the base is tipped."""
+        if not self._tilt_faulted():
+            return None
+        f = dict(self.fault)
+        return {
+            "accepted": False, "ok": False,
+            "error": "base_tilt", "rule": "base_tilt", "code": "base_tilt",
+            "http_status": 409,
+            "fault": f,
+            "message": f.get("message", "base tilted"),
+            "say": (f"I cannot move: my base is tipped "
+                    f"{f.get('tilt_deg', 0.0):.0f} deg from upright. I need "
+                    "to be righted first (reset_to_home)."),
+        }
+
     # ── D4: the contact feed ──────────────────────────────────────
 
     # Every N ticks, not every tick. At the default 32 ms basic step this is
@@ -2579,6 +2754,9 @@ class MobileBridge:
         if kind_fence := self._fence_guard():
             self.queue_window("error:" + kind_fence)
             print(f"[omnilink_mobile_bridge] {kind_fence}", flush=True)
+        # TILT GUARD -- also before any motion is applied, for the same
+        # reason: a base lying on its side must not be driven by anybody.
+        self._tilt_guard(x, y, yaw)
 
         with self.lock:
             kind, p = self.motion
@@ -3633,6 +3811,9 @@ class MobileBridge:
         and silently clobbered whatever was running, while the shipped tool
         description promised the caller a 409.
         """
+        refusal = self._fault_refusal()
+        if refusal is not None:
+            return None, refusal
         with self.lock:
             kind, p = self.motion
             if kind in ("drive", "turn"):
@@ -3960,10 +4141,18 @@ class MobileBridge:
         elif hold is not None:
             out["note"] += (" This robot has no autonomy loop, so nothing "
                             "will move it until you command it again.")
+        if self._tilt_faulted():
+            # At rest is not the same as fine: a base lying on its side is
+            # perfectly stationary. Say both.
+            out["fault"] = dict(self.fault)
+            out["note"] += (" BUT THE BASE IS FAULTED: "
+                            + str(self.fault.get("message", "base tilted"))
+                            + ". Tell the operator it has tipped over.")
         return out
 
     def _record_completion(self, p: dict, achieved: float,
-                           settled: bool, timed_out: bool) -> None:
+                           settled: bool, timed_out: bool,
+                           fault: Optional[dict] = None) -> None:
         """Called from the tick when a motion ends. This is the ONLY place a
         motion result is written, and it writes what was MEASURED."""
         commanded = float(p.get("commanded", 0.0))
@@ -3992,6 +4181,10 @@ class MobileBridge:
             "steps": (None if step0 is None
                       else max(0, self.sim_step - int(step0))),
         }
+        if p.get("completion_reason"):
+            self.last_completion["completion_reason"] = p["completion_reason"]
+        if fault:
+            self.last_completion["fault"] = dict(fault)
         # D4: a motion that timed out or gave up short is an EVENT. The
         # agent asked for something and did not get it, and until now the
         # only way it could find out was to have been waiting on the call.
@@ -5002,6 +5195,11 @@ class MobileBridge:
             "v_angular": self.v_angular,
             "mode": kind,
             "fault": self.fault,
+            # Measured every tick (node +Z vs world +Z); the guard's limit
+            # beside it so a reader can see how close the base is.
+            "tilt_deg": self.tilt_deg,
+            "tilt_limit_deg": (self.tilt_limit_deg if self.tilt_guard_on
+                               else None),
             # ⚠️ SIM SECONDS, as PROTOCOL.md §5.3 has always shown it. This
             # used to send `time.time()` -- 1.7 billion where the spec's own
             # example reads 12.448 -- so a client differencing it against
@@ -8960,10 +9158,10 @@ def make_handler(bridge: MobileBridge, relay: Any = None):
                 # Long physical sequences can exceed the ordinary chat wait,
                 # especially while capturing native frames. Keep cancellation
                 # bounded, but let the caller budget for a complete sequence.
-                prompt_timeout_s = finite_number(body.get("timeout_s", 90.0), "timeout_s")
-                if not 0 < prompt_timeout_s <= 600:
-                    raise RequestError(400, "bad_request",
-                                       "timeout_s must be greater than zero and at most 600")
+                # `timeout_s` counts on the SLOWER of the sim and wall clocks
+                # (dispatch_sync's rule, 2026-10-17); `wall_timeout_s` is the
+                # hard wall ceiling for a world that stops stepping.
+                prompt_timeout_s, prompt_wall_s = prompt_budget(body)
                 # Give the intent store the operator's VERBATIM words for the
                 # turn: hold_until_told checks them so a model cannot turn a
                 # bare "stop" into an indefinite hold by inventing an
@@ -9016,7 +9214,10 @@ def make_handler(bridge: MobileBridge, relay: Any = None):
                                     _lane = "aside"
                             except Exception:
                                 _lane = "main"
-                        out = relay.dispatch_sync(text, timeout_s=prompt_timeout_s, lane=_lane)
+                        out = relay.dispatch_sync(
+                            text, timeout_s=prompt_timeout_s, lane=_lane,
+                            sim_clock=lambda: bridge.sim_time,
+                            wall_timeout_s=prompt_wall_s)
                         bridge.end_chat_turn(prev_pause_marker,
                                              out.get("actions"))
                         # AFTER end_chat_turn on purpose: the pause decision

@@ -4976,6 +4976,222 @@ class World:
                 "non-colliding: their robots' links carry the contact. "
                 "OMNISIM_NEWTON_WRAPPER_PLACEHOLDER_COLLIDES=1 restores them." % len(quieted))
 
+    def mark_robot_root_shapes(self, body_idx, phase):
+        """Bracket the shapes a Robot wrapper attaches from its OWN
+        boundingObject (2026-10-17). OmSolid.cpp calls phase 0 just before
+        attaching them and phase 1 just after; _resolve_robot_root_shapes then
+        decides at finalize whether they collide. BUILD phase only. Returns 0,
+        or -1 (unknown body / not building)."""
+        if self.model is not None or self.builder is None:
+            return -1
+        b = int(body_idx)
+        n = len(self.builder.shape_body)
+        pend = self.__dict__.setdefault("_robot_root_pending", {})
+        if int(phase) == 0:
+            pend[b] = n
+            return 0
+        start = pend.pop(b, None)
+        if start is None:
+            return -1
+        if n > start:
+            self.__dict__.setdefault("_robot_root_shapes", {})[b] = list(range(start, n))
+        return 0
+
+    @staticmethod
+    def _quat_rotate(q, v):
+        # (x, y, z, w) quaternion -- warp/newton's layout -- applied to v.
+        x, y, z, w = (float(c) for c in q)
+        vx, vy, vz = (float(c) for c in v)
+        tx = 2.0 * (y * vz - z * vy)
+        ty = 2.0 * (z * vx - x * vz)
+        tz = 2.0 * (x * vy - y * vx)
+        return (vx + w * tx + (y * tz - z * ty),
+                vy + w * ty + (z * tx - x * tz),
+                vz + w * tz + (x * ty - y * tx))
+
+    def _shape_up_min(self, sid, up):
+        """Lowest point of shape ``sid`` along the unit vector ``up`` at its
+        spawn pose, or None when the geometry cannot be bounded (plane,
+        heightfield, an unreadable mesh) -- callers must then not judge."""
+        bld = self.builder
+        try:
+            import numpy as _np
+            gt = int(bld.shape_type[sid])
+            sc = [float(c) for c in bld.shape_scale[sid]]
+            stf = bld.shape_transform[sid]
+            body = int(bld.shape_body[sid])
+            if body >= 0:
+                btf = [float(c) for c in bld.body_q[body]]
+                bp, bq = btf[:3], btf[3:7]
+            else:
+                bp, bq = [0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]
+            stf = [float(c) for c in stf]
+            sp, sq = stf[:3], stf[3:7]
+            r = self._quat_rotate
+            centre = [a + b for a, b in zip(bp, r(bq, sp))]
+
+            def axis(local):
+                return r(bq, r(sq, local))
+            c_up = sum(a * b for a, b in zip(centre, up))
+            G = newton.GeoType
+            if gt == int(G.SPHERE):
+                return c_up - sc[0]
+            if gt == int(G.BOX):
+                ext = sum(abs(sum(a * b for a, b in zip(axis(e), up))) * h
+                          for e, h in (((1, 0, 0), sc[0]), ((0, 1, 0), sc[1]), ((0, 0, 1), sc[2])))
+                return c_up - ext
+            if gt in (int(G.CAPSULE), int(G.CYLINDER)):
+                az = abs(sum(a * b for a, b in zip(axis((0, 0, 1)), up)))
+                rad, hh = sc[0], sc[1]
+                if gt == int(G.CAPSULE):
+                    return c_up - (rad + hh * az)
+                return c_up - (hh * az + rad * (max(0.0, 1.0 - az * az) ** 0.5))
+            if gt in (int(G.MESH), int(G.CONVEX_MESH)):
+                src = bld.shape_source[sid]
+                verts = _np.asarray(getattr(src, "vertices", None), dtype=float)
+                if verts.ndim != 2 or len(verts) == 0:
+                    return None
+                # up expressed in the shape's local frame, then one dot product
+                # per vertex in numpy: a 97k-vertex wheel mesh (Rover MEGA) took
+                # seconds as a per-vertex Python rotation.
+                up_local = [sum(a * b for a, b in zip(axis(e), up))
+                            for e in ((1, 0, 0), (0, 1, 0), (0, 0, 1))]
+                ups = (verts[:, :3] * _np.asarray(sc[:3])) @ _np.asarray(up_local)
+                return c_up + float(ups.min())
+        except Exception:                               # noqa: BLE001
+            return None
+        return None
+
+    @staticmethod
+    def _support_level(lows, band=0.005):
+        """The height a robot stands on, from the lowest point of each BRANCH
+        below its root (one per child link: a wheel, a leg, a caster, an arm).
+
+        Wheels and feet come at least in pairs at one height; one branch
+        hanging lower than all the others at the spawn pose (an arm or gripper
+        in its zero pose, a sensor on a joint) is not what the robot stands on,
+        and taking the plain minimum let it pull the reference under the tyres
+        -- so a chassis box reaching below the wheels was kept and held them
+        off the floor (review, 2026-10-17). Returns the lowest level shared by
+        at least two branches within ``band``; a single-branch support (a
+        ballbot, a unicycle) falls back to the plain minimum.
+        """
+        vals = sorted(float(v) for v in lows)
+        for i in range(len(vals) - 1):
+            if vals[i + 1] - vals[i] <= band:
+                return vals[i]
+        return vals[0]
+
+    def _resolve_robot_root_shapes(self):
+        """Keep a Robot's ROOT collider unless it would lift the robot off its
+        own wheels / feet (2026-10-17).
+
+        ⚠ WHY. OmSolid.cpp used to give every Robot wrapper with colliding
+        descendants a 1 mm placeholder INSTEAD of its own boundingObject (P3.10i
+        / P3.10j: "a chassis-envelope box that engulfs the wheel space pins the
+        body") unless WorldInfo.newtonRobotColliders TRUE -- so a URDF robot's
+        root-link <collision> silently did not exist, and the log said the Solid
+        declared no boundingObject although it did. MEASURED (Preferred
+        Robotics' Kachaka, chassis box underside exactly on the tyre contact
+        plane): by default the robot tipped onto its nose (pitch 79 deg) where
+        both OmniSim-with-colliders and plain MuJoCo drag the box.
+
+        THE RULE, from geometry at the spawn pose, along the world up axis:
+        the root shapes are kept colliding unless their lowest point is more
+        than ROOT_BELOW_TOL below the lowest point of the robot's own descendant
+        colliders -- the one shape of "envelope" that really does stop a robot
+        driving (every wheel held off the floor). A root collider level with
+        the tyre plane (Kachaka) or above it (a Husky's chassis boxes sit
+        13 cm up) is kept: it is the file's geometry, and it touches the world
+        only where the file says the body does. Self-contact is unaffected
+        (intra-robot pairs are filtered at finalize). When the geometry cannot
+        be bounded (plane, heightfield) the shapes are kept and the note says
+        so. Returns nothing; records an engine note either way.
+
+        Hatch (engine side, value-parsed): OMNISIM_NEWTON_ROBOT_ROOT_COLLIDER=0
+        restores the 1 mm placeholder for every wrapper.
+        """
+        roots = getattr(self, "_robot_root_shapes", None)
+        if not roots:
+            return
+        # How far (m) a Robot's root collider may reach below its own wheels/feet before
+        # it is made non-colliding (default 0.002).
+        tol = self._env_float("OMNISIM_NEWTON_ROBOT_ROOT_TOL", 0.002)
+        bld = self.builder
+        try:
+            collide = int(newton.ShapeFlags.COLLIDE_SHAPES)
+        except Exception:                                   # noqa: BLE001
+            from newton.geometry import ShapeFlags as _SF
+            collide = int(_SF.COLLIDE_SHAPES)
+        up = tuple(float(c) for c in getattr(bld, "up_vector", (0.0, 0.0, 1.0)))
+        children = {}
+        for j in getattr(self, "pending_revolutes", ()) or ():
+            try:
+                children.setdefault(int(j["parent"]), []).append(int(j["child"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        flags = bld.shape_flags
+        body_shapes = getattr(bld, "body_shapes", {}) or {}
+        kept, quieted, census = [], [], []
+        for body, sids in sorted(roots.items()):
+            own = [s for s in sids if 0 <= s < len(flags) and int(flags[s]) & collide]
+            if not own:
+                continue
+            # Lowest colliding point per BRANCH (each child link of the root and
+            # everything below it): a wheel, a leg, a caster -- or a whole arm.
+            desc, seen = {}, {body}
+            stack = [(c, c) for c in children.get(body, ())]
+            while stack:
+                b, branch = stack.pop()
+                if b in seen:
+                    continue
+                seen.add(b)
+                lows = [self._shape_up_min(int(s), up) for s in body_shapes.get(b, ()) or ()
+                        if int(flags[int(s)]) & collide]
+                lows = [v for v in lows if v is not None]
+                if lows:
+                    desc[branch] = min(min(lows), desc.get(branch, float("inf")))
+                stack.extend((c, branch) for c in children.get(b, ()))
+            own_min = [self._shape_up_min(s, up) for s in own]
+            if not desc or any(v is None for v in own_min):
+                kept.append(body)
+                census.append((body, None, None, "kept (not judged)"))
+                continue
+            o, dmin = min(own_min), self._support_level(list(desc.values()))
+            if o < dmin - tol:
+                for s in own:
+                    flags[s] = int(flags[s]) & ~collide
+                quieted.append((body, o, dmin))
+                census.append((body, o, dmin, "QUIETED"))
+            else:
+                kept.append(body)
+                census.append((body, o, dmin, "kept"))
+        self._robot_root_census = census
+        for body, o, dmin, verdict in census:
+            self._newton_log(
+                "[OmNewtonBackend] robot root collider body %d: %s (root lowest %s, "
+                "descendant colliders lowest %s, up axis %s)"
+                % (body, verdict, "n/a" if o is None else "%.4f" % o,
+                   "n/a" if dmin is None else "%.4f" % dmin, up))
+        if kept:
+            gaps = ["%+.1f mm" % ((o - d) * 1000.0) for (_b, o, d, v) in census
+                    if v == "kept" and o is not None]
+            self._set_engine_note(
+                "robot_root_collider",
+                "%d Robot root collider(s) registered from the robot's own boundingObject "
+                "(lowest point vs its wheels/feet: %s). Before 2026-10-17 they were left out "
+                "unless WorldInfo.newtonRobotColliders TRUE. "
+                "OMNISIM_NEWTON_ROBOT_ROOT_COLLIDER=0 restores the old placeholder."
+                % (len(kept), ", ".join(gaps[:8]) or "not judged"))
+        if quieted:
+            self._set_engine_note(
+                "robot_root_collider_quiet",
+                "%d Robot root collider(s) kept on the body but made NON-colliding: each "
+                "reaches below its own wheels/feet (%s) and would hold them off the floor. "
+                "WorldInfo.newtonRobotColliders TRUE registers it anyway."
+                % (len(quieted), ", ".join("%.1f mm below" % ((d - o) * 1000.0)
+                                          for (_b, o, d) in quieted[:8])))
+
     def _set_engine_note(self, key, text):
         """One keyed line for the engine log, emitted after finalize via
         _fin_report() (the runtime's only finalize-time channel into OmLog;
@@ -6846,6 +7062,7 @@ class World:
                              "(HingeJointParameters/JointParameters.position); "
                              "OMNISIM_NEWTON_SPAWN_AT_POSITION=0 reverts" % self._n_seeded_q)
         self._quiet_wrapper_placeholders()
+        self._resolve_robot_root_shapes()
         self._fin_mark("topology")
         # newton raises "Cannot create an articulation with no joints" on an
         # empty list (builder.py:3062). Every world with a body has at least the
@@ -9756,6 +9973,425 @@ class World:
             self._newton_log("[OmNewtonBackend] velocity-gain clamp skipped: "
                              "%r" % (exc,))
 
+    @staticmethod
+    def _servo_armature_bound():
+        """OMNISIM_NEWTON_SERVO_ARMATURE_BOUND, value-parsed.
+
+        Unset / empty -> 1.0 (the default: dt*kv <= M_eff, the same invariant
+        the velocity-servo clamp holds). ``0`` / ``off`` / ``false`` / ``no``
+        -> None (the pass is off: today's behaviour before 2026-10-17). Any
+        other positive number is the bound itself (a looser bound touches
+        fewer joints). Unparseable or non-positive -> None (off, never a guess).
+        """
+        # Position-servo armature bound (2026-10-17): fixed-base servos get armature so
+        # dt*kd/M_eff <= this (default 1); 0/off restores the old model (light jaws then
+        # close into a part and throw it). Value-parsed.
+        raw = _os.environ.get("OMNISIM_NEWTON_SERVO_ARMATURE_BOUND")
+        if raw is None or raw.strip() == "":
+            return 1.0
+        if raw.strip().lower() in ("0", "off", "false", "no"):
+            return None
+        try:
+            v = float(raw)
+        except ValueError:
+            return None
+        return v if v > 0.0 else None
+
+    @staticmethod
+    def _servo_armature_scope():
+        """OMNISIM_NEWTON_SERVO_ARMATURE_SCOPE: ``fixed`` (default) or ``all``.
+
+        ``fixed``: only articulations whose root is welded to the world (a
+        ``staticBase`` arm, a welded root) -- the manipulators whose grasps
+        this exists for. A free-floating robot (legged, humanoid, a mobile
+        base) is left bit-identical, because its gaits and RL policies were
+        tuned against today's dynamics (measured census, 2026-10-17: every
+        Go2 / B2 / G1 / X30 / Lite3 world in the catalogue has servos over
+        the bound). ``all`` applies the same bound to them too.
+        """
+        # Scope of the position-servo armature bound: "fixed" (default, robots welded to
+        # the world) or "all" (also free-floating legged / humanoid / mobile robots).
+        raw = (_os.environ.get("OMNISIM_NEWTON_SERVO_ARMATURE_SCOPE") or "").strip().lower()
+        return "all" if raw == "all" else "fixed"
+
+    def _refresh_invweights(self, m, mj, joints, wm=None):
+        """Recompute MuJoCo's constraint-regularisation weights for the DoFs
+        of ``joints`` and the bodies they carry, after armature was added
+        post-compile.
+
+        MuJoCo sizes every constraint's softness (R = (1-d)/d * A_approx)
+        from dof_invweight0 / body_invweight0, which mj_setConst computes ONCE
+        at compile time from the inertia then present. Armature added after
+        that leaves them describing the bare joint: a mimic equality between a
+        leader and a follower that both carry 0.09 kg of armature still
+        regularises as if each were 7 g, i.e. ~14x softer than its new
+        inertia warrants (measured, minimal two-jaw pinch: follower 15 mm off
+        its mirror with stale weights). Only the entries this pass changed
+        are written back -- every other DoF and body keeps its compiled value
+        bit-for-bit, so wheel armature (added the same way) is untouched.
+        A deep copy takes mj_setConst so the live model's other constants
+        (stat, actuator_acc0, ...) are not recomputed.
+        """
+        try:
+            import copy as _cp
+            m2 = _cp.deepcopy(m)
+            d2 = mj.MjData(m2)
+            mj.mj_setConst(m2, d2)
+            jset = set(int(j) for j in joints)
+            roots = set(int(m.jnt_bodyid[j]) for j in jset)
+            n_d = 0
+            for j in jset:
+                dof = int(m.jnt_dofadr[j])
+                m.dof_invweight0[dof] = m2.dof_invweight0[dof]
+                n_d += 1
+            n_b = 0
+            for b in range(1, int(m.nbody)):
+                p, hit = b, False
+                while p > 0:
+                    if p in roots:
+                        hit = True
+                        break
+                    p = int(m.body_parentid[p])
+                if hit:
+                    m.body_invweight0[b] = m2.body_invweight0[b]
+                    n_b += 1
+            if wm is not None:          # mujoco_warp steps the device copy
+                for _name, _idx in (("dof_invweight0", [int(m.jnt_dofadr[j]) for j in jset]),
+                                    ("body_invweight0", None)):
+                    arr = getattr(wm, _name, None)
+                    if arr is None:
+                        continue
+                    a = arr.numpy()
+                    src = getattr(m, _name)
+                    if _idx is None:
+                        import numpy as _npi
+                        a[...] = _npi.broadcast_to(_npi.asarray(src, dtype=a.dtype), a.shape)
+                    else:
+                        for i in _idx:
+                            a[..., i] = src[i]
+                    arr.assign(a)
+            self._newton_log("[OmNewtonBackend] constraint weights refreshed for "
+                             "%d DoFs / %d bodies after servo armature" % (n_d, n_b))
+            return True
+        except Exception as exc:                   # noqa: BLE001
+            self._newton_log("[OmNewtonBackend] constraint-weight refresh "
+                             "skipped: %r" % (exc,))
+            return False
+
+    def _bound_position_servo_inertia(self, dt):
+        """Give a POSITION servo the rotor inertia its own damping gain implies
+        (2026-10-17), so contacts, joint limits and mimic couplings act on it.
+
+        ⚠ THE DEFECT. Every position servo is built ke = effort*10,
+        kd = effort*0.5 (OmBasicJoint.cpp), independent of the joint's
+        inertia, with zero armature. MuJoCo's implicit integrators fold the
+        velocity actuator into the acceleration solve as (M + dt*kd), but the
+        CONSTRAINT solve (contacts, joint limits, equality) computes its force
+        against the bare M. When dt*kd >> M the constraint's correction is
+        diluted by M / (M + dt*kd) per step: the constraint asks for exactly
+        the impulse that would stop a 7 g jaw, and the integrator spends it on
+        a joint that behaves ~14x heavier. That is the velocity-servo defect
+        _clamp_velocity_servo_gains documents ("inertia inflation"), on the
+        joints that pass explicitly skipped.
+
+        MEASURED (Robonine SO-ARM 102, OmniSim's own exported model replayed
+        in plain MuJoCo 3.11, social/.../robonine/evidence/r8_mjcf): the 7 g
+        prismatic jaws run dt*kd/M = 13.6, the wrist joints 69 and 857. The
+        driven jaw runs 19.5 mm PAST its own lower limit, the mimic follower
+        43 mm past its upper one with no part in the way, the jaws close
+        21 mm into a 40 mm cube, and the part squirts out at lift-off -- at
+        every jaw force from 3 to 100 N and at 1 and 2 ms. Adding exactly
+        ``dt*kd - M`` of armature to every position servo (jaws AND arm) on
+        the same model: jaw penetration 0.4 mm, limits held, the cube carried
+        the full 17.3 cm lift at 0.19 m/s peak. Jaws alone are NOT enough
+        (the arm's wrist servos then shake the part out); bound 8 still
+        closes 13 mm into the cube.
+
+        WHY ARMATURE AND NOT A SMALLER kd. Lowering kd to M/dt would starve a
+        PD tuned for tracking (a 1e-4 kg m^2 wrist at kp 1000 is then
+        undamped and explicit-unstable at 2 ms). Armature raises M_eff to
+        dt*kd, which is the inertia the implicit integrator ALREADY makes the
+        joint behave as in free space -- so tracking, gravity sag and the
+        servo's force are unchanged to first order (the apparent inertia goes
+        from M + dt*kd to 2*dt*kd, i.e. at most 2x, the same ratio the wheel
+        clamp accepts); what changes is that constraints now see it. Physically
+        it is the reflected rotor + gearbox inertia a real servo has and the
+        URDF cannot express (MuJoCo Menagerie's SO-ARM100 carries 0.028 on
+        every joint).
+
+        SCOPE. Only joints with a live position actuator (kp != 0) and a
+        velocity gain, only where dt*kd/M exceeds the bound, and only ever the
+        armature that bound needs (never more than dt*kd). By default only on
+        FIXED-BASE articulations (a root welded to the world: the arms whose
+        grasps this is for); free-floating robots -- legged, humanoid, mobile
+        -- are left bit-identical because their gaits and policies were tuned
+        on today's dynamics, although the census shows they carry the same
+        dilution (Go2 73, B2 74, a G1 wrist 723):
+        OMNISIM_NEWTON_SERVO_ARMATURE_SCOPE=all extends it to them. Skipped entirely
+        when OMNISIM_NEWTON_TARGET_KD / _FINGER_KD / _ARM_KD is set -- an
+        explicitly commanded gain is an RL recipe's number, and the policies
+        trained against it keep their dynamics. The armature joins the wheel
+        armature's bookkeeping, so set_joint_effort_limit(0) takes it off a
+        switched-off motor and puts it back when torque returns.
+
+        HATCH: OMNISIM_NEWTON_SERVO_ARMATURE_BOUND (value-parsed; 0/off
+        restores the pre-2026-10-17 model exactly; a number sets the bound).
+        Pins: tests/test_newton_servo_armature_bound.py.
+        """
+        if getattr(self, "_pos_servo_bounded", False):
+            return
+        self._pos_servo_bounded = True
+        bound = self._servo_armature_bound()
+        if bound is None:
+            self._newton_log("[OmNewtonBackend] position-servo armature bound "
+                             "OFF (OMNISIM_NEWTON_SERVO_ARMATURE_BOUND)")
+            return
+        for _k in ("OMNISIM_NEWTON_TARGET_KD", "OMNISIM_NEWTON_FINGER_KD",
+                   "OMNISIM_NEWTON_ARM_KD"):
+            if _os.environ.get(_k) not in (None, ""):
+                self._newton_log("[OmNewtonBackend] position-servo armature "
+                                 "bound skipped: %s is set explicitly" % _k)
+                return
+        sv = self._mjc_solver()
+        m = getattr(sv, "mj_model", None)
+        d = getattr(sv, "mj_data", None)
+        mj = getattr(sv, "_mujoco", None)
+        if m is None or d is None or mj is None or dt <= 0.0:
+            return
+        try:
+            import numpy as _np
+            mj.mj_kinematics(m, d)
+            mj.mj_comPos(m, d)
+            (getattr(mj, "mj_makeM", None) or mj.mj_crb)(m, d)
+            if int(m.nv) == 0:
+                self._newton_log("[OmNewtonBackend] position-servo armature "
+                                 "bound: no DoFs")
+                return
+            full = _mj_full_mass(mj, m, d, m.nv, _np)
+            if not _np.any(_np.diag(full) > 0.0):
+                self._newton_log("[OmNewtonBackend] position-servo armature "
+                                 "bound skipped: mass matrix read all-zero")
+                return
+            kv_of, has_position = {}, set()
+            for a in range(m.nu):
+                jid = int(m.actuator_trnid[a][0])
+                if jid < 0 or int(m.actuator_trntype[a]) != 0:
+                    continue
+                if float(m.actuator_biasprm[a][1]) != 0.0:
+                    has_position.add(jid)
+                kv = -float(m.actuator_biasprm[a][2])
+                if kv > 0.0 and float(m.actuator_gainprm[a][0]) > 0.0:
+                    kv_of[jid] = kv_of.get(jid, 0.0) + kv
+            scope_all = self._servo_armature_scope() == "all"
+
+            def _free_root(jid):
+                return self._servo_on_free_root(m, jid)
+            # Kept for _rebound_servo_joint: a gain written after this one-shot
+            # pass (setControlPID, servo promotion) re-judges its joint against
+            # the same bound, dt and bare inertia instead of keeping armature
+            # sized for a kd that no longer exists.
+            self._servo_bound_ctx = dict(bound=bound, dt=float(dt), scope_all=scope_all,
+                                         diag=[float(x) for x in _np.diag(full)])
+            self._servo_followers = {}
+            for e in range(int(getattr(m, "neq", 0) or 0)):
+                if int(m.eq_type[e]) == 2:              # mjEQ_JOINT: obj1 follows obj2
+                    self._servo_followers.setdefault(int(m.eq_obj2id[e]), []).append(
+                        (int(m.eq_obj1id[e]), float(m.eq_data[e][1])))
+            armed, worst, n_free = [], None, 0
+            for jid in sorted(has_position):
+                kv = kv_of.get(jid, 0.0)
+                if kv <= 0.0 or int(m.jnt_type[jid]) not in (2, 3):   # slide, hinge
+                    continue
+                if not scope_all and _free_root(jid):
+                    n_free += 1
+                    continue
+                dof = int(m.jnt_dofadr[jid])
+                if not (0 <= dof < m.nv):
+                    continue
+                inertia = float(full[dof][dof])
+                if inertia <= 0.0:
+                    continue
+                ratio = kv * dt / inertia
+                if worst is None or ratio > worst[0]:
+                    worst = (ratio, jid, inertia, kv)
+                add = kv * dt / bound - inertia
+                if ratio <= bound or add <= 0.0:
+                    continue
+                add = min(add, kv * dt)
+                m.dof_armature[dof] = float(m.dof_armature[dof]) + add
+                armed.append((dof, add, inertia, ratio, jid))
+            # A URDF <mimic> FOLLOWER has no actuator of its own: it is driven
+            # through the joint-equality constraint (_apply_joint_mimics) by
+            # the leader's motor, so the leader's rotor inertia is reflected
+            # onto it (multiplier^2 x, as through a gear). Without this the
+            # coupling is lopsided -- a 7 g follower against a leader carrying
+            # 0.09 kg -- and the equality, whose stiffness scales with the
+            # LIGHTER side, lets the follower be pushed open by the part it is
+            # meant to squeeze (measured on a minimal two-jaw pinch: follower
+            # 19 mm off its mirror position with the leader armed alone).
+            lead_add = {x[4]: x[1] for x in armed}
+            if lead_add and int(getattr(m, "neq", 0) or 0) > 0:
+                for e in range(int(m.neq)):
+                    if int(m.eq_type[e]) != 2:          # mjEQ_JOINT
+                        continue
+                    f_j, l_j = int(m.eq_obj1id[e]), int(m.eq_obj2id[e])
+                    if l_j not in lead_add or f_j in has_position or f_j < 0:
+                        continue
+                    if int(m.jnt_type[f_j]) not in (2, 3):
+                        continue
+                    mult = float(m.eq_data[e][1])
+                    f_add = mult * mult * lead_add[l_j]
+                    f_dof = int(m.jnt_dofadr[f_j])
+                    if f_add <= 0.0 or not (0 <= f_dof < m.nv):
+                        continue
+                    if any(x[0] == f_dof for x in armed):
+                        continue
+                    m.dof_armature[f_dof] = float(m.dof_armature[f_dof]) + f_add
+                    armed.append((f_dof, f_add, float(full[f_dof][f_dof]), 0.0, f_j))
+            if not armed:
+                if worst is not None:
+                    self._newton_log(
+                        "[OmNewtonBackend] position-servo armature bound: no joint "
+                        "over dt*kd/M = %.4g (worst %.3g on joint %d, %d position "
+                        "servos, %d on free-base robots left alone)"
+                        % (bound, worst[0], worst[1], len(has_position), n_free))
+                else:
+                    self._newton_log("[OmNewtonBackend] position-servo armature "
+                                     "bound: no fixed-base position servos (%d "
+                                     "position servos, %d on free-base robots "
+                                     "left alone)" % (len(has_position), n_free))
+                return
+            on_gpu = not getattr(sv, "use_mujoco_cpu", False)
+            if on_gpu:
+                wm = getattr(sv, "mjw_model", None)
+                try:
+                    if wm is None or not hasattr(wm, "dof_armature"):
+                        raise AttributeError("mjw_model.dof_armature absent")
+                    _da = wm.dof_armature.numpy()
+                    for _dof, _add, _I, _r, _j in armed:
+                        _da[..., _dof] += _add
+                    wm.dof_armature.assign(_da)
+                except Exception as _ae:           # noqa: BLE001
+                    for _dof, _add, _I, _r, _j in armed:
+                        m.dof_armature[_dof] = float(m.dof_armature[_dof]) - _add
+                    self._newton_log(
+                        "[OmNewtonBackend] position-servo armature did NOT reach "
+                        "the GPU model (%r) -- not applied; this world's light "
+                        "servos keep constraints diluted by M/(M+dt*kd)." % (_ae,))
+                    return
+            self._refresh_invweights(m, mj, [x[4] for x in armed],
+                                     getattr(sv, "mjw_model", None) if on_gpu else None)
+            reg = getattr(self, "_wheel_armature_added", None)
+            if reg is None:
+                reg = self._wheel_armature_added = {}
+            for _dof, _add, _I, _r, _j in armed:
+                reg[int(_dof)] = reg.get(int(_dof), 0.0) + float(_add)
+            self._servo_armature_added = {int(x[0]): float(x[1]) for x in armed}
+            self._sync_passive_armature(
+                m, getattr(sv, "mjw_model", None) if on_gpu else None)
+            n_follow = sum(1 for x in armed if x[3] == 0.0)
+            self._newton_log(
+                "[OmNewtonBackend] position-servo armature added on %d of %d "
+                "position servos (+%d mimic followers; %d on free-base robots "
+                "left alone) (dt*kd/M over %.4g; worst "
+                "%.3g on joint %d, M %.4g, kd %.4g): +%.4g..%.4g (kg or kg m^2). "
+                "The constraint solve sees the bare M while the implicit "
+                "integrator applies M + dt*kd, so without it contacts, limits "
+                "and mimic couplings on these joints act at M/(M+dt*kd) "
+                "strength. OMNISIM_NEWTON_SERVO_ARMATURE_BOUND=0 reverts."
+                % (len(armed) - n_follow, len(has_position), n_follow, n_free, bound,
+                   worst[0], worst[1], worst[2], worst[3],
+                   min(x[1] for x in armed), max(x[1] for x in armed)))
+            self._servo_armature_census = dict(
+                bound=bound, position_servos=len(has_position),
+                armed=len(armed) - n_follow, followers=n_follow, free_base=n_free,
+                worst_ratio=float(worst[0]))
+        except Exception as exc:                   # noqa: BLE001
+            self._newton_log("[OmNewtonBackend] position-servo armature bound "
+                             "skipped: %r" % (exc,))
+
+    @staticmethod
+    def _servo_on_free_root(m, jid):
+        """True when MuJoCo joint ``jid`` belongs to a free-floating tree."""
+        r = int(m.body_rootid[int(m.jnt_bodyid[int(jid)])])
+        return (int(m.body_jntnum[r]) > 0
+                and int(m.jnt_type[int(m.body_jntadr[r])]) == 0)   # mjJNT_FREE
+
+    def _rebound_servo_joint(self, m, jid):
+        """Re-judge one joint's position-servo armature after its gains changed.
+
+        ⚠ WHY. _bound_position_servo_inertia runs once, on the first step, from
+        the gains present then. A gain written later -- Motor.setControlPID, or a
+        limit-less motor promoted to a servo by its first setPosition() -- left
+        the joint with armature sized for the OLD kd: raise kd and the
+        M/(M+dt*kd) dilution comes back (a light jaw throws the part again);
+        lower it and the joint carries armature far above dt*kd, heavier than
+        the bound ever intends. Same rule, same bound, same dt and the bare
+        inertia read at the pass; the joint's mimic followers move with it.
+        CPU model only (set_joint_gains is CPU-only). No-op when the pass did
+        not run (hatch off, an explicit RL gain, no solver).
+        """
+        ctx = getattr(self, "_servo_bound_ctx", None)
+        if ctx is None or m is None:
+            return
+        jid = int(jid)
+        if not (0 <= jid < int(m.njnt)) or int(m.jnt_type[jid]) not in (2, 3):
+            return
+        if not ctx["scope_all"] and self._servo_on_free_root(m, jid):
+            return
+        bound, dt, diag = ctx["bound"], ctx["dt"], ctx["diag"]
+        kv, has_pos = 0.0, False
+        for a in range(m.nu):
+            if int(m.actuator_trnid[a][0]) != jid or int(m.actuator_trntype[a]) != 0:
+                continue
+            if float(m.actuator_biasprm[a][1]) != 0.0:
+                has_pos = True
+            k = -float(m.actuator_biasprm[a][2])
+            if k > 0.0 and float(m.actuator_gainprm[a][0]) > 0.0:
+                kv += k
+
+        def _target(dof):
+            inertia = diag[dof] if 0 <= dof < len(diag) else 0.0
+            if not has_pos or kv <= 0.0 or inertia <= 0.0 or kv * dt / inertia <= bound:
+                return 0.0
+            return max(0.0, min(kv * dt / bound - inertia, kv * dt))
+
+        servo = self.__dict__.setdefault("_servo_armature_added", {})
+        reg = self.__dict__.setdefault("_wheel_armature_added", {})
+        off = getattr(self, "_armature_off_cpu", None) or set()
+        dof = int(m.jnt_dofadr[jid])
+        lead_target = _target(dof)
+        plan = [(dof, lead_target, jid)]
+        for f_j, mult in getattr(self, "_servo_followers", {}).get(jid, ()):
+            if not (0 <= f_j < int(m.njnt)) or int(m.jnt_type[f_j]) not in (2, 3):
+                continue
+            if any(int(m.actuator_trnid[a][0]) == f_j and int(m.actuator_trntype[a]) == 0
+                   for a in range(m.nu)):
+                continue                      # a driven follower is judged on its own gains
+            plan.append((int(m.jnt_dofadr[f_j]), mult * mult * lead_target, f_j))
+        changed = []
+        for d_, target, j_ in plan:
+            delta = target - servo.get(d_, 0.0)
+            if abs(delta) <= 1e-15:
+                continue
+            if d_ not in off:                 # an effort-0 joint has its armature off
+                m.dof_armature[d_] = float(m.dof_armature[d_]) + delta
+            reg[d_] = reg.get(d_, 0.0) + delta
+            if target > 0.0:
+                servo[d_] = target
+            else:
+                servo.pop(d_, None)
+            if abs(reg[d_]) <= 1e-15:
+                reg.pop(d_, None)
+            changed.append((j_, servo.get(d_, 0.0)))
+        if changed:
+            mj = getattr(self._mjc_solver(), "_mujoco", None)
+            if mj is not None:
+                self._refresh_invweights(m, mj, [j for j, _ in changed])
+            self._newton_log("[OmNewtonBackend] position-servo armature re-judged after a "
+                             "gain change (kd %.4g): %s" % (
+                                 kv, ", ".join("joint %d -> %.4g" % c for c in changed)))
+
     def _launch_debug(self, path):
         """Append one JSON line per step: the whole mj state + contacts.
 
@@ -10571,6 +11207,10 @@ class World:
         # first known now -- nothing plumbs basicTimeStep into this runtime.
         if not getattr(self, "_kv_clamped", False):
             self._clamp_velocity_servo_gains(sub_dt)
+        # After the wheel clamp (it REPLACES _wheel_armature_added; this pass
+        # adds the position servos to it). Same one-shot, same sub_dt reason.
+        if not getattr(self, "_pos_servo_bounded", False):
+            self._bound_position_servo_inertia(sub_dt)
         # W3.1: external body wrenches queued this tick via add_body_force -> a (body_count,6) host array
         # written into state.body_f AFTER clear_forces() each substep (clear_forces zeros body_f). Cleared
         # after the tick so the controller must re-apply every tick (ODE addBodyForce semantics).
@@ -11656,6 +12296,12 @@ class World:
         if a_vel is not None:
             m.actuator_gainprm[a_vel, 0] = float(kd)
             m.actuator_biasprm[a_vel, 2] = -float(kd)
+        # The position-servo armature was sized for the old kd (one-shot pass).
+        try:
+            self._rebound_servo_joint(m, int(m.actuator_trnid[a_pos][0]))
+        except Exception as exc:                   # noqa: BLE001
+            self._newton_log("[OmNewtonBackend] position-servo armature re-judge "
+                             "skipped: %r" % (exc,))
         return 0
 
     def set_joint_effort_limit(self, slot_id, dof, effort):

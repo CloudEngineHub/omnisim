@@ -83,6 +83,7 @@ from _omnilink_relay.http_security import (  # noqa: E402
     error_envelope,
     finite_number,
     nonempty_string,
+    prompt_budget,
     read_json,
     require_field,
     validate_request_id,
@@ -1393,10 +1394,9 @@ def make_handler(bridge: QuadrupedBridge, relay: Any = None):
                 text = nonempty_string(require_field(body, "text"), "text")
                 # A walked inspection round outlasts the ordinary chat wait.
                 # Same bound as the mobile bridge: positive, at most 600 s.
-                prompt_timeout_s = finite_number(body.get("timeout_s", 90.0), "timeout_s")
-                if not 0 < prompt_timeout_s <= 600:
-                    raise RequestError(400, "bad_request",
-                                       "timeout_s must be greater than zero and at most 600")
+                # Counted on the SLOWER of the sim and wall clocks, with
+                # `wall_timeout_s` as the hard wall cap (dispatch_sync).
+                prompt_timeout_s, prompt_wall_s = prompt_budget(body)
                 if relay is not None:
                     # ── PARSER FIRST ──────────────────────────────────
                     # Reached only WITH a relay: the access check at the
@@ -1419,7 +1419,10 @@ def make_handler(bridge: QuadrupedBridge, relay: Any = None):
                     return self._json(
                         200, _shared_stamp_via(shared_with_halt(
                             getattr(self, "_halted_first", None),
-                            relay.dispatch_sync(text, timeout_s=prompt_timeout_s))))
+                            relay.dispatch_sync(
+                                text, timeout_s=prompt_timeout_s,
+                                sim_clock=lambda: bridge.sim_time,
+                                wall_timeout_s=prompt_wall_s))))
                 return self._json(503, connection_error())
             if p == "/tool":
                 # Platform-side tool callback. omnilink-agents.com web UI

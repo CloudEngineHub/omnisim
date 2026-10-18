@@ -856,6 +856,14 @@ Therefore, for any action that changes the robot's physical state:
    sim thread stopped?" is a wall-clock question — and it is reported
    separately for exactly that reason. The same condition also files
    `fault.telemetry_stale` on the bridge's event stream (§5.9).
+   ⚠️ **A slow world is not a stopped one** (2026-10-17): the shipped waits
+   call a world stalled after **10 s** of wall silence from the sim thread
+   (`bridge_base.STALL_GRACE_S`, the arm's `WAIT_STALL_S`). It was 2 s, and
+   one ~2.4 s engine tick on a world running at 0.09-0.18x real time ended
+   a good `set_tcp_target` wait as `stalled`. A wait that does give up
+   (stalled or timed out) on the arm bridge also returns `last_reading`:
+   the joints' last measured values (and the tool point and its error, for
+   a TCP verb), labelled as not a completion. `achieved` stays `null`.
    ⚠️ **`stalled` is the ONE field name for this**, on every bridge that can
    tell the condition apart. The two shipped implementations spelled it
    differently until 2026-09-22 — `stalled: true` on the mobile bridge,
@@ -965,6 +973,20 @@ quadruped) this returns `{ "ok": true, "accepted": true, "pose": "stand" }`.
 The natural-language endpoint: one operator sentence in, a reply and a
 record of what was actually done out. A bridge MAY omit it entirely
 (reporting it as absent from `/capabilities.actions`).
+
+**The turn budget** (all four shipped bridges, 2026-10-17). The body
+accepts `timeout_s` (default 90, in (0, 600]) and `wall_timeout_s` (in
+[`timeout_s`, 3600], default `max(timeout_s, 600)`). A model turn is
+cancelled only once BOTH the simulation clock and the wall clock have run
+`timeout_s`: the slower clock decides, so a world below real time gets
+`timeout_s` of simulation and a world above it still gets `timeout_s` of
+wall time for the model. `wall_timeout_s` caps the wall clock alone, for a
+sim that stops stepping. A cancelled turn carries
+`budget: {timeout_s, clock, expired_on, elapsed_wall_s, elapsed_sim_s,
+wall_timeout_s}`, where `expired_on` is `"sim"`, `"wall"` or `"wall_cap"`.
+Before this the arm bridge ignored `timeout_s` and used a fixed 90 s wall
+budget; on WIRobotics ALLEX at 0.09-0.18x real time that cancelled a
+correct three-hover turn after two hovers.
 
 ### 5.7.1 The interpretation cascade
 
@@ -1626,8 +1648,21 @@ A bridge with a model relay attached MAY dispatch **one** model turn in
 response to a qualifying event, through the same cascade and the same gate
 as an operator sentence (§5.7.1). This is bridge behaviour, not a wire
 contract — nothing about `GET /events` changes — but a client should know
-it exists, because it spends the operator's model budget:
+it exists, because it spends the operator's model budget and can move the
+robot:
 
+- ⚠️ **it is OFF unless `OMNILINK_EVENT_WAKE=1`** (since 2026-10-17; it was
+  on by default from v9.0.0 through v9.2.5). On installed v9.2.5 an arm
+  bridge restarted with short-term memory on was woken by the
+  `joint.limit_hit` of a hand settling onto its stops, and the model
+  re-ran the previous session's whole task with no new prompt;
+- even when on, **no wake fires before this session's first operator turn**
+  (`/prompt`, window chat, voice, or a parser-answered sentence), and only
+  events filed AFTER that turn count — so a restored conversation is never
+  acted on because a sensor ticked;
+- **startup settle never wakes**: an event in the first 5 s of sim time, or
+  in the first 5 s after the relay first read the ring, is consumed without
+  a turn. Held-back events stay readable and are counted per reason;
 - only physical or safety events qualify (the "wakes?" column above);
 - `contact.began` wakes only for a **non-floor** body, and `gate.refused`
   only when the refusal did **not** come from the agent's own turn — a
@@ -1638,8 +1673,8 @@ it exists, because it spends the operator's model budget:
   is narrowed, not a limit raised;
 - the first poll only **primes** the cursor, so a restart with a full ring
   does not wake on history;
-- `OMNILINK_EVENT_WAKE=0` disables every wake while the ring still fills
-  and `get_events` still answers;
+- with the wake off (the default) the ring still fills and `get_events`
+  still answers;
 - no key means no relay, which means no wake and no error.
 
 ⚠️ **Idle wake frequency on a cluttered world has never been measured.**
@@ -1653,7 +1688,7 @@ by a measurement yet.
 | `OMNISIM_BRIDGE_EVENT_CAPACITY` | ring size (default `512`), clamped to `[16, 100000]`; evictions are reported as `dropped` |
 | `OMNISIM_HARNESS_URL` | the World Harness base URL. Pre-existing and previously undocumented; the MCP server and the ROS 2 client read it too. Setting it turns the pass-through on |
 | `OMNISIM_BRIDGE_HARNESS_EVENTS` | `=0` stops mirroring the harness's events onto this ring while leaving the harness attached |
-| `OMNILINK_EVENT_WAKE` | `=0` disables the wake above; the ring still fills |
+| `OMNILINK_EVENT_WAKE` | `=1` opts into the wake above (default OFF since 2026-10-17); the ring fills either way |
 
 All are value-parsed (`=0` means off). The generated list of every
 `OMNISIM_*` variable is
@@ -4171,6 +4206,7 @@ field of the error envelope (§3.2), in `/state.fault.code`, and in
 | `not_supported` | The endpoint exists but this robot class does not implement the action. |
 | `internal_error` | An unexpected implementation failure occurred; implementation details are not exposed. |
 | `refused_by_gate` | The safety gate declined to dispatch a command. **Nothing was actuated.** See below. |
+| `base_tilt` | A mobile base has tilted past its limit (default 35° between the node's +Z and world +Z; `OMNISIM_MOBILE_TILT_LIMIT_DEG`). The mobile bridge zeroed the wheels, ended any motion in flight with `settled: false` and this fault attached, and refuses drive/turn until the base is back under limit − 5°. Reported as `/state.fault` with `tilt_deg`, `peak_tilt_deg` and `limit_deg`. Hatch: `OMNISIM_MOBILE_TILT_GUARD=0`. |
 | `tool_not_registered` | `POST /tool` named a tool this bridge does not serve, or no tool registry is attached yet (§5.8.2). |
 | `tool_execution_failed` | A `POST /tool` dispatch raised (§5.8.2). |
 | `proto_not_found` | A referenced PROTO definition could not be located. |

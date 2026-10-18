@@ -32,11 +32,13 @@ in how fixed-joint links are flattened into one Newton body:
 3. FIXED-CHILD COLLIDERS DROPPED (OmSolid flush). Only the merge leader's own
    boundingObject registered, so the caster box never collided and the Burger
    rocked about its axle forever. Hatch: OMNISIM_NEWTON_FIXED_CHILD_COLLIDERS=0.
-4. A second <collision> on base_link "not registered": NOT a separate bug.
-   With newtonRobotColliders FALSE (the default) a Robot wrapper's OWN
-   boundingObject is skipped by design (a chassis envelope starves the
-   wheels); with it TRUE and newtonCompoundColliders TRUE every child of the
-   Group registers. Pinned here so it stays that way.
+4. A second <collision> on base_link "not registered". Until 2026-10-17 a
+   Robot wrapper's OWN boundingObject was skipped under the default
+   newtonRobotColliders FALSE ("a chassis envelope starves the wheels").
+   Since then it registers unless it reaches more than 2 mm below the robot's
+   own wheels (World._resolve_robot_root_shapes): this Burger's chassis box
+   (underside 8.5 mm above the tyre plane) and its caster bump (0.5 mm above)
+   both collide by default. Hatch: OMNISIM_NEWTON_ROBOT_ROOT_COLLIDER=0.
 5. URDF <dynamics damping friction> NOT APPLIED (OmBasicJoint flush ->
    set_joint_passive_dynamics). Hatch: OMNISIM_NEWTON_JOINT_DYNAMICS=0.
 
@@ -139,6 +141,9 @@ HATCHES_OFF = {
     # The mobile-base lane's placeholder fix (2026-10-03) stops the 1 mm wrapper
     # sphere colliding once the robot has real colliders; the old model needs it back.
     "OMNISIM_NEWTON_WRAPPER_PLACEHOLDER_COLLIDES": "1",
+    # The robot-root-collider rule (2026-10-17) registers base_link's own
+    # boundingObject by default; the old model left it out.
+    "OMNISIM_NEWTON_ROBOT_ROOT_COLLIDER": "0",
 }
 
 
@@ -169,7 +174,8 @@ pytestmark = pytest.mark.skipif(_binary() is None, reason="no omnisim-bin in thi
 
 _VEC = r"\[([^\]]*)\]"
 _BODY = re.compile(r"^body (\d+) \S+\s+mass=(\S+) ipos=" + _VEC + r" pos=" + _VEC + r" inertia=" + _VEC, re.M)
-_GEOM = re.compile(r"^geom \d+ \S+\s+body=(\d+) type=(\d+) .* size=" + _VEC + r" pos=" + _VEC, re.M)
+_GEOM = re.compile(r"^geom \d+ \S+\s+body=(\d+) type=(\d+) condim=\d+ contype=(\d+) conaff=(\d+) .* size="
+                   + _VEC + r" pos=" + _VEC, re.M)
 _DOF = re.compile(r"^dof (\d+) damping=(\S+) armature=\S+ frictionloss=(\S+)", re.M)
 
 
@@ -228,7 +234,8 @@ def _parse(text):
     bodies = {int(m.group(1)): dict(mass=float(m.group(2)), ipos=_vec(m.group(3)), pos=_vec(m.group(4)),
                                      inertia=_vec(m.group(5)))
               for m in _BODY.finditer(text)}
-    geoms = [dict(body=int(m.group(1)), type=int(m.group(2)), size=_vec(m.group(3)), pos=_vec(m.group(4)))
+    geoms = [dict(body=int(m.group(1)), type=int(m.group(2)), collides=int(m.group(3)) != 0 or int(m.group(4)) != 0,
+                  size=_vec(m.group(5)), pos=_vec(m.group(6)))
              for m in _GEOM.finditer(text)]
     dofs = {int(m.group(1)): (float(m.group(2)), float(m.group(3))) for m in _DOF.finditer(text)}
     # the chassis is the robot body carrying the free joint: the heaviest one
@@ -291,10 +298,14 @@ def test_fixed_child_colliders_register_with_robot_colliders_false(dumps):
     casters = [g for g in on_chassis if g["type"] == 6 and abs(sorted(g["size"])[0] - 0.0045) < 1e-4]
     assert casters, f"caster box missing from the chassis body: {on_chassis}"
     assert np.allclose(casters[0]["pos"][[0, 2]], [-0.081, BASE_JOINT_Z - 0.004], atol=2e-3), casters[0]
-    lidars = [g for g in on_chassis if g["type"] == 3 and abs(g["size"][0] - 0.055) < 1e-4]
+    # capsule (3) before 403f36a84; a real cylinder (5) since a fixed-child Cylinder stays one
+    lidars = [g for g in on_chassis if g["type"] in (3, 5) and abs(g["size"][0] - 0.055) < 1e-4]
     assert lidars, f"lidar capsule missing from the chassis body: {on_chassis}"
-    # the wrapper's OWN chassis box stays off the solver with newtonRobotColliders FALSE (by design)
-    assert not [g for g in on_chassis if g["type"] == 6 and abs(g["size"][0] - 0.07) < 1e-4], on_chassis
+    # since 2026-10-17 the wrapper's OWN chassis box registers AND collides by default: its
+    # underside is 8.5 mm above the tyre plane, so it cannot hold the wheels off the floor
+    own = [g for g in on_chassis if g["type"] == 6 and abs(g["size"][0] - 0.07) < 1e-4]
+    assert own and all(g["collides"] for g in own), (
+        f"base_link's own chassis box must register and collide by default (robot root collider rule): {on_chassis}")
 
 
 def test_every_collision_registers_with_robot_and_compound_colliders(dumps):

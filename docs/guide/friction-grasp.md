@@ -24,6 +24,42 @@ what is *measured* to decide whether one holds, and what is measured not to.
 
 ---
 
+> ### ⚠ 2026-10-17: light fingers and light arm joints were the hidden variable
+>
+> Every position servo is built `ke = effort*10`, `kd = effort*0.5` with no
+> rotor inertia, whatever the joint weighs. MuJoCo's implicit integrator applies
+> that damping as `M + dt*kd`, but the constraint solve -- contacts, joint
+> limits, a URDF `<mimic>` coupling -- sizes its force against the bare `M`. On a
+> joint where `dt*kd/M` is large every one of those constraints acts at
+> `M/(M+dt*kd)` strength: pads close **into** the part, run past their own
+> limits, and the stored interference throws the part out at lift-off. Measured
+> `dt*kd/M`: the 7 g jaws of a Robonine SO-ARM 102 13.6 (its wrist 857), this
+> page's rung-8 pads 20 (20 g, kd 100, 4 ms), `friction_grasp_minimal`'s 9.6, a UR5e
+> wrist 870.
+>
+> Since 2026-10-17 the engine gives every **fixed-base** position servo with
+> `dt*kd/M > 1` exactly `dt*kd - M` of armature (reflected rotor inertia; the
+> leader's reaches a URDF mimic follower) and refreshes MuJoCo's constraint
+> weights -- `OMNISIM_NEWTON_SERVO_ARMATURE_BOUND` (`0` = the old model).
+> Re-measured with it, same binary, hatch on vs off:
+>
+> | scene | bound ON (default) | bound OFF (the old model) |
+> |---|---|---|
+> | rung 8, `newtonContactKe 4000 / 6000 / 8000` | **carried**, `carry_rel` 2.0 / 2.0 / 2.0 mm, 0.15 m/s | ejected, 0.317 / 0.402 / 0.332, up to 2.33 m/s (the table below) |
+> | `friction_grasp_minimal` | **carried**: pads 0.6 mm into the faces, part rises 0.2025 m for 0.2023 m of wrist travel, set down on the floor | part squeezed out onto the wrist plate (pads 11.8 mm inside each face) |
+> | Robonine SO-ARM 102, 40 mm cube | **carried** 17.8 cm to home, 3.8 mm from the tool point | squirted out at lift-off |
+> | `omniarm6_real_pick_place` | placed, drift 0.7 mm | placed, drift 4.8 mm |
+>
+> So **`newtonContactKe` is no longer the trap the next section measured**: the
+> ejections it found were this dilution. The tables below are kept as measured
+> on the old model; read them with that in mind. Free-floating robots (legged,
+> humanoid, mobile) are left on the old model unless
+> `OMNISIM_NEWTON_SERVO_ARMATURE_SCOPE=all`: their gaits and policies were tuned
+> on it. Pins: `tests/test_newton_servo_armature_bound.py`,
+> `tests/test_friction_grasp_holds.py`.
+
+---
+
 ## The scene these numbers come from
 
 Read this before copying anything: a grasp setting is not a constant of the
@@ -280,8 +316,12 @@ python -m omnisim run-headless \
   projects/samples/demos/worlds/flagship/omniarm6_real_pick_place.omniworld --duration 45
 ```
 
-⚠ **`friction_grasp_minimal.omniworld` is NOT a working grasp. Do not copy it.**
-Instrumented 2026-08-10: the box is not carried by the pinch, it is ejected by
+⚠ **`friction_grasp_minimal.omniworld` was NOT a working grasp before
+2026-10-17** (on the old model, `OMNISIM_NEWTON_SERVO_ARMATURE_BOUND=0`, it still
+is not). Since the position-servo armature bound it carries the part between the
+pads and puts it down -- measured above -- but it is still a `setForce` demo (see
+the controller section), so `omniarm6_real_pick_place` remains the one to copy.
+Instrumented 2026-08-10, on the old model: the box is not carried by the pinch, it is ejected by
 interpenetration blow-out at 3.5 m/s, arcs to z = 0.97 m, and lands on the
 gripper's own wrist plate — a 100 × 40 mm horizontal shelf sitting directly
 above the fingers. During the "hold", all 12 of its contact points lie in one
@@ -354,8 +394,10 @@ In order of what the measurements support:
    cone, which measured worse than leaving it alone.
 5. **The fingers are `setForce`-controlled without `OMNISIM_NEWTON_TORQUE_MODE=1`**,
    so the "force" is a spring pulling at the last `setPosition`.
-6. **`newtonContactKe` has been raised.** If the part is not slipping out but
-   being *thrown*, this is the first thing to put back.
+6. **The part is being *thrown*, not slipping out.** Check the engine log for
+   the `position-servo armature` line: if your gripper is on a free-floating
+   robot it is not covered by default (`OMNISIM_NEWTON_SERVO_ARMATURE_SCOPE=all`),
+   and on an older build a raised `newtonContactKe` measured as the trigger.
 7. **The part twists rather than slides** — that is `newtonCondim`, not
    friction magnitude.
 8. Only then reach for `basicTimeStep`, `newtonNoslipIterations`, or more

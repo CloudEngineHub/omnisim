@@ -17,8 +17,11 @@
 A wake is a chat round trip, measured at ~5.6k prompt tokens. The whole
 design is therefore about what it REFUSES to spend: only physical or
 safety events qualify (decision L4), at most one per 10 s and 30 per
-session, and `OMNILINK_EVENT_WAKE=0` turns the whole thing off while
-leaving the ring readable.
+session, and the wake is OFF unless `OMNILINK_EVENT_WAKE=1` (since
+2026-10-17), leaving the ring readable either way. When it is on it still
+waits for this session's first operator turn and for the startup settle:
+those rules are pinned in `test_no_unprompted_turns.py`; the tests here
+arm the relay first so they keep measuring the budget alone.
 
 Every test here drives a FAKE ring, so nothing below needs an engine, a
 key or a network. The ring's real implementation is pinned separately in
@@ -45,7 +48,7 @@ class FakeRing:
         self._seq = 0
         self.dropped = 0
 
-    def add(self, type: str, *, detail=None, sim_time: float = 1.0) -> dict:
+    def add(self, type: str, *, detail=None, sim_time: float = 10.0) -> dict:
         self._seq += 1
         evt = {"seq": self._seq, "type": type, "sim_time": sim_time,
                "step": self._seq, "robot": "probe", "source": "bridge",
@@ -96,7 +99,7 @@ def wired(monkeypatch, tmp_path):
     monkeypatch.setenv("OMNILINK_INTENT_STATE_DIR", str(tmp_path))
     monkeypatch.setenv("OMNILINK_PRESENCE", "0")   # no heartbeat thread
     monkeypatch.setenv("OMNILINK_EDGE", "0")       # no edge connector
-    monkeypatch.delenv("OMNILINK_EVENT_WAKE", raising=False)
+    monkeypatch.setenv("OMNILINK_EVENT_WAKE", "1")  # opt in: off by default
 
     probe = Tool("drive_forward", "move",
                  {"type": "object", "properties": {}}, lambda a: {"ok": True})
@@ -114,7 +117,7 @@ def wired(monkeypatch, tmp_path):
 
     dispatched = []
 
-    def _record(text, on_event):
+    def _record(text, on_event, **kw):
         dispatched.append(text)
         return relay_mod.DispatchHandle()
 
@@ -127,8 +130,10 @@ def wired(monkeypatch, tmp_path):
 
 
 def prime(relay, ring) -> None:
-    """Consume the backlog. The first poll never wakes -- see below."""
+    """Consume the backlog (the first poll never wakes -- see below), then
+    ARM the wake the way an operator's first sentence does."""
     relay.poll_events_once(now=0.0)
+    relay.note_operator_turn()
 
 
 # ── The rate limit ───────────────────────────────────────────────────
@@ -267,10 +272,11 @@ def test_the_hatch_disables_the_wake_and_fills_nothing_of_its_own(
     ring = FakeRing()
     relay.attach_bridge(FakeBridge(ring))
     dispatched = []
-    relay.dispatch_async = lambda t, cb: (dispatched.append(t)
-                                          or relay_mod.DispatchHandle())
+    relay.dispatch_async = lambda t, cb, **kw: (dispatched.append(t)
+                                                or relay_mod.DispatchHandle())
     try:
         relay.poll_events_once(now=0.0)
+        relay.note_operator_turn()
         for _ in range(50):
             ring.add("joint.limit_hit")
         assert relay.poll_events_once(now=800.0) == 0
@@ -286,11 +292,12 @@ def test_the_hatch_disables_the_wake_and_fills_nothing_of_its_own(
 
 def test_the_hatch_is_value_parsed(monkeypatch) -> None:
     """`=0` is off. A presence-gated hatch would ARM on `=0`, which is the
-    OMNISIM_REQUIRE_NEWTON trap class."""
+    OMNISIM_REQUIRE_NEWTON trap class. The relay reads it with default
+    False, so an empty value is OFF too (the opt-in must say yes)."""
     for raw, expected in (("0", False), ("false", False), ("no", False),
-                          ("off", False), ("1", True), ("", True)):
+                          ("off", False), ("1", True), ("", False)):
         monkeypatch.setenv("OMNILINK_EVENT_WAKE", raw)
-        assert relay_mod._env_flag("OMNILINK_EVENT_WAKE", True) is expected
+        assert relay_mod._env_flag("OMNILINK_EVENT_WAKE", False) is expected
 
 
 # ── Cursor discipline ────────────────────────────────────────────────
@@ -303,6 +310,7 @@ def test_the_first_poll_primes_the_cursor_and_never_wakes(wired) -> None:
         ring.add("joint.limit_hit")
     assert relay.poll_events_once(now=0.0) == 0, "the priming pass must be silent"
     assert dispatched == []
+    relay.note_operator_turn()
     ring.add("joint.limit_hit")
     assert relay.poll_events_once(now=900.0) == 1, "and then it must work"
 
@@ -369,7 +377,7 @@ def test_a_refused_enqueue_refunds_the_budget(wired) -> None:
     wakes on turns that never ran."""
     relay, ring, dispatched = wired
 
-    def _refuse(text, on_event):
+    def _refuse(text, on_event, **kw):
         handle = relay_mod.DispatchHandle()
         handle.cancel()
         return handle
@@ -442,6 +450,7 @@ def test_the_dispatcher_drives_the_real_event_ring(monkeypatch,
     monkeypatch.setenv("OMNILINK_INTENT_STATE_DIR", str(tmp_path))
     monkeypatch.setenv("OMNILINK_PRESENCE", "0")
     monkeypatch.setenv("OMNILINK_EDGE", "0")
+    monkeypatch.setenv("OMNILINK_EVENT_WAKE", "1")
     relay = OmniLinkRelay(
         omni_key="olink_test_key_not_used_offline",
         agent_name="RealRingProbe", main_task="test",
@@ -450,19 +459,20 @@ def test_the_dispatcher_drives_the_real_event_ring(monkeypatch,
         usage_enabled=False, memory_enabled=False, surface="mobile")
     ring = EventRing(robot="husky")
     dispatched = []
-    relay.dispatch_async = lambda t, cb: (dispatched.append(t)
-                                          or relay_mod.DispatchHandle())
+    relay.dispatch_async = lambda t, cb, **kw: (dispatched.append(t)
+                                                or relay_mod.DispatchHandle())
     try:
         relay.attach_bridge(FakeBridge(ring))   # type: ignore[arg-type]
         relay.poll_events_once(now=0.0)
+        relay.note_operator_turn()
 
-        ring.emit("contact.began", sim_time=1.0, step=10, body="FLOOR")
+        ring.emit("contact.began", sim_time=6.0, step=10, body="FLOOR")
         assert relay.poll_events_once(now=10.0) == 0, "the floor is not news"
 
-        ring.emit("joint.limit_hit", sim_time=2.0, step=20,
+        ring.emit("joint.limit_hit", sim_time=7.0, step=20,
                   joint="arm_1", q=1.57)
         assert relay.poll_events_once(now=20.0) == 1
-        assert dispatched[0].startswith("[Event] joint.limit_hit at sim t=2.000")
+        assert dispatched[0].startswith("[Event] joint.limit_hit at sim t=7.000")
 
         page = relay.tools["get_events"].dispatch({"limit": 10})
         assert page["available"] is True

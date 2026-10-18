@@ -159,7 +159,14 @@ def _describe(tool: str, args: Dict[str, Any], res: Any,
     # Reading it as a failure reported "I could not stop: 4.3e-11" after a
     # textbook stop. Only a non-empty STRING is a failure.
     err = res.get("error")
+    fault = res.get("fault") if isinstance(res.get("fault"), dict) else None
     if isinstance(err, str) and err.strip():
+        if fault is not None and res.get("accepted") is False:
+            # A command refused because the robot is FAULTED (a tipped base):
+            # the bridge's own sentence, and the fault code as the rule.
+            why = str(res.get("say") or fault.get("message") or err)
+            return (f"I did not {tool.replace('_', ' ')}: {why}", "refused",
+                    why, str(fault.get("code") or err))
         return (f"I could not {tool.replace('_', ' ')}: {err}", "err", err,
                 "")
     if res.get("accepted") is False:
@@ -175,6 +182,12 @@ def _describe(tool: str, args: Dict[str, Any], res: Any,
     # A measured stop is the reference case: say the measurement, or say
     # plainly that it could not be confirmed. Never "Stopping wheels."
     measured = res.get("measured") or {}
+    if tool == "stop" and fault is not None:
+        # Standing still is not the same as fine: a base on its side is
+        # perfectly stationary (MAB HB50W, 48 deg, 2026-10-17).
+        msg = str(fault.get("message") or fault.get("code") or "fault")
+        return (f"Motion is commanded to zero, but the robot is FAULTED: {msg}.",
+                "err", f"fault {fault.get('code', '')}", "")
     if tool == "stop":
         still = res.get("stationary")
         if still is True and "speed_mps" in measured:
@@ -232,6 +245,18 @@ def _measured_motion(tool: str, res: Dict[str, Any]
         return _measured_drive_to(res)
     if tool not in ("drive_forward", "turn"):
         return None
+    fault = res.get("fault")
+    if isinstance(fault, dict) and fault:
+        # Ended by a guard (the base-tilt fault): what it measured before
+        # the guard fired, and why it stopped. Never "Drove +1.98 m."
+        msg = str(fault.get("message") or fault.get("code") or "fault")
+        ach = res.get("achieved")
+        if isinstance(ach, (int, float)):
+            got = (f"{ach:+.2f} m" if tool == "drive_forward"
+                   else f"{math.degrees(ach):+.0f} deg")
+            return (f"I stopped after {got}: {msg}.", "err",
+                    f"fault {fault.get('code', '')} at {got}")
+        return (f"I stopped: {msg}.", "err", f"fault {fault.get('code', '')}")
     if res.get("superseded"):
         return ("That motion was ended before it finished (a newer order or a "
                 "stop took over).", "ok", "superseded")

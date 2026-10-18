@@ -135,6 +135,14 @@ class SimClock:
                 "wall_time": self.wall_time, "dt": self.dt}
 
 
+# How long (WALL seconds) the sim thread may be silent before a wait calls
+# the world STALLED rather than slow. 10 s since 2026-10-17; it was 2 s, and a
+# single ~2.4 s engine tick on a slow world (WIRobotics ALLEX at 0.09-0.18x
+# real time, capture camera on) ended a perfectly good arm wait as `stalled`.
+# The arm bridge's WAIT_STALL_S is the same figure.
+STALL_GRACE_S = 10.0
+
+
 class StepBudget:
     """A wait measured in SIM STEPS. The verdict is never a wall clock.
 
@@ -171,7 +179,7 @@ class StepBudget:
     def expired(self) -> bool:
         return self.elapsed_steps >= self.steps
 
-    def stalled(self, last_tick_wall: float, grace_s: float = 2.0) -> bool:
+    def stalled(self, last_tick_wall: float, grace_s: Optional[float] = None) -> bool:
         """The world is not stepping -- not the same thing as expired.
 
         ⚠️ MEASURED FROM WHEN THE WAIT BEGAN, not from the last tick alone. A
@@ -183,6 +191,8 @@ class StepBudget:
         robot then drove 0.9855 m. A world that really stops still reports
         a stall, `grace_s` after the wait began.
         """
+        if grace_s is None:
+            grace_s = STALL_GRACE_S
         try:
             ref = max(float(last_tick_wall), self.wall_start)
             return (time.time() - ref) > float(grace_s)

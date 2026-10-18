@@ -233,6 +233,30 @@ def finite_number(value: Any, name: str) -> float:
     return result
 
 
+def prompt_budget(body: Any, default_s: float = 90.0) -> tuple[float, Optional[float]]:
+    """`(timeout_s, wall_timeout_s)` for a `POST /prompt` body.
+
+    ONE parser for every bridge, so the budget means the same thing on each:
+    `timeout_s` (default 90, in (0, 600]) is counted on the slower of the
+    simulation and wall clocks, and the optional `wall_timeout_s` (in
+    [timeout_s, 3600]) is the hard wall ceiling for a sim that stops
+    stepping -- see `OmniLinkRelay.dispatch_sync`."""
+    body = body if isinstance(body, dict) else {}
+    timeout_s = finite_number(body.get("timeout_s", default_s), "timeout_s")
+    if not 0 < timeout_s <= 600:
+        raise RequestError(400, "value_out_of_range",
+                           "timeout_s must be greater than zero and at most 600",
+                           {"field": "timeout_s"})
+    wall = body.get("wall_timeout_s")
+    if wall is not None:
+        wall = finite_number(wall, "wall_timeout_s")
+        if not timeout_s <= wall <= 3600:
+            raise RequestError(400, "value_out_of_range",
+                               "wall_timeout_s must be at least timeout_s and at most 3600",
+                               {"field": "wall_timeout_s"})
+    return timeout_s, wall
+
+
 def nonempty_string(value: Any, name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise RequestError(400, "invalid_type", f"Field {name!r} must be a non-empty string.", {"field": name})

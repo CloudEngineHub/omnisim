@@ -58,6 +58,9 @@ Surfaces
        POST /grasp                -> {gripper, attached}  close + hold
        POST /release              -> {gripper, released}  open + drop
        POST /prompt               -> {response, actions}  natural-language
+                                      {text, timeout_s?=90 (sim AND wall:
+                                      the slower clock decides),
+                                      wall_timeout_s?=600 (hard wall cap)}
        POST /learn                -> {started, recipe, message}  skill learning
        POST /<learned_verb>       -> {accepted, commanded, achieved,
                                       duration_s}  replay a skill learned
@@ -260,6 +263,7 @@ from _omnilink_relay.http_security import (  # noqa: E402
     finite_number,
     nonempty_string,
     number_list,
+    prompt_budget,
     read_json,
     require_field,
     validate_request_id,
@@ -3088,7 +3092,18 @@ class ArmBridge:
     # silent this long (wall seconds) nothing is stepping the sim, so a
     # waiter would block for its whole budget and then report a timeout
     # that says nothing about the arm. Says the real reason instead.
-    WAIT_STALL_S = 2.0
+    #
+    # ⚠️ 10 s, NOT 2 s (2026-10-17). A slow world is not a stopped one, and
+    # the only thing that tells them apart here is how long the silence
+    # lasts. MEASURED (WIRobotics ALLEX, installed v9.2.5, 0.09-0.18x real
+    # time with a capture camera): one tick gap of ~2.4 s wall in the middle
+    # of a hover, and set_tcp_target answered `stalled`, `achieved: None`,
+    # `settled: False` for a move the arm then finished 1.4 mm from target --
+    # the model had to call get_robot_state to find out it had worked. A
+    # world that really stops (a harness pause, a dead engine) is now
+    # reported 10 s after the silence began instead of 2 s. Same figure as
+    # bridge_base.STALL_GRACE_S, which the other bridges' waits use.
+    WAIT_STALL_S = 10.0
     # Sim seconds a finished plan holds still before it is measured. The
     # last setpoint is written in the same tick the interpolation ends, so
     # the position servo has not tracked it yet; measuring immediately
@@ -3737,7 +3752,51 @@ class ArmBridge:
             })
             return head
         head.update(self._await_completion(seq, budget_s))
+        if head.get("achieved") is None and (head.get("stalled")
+                                             or head.get("timed_out")):
+            # P2 (tool-design-for-agents.md): `achieved` stays null -- the
+            # motion never reported, so there is no completion to quote.
+            # But the joints WERE read on the last tick, and handing that
+            # reading back (labelled for what it is) saves the agent a
+            # get_robot_state round trip to learn where the arm actually is.
+            reading = self._last_reading(commanded, unit)
+            if reading is not None:
+                head["last_reading"] = reading
         return head
+
+    def _last_reading(self, commanded, unit: str) -> Optional[dict]:
+        """The last tick's MEASURED joints (and tool point, for a TCP verb),
+        for a wait that gave up before the motion reported. Cached floats
+        only: this runs on an HTTP or relay thread (MainThreadCalls)."""
+        try:
+            with self.lock:
+                q = [float(v) for v in self.last_q]
+                tick_wall = float(self.last_tick_at)
+            out: Dict[str, Any] = {
+                "q": [round(v, 6) for v in q],
+                "sim_time": round(float(self.sim_time), 6),
+                "age_wall_s": round(max(0.0, time.time() - tick_wall), 3),
+                "note": ("the joint sensors' last reading when this wait gave "
+                         "up -- NOT a completion: the motion had not reported, "
+                         "so the arm may still be moving toward `commanded`"),
+            }
+            if unit == "m" and commanded is not None and self.cfg.get("ik"):
+                ik_cfg = self.cfg["ik"]
+                tcp = [float(v) for v in forward_kinematics(
+                    ik_cfg["chain"], q, ik_cfg["tcp_offset"])]
+                err = [a - c for a, c in zip(tcp, commanded)]
+                out["tcp"] = [round(v, 5) for v in tcp]
+                out["error"] = [round(v, 5) for v in err]
+                out["error_m"] = round(math.sqrt(sum(e * e for e in err)), 5)
+                out["frame"] = "arm base (the arm's own origin), metres"
+            elif unit == "rad" and commanded is not None:
+                err = [a - float(c) for a, c in zip(q, commanded)]
+                out["error"] = [round(v, 6) for v in err]
+                out["max_abs_error_rad"] = round(
+                    max((abs(e) for e in err), default=0.0), 6)
+            return out
+        except Exception:
+            return None
 
     def _begin_motion(self, verb: str, override: bool = False):
         """Claim the motion slot for `verb`, on behalf of an external caller.
@@ -8057,6 +8116,14 @@ def make_handler(bridge: ArmBridge, relay: Any = None):
                 return self._json(200, bridge._walk_tree_json())
             if path == "/prompt":
                 text = nonempty_string(require_field(body, "text"), "text")
+                # THE TURN BUDGET honours `timeout_s` (default 90) and counts
+                # it on the SLOWER of the sim and wall clocks; `wall_timeout_s`
+                # is the hard wall ceiling for a world that stops stepping
+                # (default 600). Until 2026-10-17 this route called
+                # dispatch_sync(text) with a fixed 90 s WALL budget and ignored
+                # the body: on ALLEX at 0.09-0.18x real time a correct
+                # three-hover turn was cancelled after two hovers.
+                prompt_timeout_s, prompt_wall_s = prompt_budget(body)
                 # The blanket arm above already fired for /prompt. Roll it
                 # back if the turn only read state -- a question must not
                 # park the arm for the whole quiet window (and then report
@@ -8095,7 +8162,10 @@ def make_handler(bridge: ArmBridge, relay: Any = None):
                         # relay's own auto-reads (which emit no "tool" event)
                         # can be reported below. See _auto_reads_since.
                         _n0 = _tx_journal_seq(relay)
-                        out = relay.dispatch_sync(text)
+                        out = relay.dispatch_sync(
+                            text, timeout_s=prompt_timeout_s,
+                            sim_clock=lambda: bridge.sim_time,
+                            wall_timeout_s=prompt_wall_s)
                         bridge.end_chat_turn(prev_pause_marker,
                                              out.get("actions"))
                         # AFTER end_chat_turn on purpose: the pause decision

@@ -148,6 +148,7 @@ from _omnilink_relay.http_security import (  # noqa: E402
     error_envelope,
     finite_number,
     nonempty_string,
+    prompt_budget,
     read_json,
     require_field,
     require_authorized,
@@ -1623,13 +1624,14 @@ def make_handler(state: BridgeState):
                 # land" turn can outlast the 90 s default below real time.
                 # Parsed HERE, where it is used: a keyless or parser-answered
                 # prompt is settled above without reading it.
-                prompt_timeout_s = finite_number(body.get("timeout_s", 90.0), "timeout_s")
-                if not 0 < prompt_timeout_s <= 600:
-                    raise RequestError(400, "bad_request",
-                                       "timeout_s must be greater than zero and at most 600")
+                # Counted on the SLOWER of the sim and wall clocks, with
+                # `wall_timeout_s` as the hard wall cap (dispatch_sync).
+                prompt_timeout_s, prompt_wall_s = prompt_budget(body)
                 return self._json(
                     200, _shared_stamp_via(relay.dispatch_sync(
-                        text, timeout_s=prompt_timeout_s)))
+                        text, timeout_s=prompt_timeout_s,
+                        sim_clock=lambda: state.sim_time,
+                        wall_timeout_s=prompt_wall_s)))
 
             # ── /tool: the platform's callback, gated ─────────────────
             if p == "/tool":

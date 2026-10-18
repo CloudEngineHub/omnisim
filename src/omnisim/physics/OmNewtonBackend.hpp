@@ -213,6 +213,13 @@ public:
   // Must be called before finalizeWorld(). Returns 0, or -1 (also on a runtime
   // bundle too old to offer it).
   int quietLastShape();
+  // Robot ROOT collider (2026-10-17): brackets the shapes a Robot wrapper attaches
+  // from its OWN boundingObject. phase 0 before attaching, 1 after. finalize() then
+  // keeps them colliding unless they reach below the robot's own descendant
+  // colliders (wheels / feet), and says which. BUILD phase only. Returns 0, or -1
+  // (also on a runtime bundle too old to offer it -- the caller then keeps the
+  // pre-2026-10-17 placeholder path).
+  int markRobotRootShapes(int bodyIdx, int phase);
   // URDF <mimic>: q[followerJoint] = offset + multiplier * q[leaderJoint], both the
   // indices addJointRevolute/addJointPrismatic returned. Applied at finalize as a MuJoCo
   // joint-equality constraint. BUILD phase only. Returns 0 or -1.

@@ -1204,6 +1204,21 @@ int OmNewtonBackend::quietLastShape() {
   return static_cast<int>(rc);
 }
 
+int OmNewtonBackend::markRobotRootShapes(int bodyIdx, int phase) {
+  if (!mAvailable || mRuntime == nullptr || mRuntime->world == nullptr || !mRuntime->openForBuild)
+    return -1;
+  // An older staged bundle has no mark_robot_root_shapes: the caller then keeps
+  // the placeholder path instead of registering a collider nothing will judge.
+  if (!PyObject_HasAttrString(mRuntime->world, "mark_robot_root_shapes"))
+    return -1;
+  PyObject *r = PyObject_CallMethod(mRuntime->world, "mark_robot_root_shapes", "(ii)", bodyIdx, phase);
+  if (r == nullptr)
+    return reportPyError("mark_robot_root_shapes");
+  const long rc = PyLong_Check(r) ? PyLong_AsLong(r) : -1;
+  Py_DECREF(r);
+  return static_cast<int>(rc);
+}
+
 int OmNewtonBackend::addShapeBox(int bodyIdx, double hx, double hy, double hz,
                                  double cx, double cy, double cz, double ke,
                                  double qx, double qy, double qz, double qw,
@@ -3739,6 +3754,7 @@ int OmNewtonBackend::addKinematicBody(double, double, double, double, double, do
 int OmNewtonBackend::setKinematicPose(int, double, double, double, double, double, double, double) { return -1; }
 int OmNewtonBackend::addShapeSphere(int, double, double, double, double, double, double, double) { return -1; }
 int OmNewtonBackend::quietLastShape() { return -1; }
+int OmNewtonBackend::markRobotRootShapes(int, int) { return -1; }
 int OmNewtonBackend::addJointMimic(int, int, double, double) { return -1; }
 int OmNewtonBackend::weldBodyToWorld(int) { return -1; }
 int OmNewtonBackend::addShapeBox(int, double, double, double, double, double, double, double,

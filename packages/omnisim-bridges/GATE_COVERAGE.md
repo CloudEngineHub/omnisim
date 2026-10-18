@@ -409,6 +409,32 @@ robot to the floor it is standing on: `act_drive_forward` and
 `act_drive_to` take a distance and drive it. A two-hour soak walked a
 Husky off a 12 m floor to (−6.86, 4.75) and nothing objected.
 
+## ⚠️ What starts a turn is not the gate's question (2026-10-17)
+
+The gate vets `(utterance, frames)`. It does not know, and cannot know,
+whether anyone ASKED for the turn those frames came from. On installed
+v9.2.5 an arm bridge (WIRobotics ALLEX) restarted with short-term memory on;
+the relay's event wake fired on the `joint.limit_hit` of a hand settling
+onto its stops, the model read the previous session's restored sentence,
+and the arm re-ran that whole task before any new prompt. Every frame was
+within its rails, so the gate passed every one — correctly, by its own
+contract. The hole was upstream of it, and is closed in the relay:
+
+| rule | where | pin |
+|---|---|---|
+| Event-triggered turns are **OFF** unless `OMNILINK_EVENT_WAKE=1` (on by default from v9.0.0 through v9.2.5) | `relay.py` `OmniLinkRelay.__init__` | `tests/test_no_unprompted_turns.py` |
+| Even opted in, **no wake before this session's first operator turn**, and only events filed after it count | `note_operator_turn`, `_wake_hold_reason` | same |
+| **Startup / settle events never wake** (first 5 s of sim time, first 5 s after the poller primed); consumed, not deferred | `WAKE_SETTLE_SIM_S`, `WAKE_SETTLE_WALL_S` | same, incl. the real `JointLimitDetector` |
+| A window holding restored history carries a **session-boundary instruction**: nothing restored is to be resumed unless asked again this session | `RESTORED_HISTORY_NOTE`, `_session_boundary_note` | same |
+
+The last row is an instruction to a model, not an interlock: with a fresh
+prompt in the session, what the model does with restored context is still
+the model's choice, vetted frame by frame by the gate. Not changed by this
+fix, and worth knowing: the mobile bridge's intent store restores pending
+commitments from a previous run of the same robot (timed orders are
+dropped when the world was reloaded; counter-triggered ones are rebased and
+kept) — see `intents.py` `_restore`.
+
 ## Addendum — further ungated surfaces (full-tree scan)
 
 - **`agents/production/_lib/runner_base.py`** `/tool` — validates the
