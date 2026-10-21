@@ -1014,27 +1014,14 @@ DEF TROLLEY_PAYLOAD Solid {
   rotation 0 0 1 -1.5708
   physicsBackend "newton"
   children [
-    # — steel deck (top 0.325) —
-    Transform { translation 0 0 0.30 children [ Shape { appearance DEF TROLLEY_STEEL PBRAppearance { baseColor 0.30 0.34 0.40 roughness 0.55 metalness 0.7 } geometry Box { size 0.70 0.70 0.05 } } ] }
-    Transform { translation 0 0 0.265 children [ Shape { appearance DEF TROLLEY_DARK PBRAppearance { baseColor 0.16 0.17 0.20 roughness 0.7 metalness 0.5 } geometry Box { size 0.66 0.66 0.02 } } ] }
-    # — corner cleats that cradle the line box (visual-only) —
-    Transform { translation 0.245 0.245 0.34 children [ Shape { appearance DEF TROLLEY_CLEAT PBRAppearance { baseColor 0.85 0.55 0.10 roughness 0.7 metalness 0.3 } geometry Box { size 0.06 0.06 0.03 } } ] }
-    Transform { translation 0.245 -0.245 0.34 children [ Shape { appearance USE TROLLEY_CLEAT geometry Box { size 0.06 0.06 0.03 } } ] }
-    Transform { translation -0.245 0.245 0.34 children [ Shape { appearance USE TROLLEY_CLEAT geometry Box { size 0.06 0.06 0.03 } } ] }
-    Transform { translation -0.245 -0.245 0.34 children [ Shape { appearance USE TROLLEY_CLEAT geometry Box { size 0.06 0.06 0.03 } } ] }
-    # — four caster assemblies (fork + wheel), visual-only —
-    Transform { translation 0.27 0.27 0.185 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.04 0.07 0.13 } } ] }
-    Transform { translation 0.27 -0.27 0.185 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.04 0.07 0.13 } } ] }
-    Transform { translation -0.27 0.27 0.185 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.04 0.07 0.13 } } ] }
-    Transform { translation -0.27 -0.27 0.185 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.04 0.07 0.13 } } ] }
-    Transform { translation 0.27 0.27 0.06 rotation 1 0 0 1.5708 children [ Shape { appearance DEF TROLLEY_WHEEL PBRAppearance { baseColor 0.09 0.09 0.10 roughness 0.9 metalness 0.1 } geometry Cylinder { radius 0.06 height 0.05 } } ] }
-    Transform { translation 0.27 -0.27 0.06 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_WHEEL geometry Cylinder { radius 0.06 height 0.05 } } ] }
-    Transform { translation -0.27 0.27 0.06 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_WHEEL geometry Cylinder { radius 0.06 height 0.05 } } ] }
-    Transform { translation -0.27 -0.27 0.06 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_WHEEL geometry Cylinder { radius 0.06 height 0.05 } } ] }
-    # — hitch drawbar + plate (hitch point local (0.70, 0, 0.25)) —
-    Transform { translation 0.525 0 0.25 children [ Shape { appearance USE TROLLEY_STEEL geometry Box { size 0.35 0.05 0.04 } } ] }
-    Transform { translation 0.70 0 0.21 children [ Shape { appearance DEF TROLLEY_HITCH PBRAppearance { baseColor 0.85 0.55 0.10 roughness 0.6 metalness 0.4 } geometry Box { size 0.035 0.14 0.12 } } ] }
-    Transform { translation 0.70 0 0.27 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_HITCH geometry Cylinder { radius 0.028 height 0.03 } } ] }
+    # Tugger cart (projects/objects/factory/tugger_cart, Blender-built), visual only.
+    Shape { appearance PBRAppearance { baseColor 0.22 0.23 0.25 roughness 0.55 metalness 0.6 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_deck.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.1 0.27 0.52 roughness 0.45 metalness 0.2 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_frame.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.05 0.05 0.05 roughness 0.9 metalness 0.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_rubber.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.66 0.67 0.69 roughness 0.35 metalness 1.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_steel.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.78 0.78 0.76 roughness 0.6 metalness 0.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_wheel.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.965 0.78 0.2 roughness 0.5 metalness 0.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_accent.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.85 0.12 0.05 roughness 0.3 metalness 0.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_reflector.obj" } castShadows TRUE }
   ]
   name "trolley_payload"
   boundingObject Transform { translation 0 0 0.1625 children [ Box { size 0.70 0.70 0.325 } ] }
@@ -1046,23 +1033,14 @@ DEF TROLLEY_B Solid {
   rotation 0 0 1 0.0
   physicsBackend "newton"
   children [
-    Transform { translation 0 0 0.30 children [ Shape { appearance USE TROLLEY_STEEL geometry Box { size 0.70 0.70 0.05 } } ] }
-    Transform { translation 0 0 0.265 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.66 0.66 0.02 } } ] }
-    Transform { translation 0.245 0.245 0.34 children [ Shape { appearance USE TROLLEY_CLEAT geometry Box { size 0.06 0.06 0.03 } } ] }
-    Transform { translation 0.245 -0.245 0.34 children [ Shape { appearance USE TROLLEY_CLEAT geometry Box { size 0.06 0.06 0.03 } } ] }
-    Transform { translation -0.245 0.245 0.34 children [ Shape { appearance USE TROLLEY_CLEAT geometry Box { size 0.06 0.06 0.03 } } ] }
-    Transform { translation -0.245 -0.245 0.34 children [ Shape { appearance USE TROLLEY_CLEAT geometry Box { size 0.06 0.06 0.03 } } ] }
-    Transform { translation 0.27 0.27 0.185 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.04 0.07 0.13 } } ] }
-    Transform { translation 0.27 -0.27 0.185 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.04 0.07 0.13 } } ] }
-    Transform { translation -0.27 0.27 0.185 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.04 0.07 0.13 } } ] }
-    Transform { translation -0.27 -0.27 0.185 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.04 0.07 0.13 } } ] }
-    Transform { translation 0.27 0.27 0.06 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_WHEEL geometry Cylinder { radius 0.06 height 0.05 } } ] }
-    Transform { translation 0.27 -0.27 0.06 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_WHEEL geometry Cylinder { radius 0.06 height 0.05 } } ] }
-    Transform { translation -0.27 0.27 0.06 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_WHEEL geometry Cylinder { radius 0.06 height 0.05 } } ] }
-    Transform { translation -0.27 -0.27 0.06 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_WHEEL geometry Cylinder { radius 0.06 height 0.05 } } ] }
-    Transform { translation 0.525 0 0.25 children [ Shape { appearance USE TROLLEY_STEEL geometry Box { size 0.35 0.05 0.04 } } ] }
-    Transform { translation 0.70 0 0.21 children [ Shape { appearance USE TROLLEY_HITCH geometry Box { size 0.035 0.14 0.12 } } ] }
-    Transform { translation 0.70 0 0.27 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_HITCH geometry Cylinder { radius 0.028 height 0.03 } } ] }
+    # Tugger cart (projects/objects/factory/tugger_cart, Blender-built), visual only.
+    Shape { appearance PBRAppearance { baseColor 0.22 0.23 0.25 roughness 0.55 metalness 0.6 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_deck.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.1 0.27 0.52 roughness 0.45 metalness 0.2 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_frame.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.05 0.05 0.05 roughness 0.9 metalness 0.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_rubber.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.66 0.67 0.69 roughness 0.35 metalness 1.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_steel.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.78 0.78 0.76 roughness 0.6 metalness 0.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_wheel.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.965 0.78 0.2 roughness 0.5 metalness 0.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_accent.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.85 0.12 0.05 roughness 0.3 metalness 0.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_reflector.obj" } castShadows TRUE }
   ]
   name "trolley_b"
   boundingObject Transform { translation 0 0 0.1625 children [ Box { size 0.70 0.70 0.325 } ] }
@@ -1075,23 +1053,14 @@ DEF TROLLEY_C Solid {
   rotation 0 0 1 0.0
   physicsBackend "newton"
   children [
-    Transform { translation 0 0 0.30 children [ Shape { appearance USE TROLLEY_STEEL geometry Box { size 0.70 0.70 0.05 } } ] }
-    Transform { translation 0 0 0.265 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.66 0.66 0.02 } } ] }
-    Transform { translation 0.245 0.245 0.34 children [ Shape { appearance USE TROLLEY_CLEAT geometry Box { size 0.06 0.06 0.03 } } ] }
-    Transform { translation 0.245 -0.245 0.34 children [ Shape { appearance USE TROLLEY_CLEAT geometry Box { size 0.06 0.06 0.03 } } ] }
-    Transform { translation -0.245 0.245 0.34 children [ Shape { appearance USE TROLLEY_CLEAT geometry Box { size 0.06 0.06 0.03 } } ] }
-    Transform { translation -0.245 -0.245 0.34 children [ Shape { appearance USE TROLLEY_CLEAT geometry Box { size 0.06 0.06 0.03 } } ] }
-    Transform { translation 0.27 0.27 0.185 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.04 0.07 0.13 } } ] }
-    Transform { translation 0.27 -0.27 0.185 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.04 0.07 0.13 } } ] }
-    Transform { translation -0.27 0.27 0.185 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.04 0.07 0.13 } } ] }
-    Transform { translation -0.27 -0.27 0.185 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.04 0.07 0.13 } } ] }
-    Transform { translation 0.27 0.27 0.06 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_WHEEL geometry Cylinder { radius 0.06 height 0.05 } } ] }
-    Transform { translation 0.27 -0.27 0.06 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_WHEEL geometry Cylinder { radius 0.06 height 0.05 } } ] }
-    Transform { translation -0.27 0.27 0.06 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_WHEEL geometry Cylinder { radius 0.06 height 0.05 } } ] }
-    Transform { translation -0.27 -0.27 0.06 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_WHEEL geometry Cylinder { radius 0.06 height 0.05 } } ] }
-    Transform { translation 0.525 0 0.25 children [ Shape { appearance USE TROLLEY_STEEL geometry Box { size 0.35 0.05 0.04 } } ] }
-    Transform { translation 0.70 0 0.21 children [ Shape { appearance USE TROLLEY_HITCH geometry Box { size 0.035 0.14 0.12 } } ] }
-    Transform { translation 0.70 0 0.27 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_HITCH geometry Cylinder { radius 0.028 height 0.03 } } ] }
+    # Tugger cart (projects/objects/factory/tugger_cart, Blender-built), visual only.
+    Shape { appearance PBRAppearance { baseColor 0.22 0.23 0.25 roughness 0.55 metalness 0.6 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_deck.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.1 0.27 0.52 roughness 0.45 metalness 0.2 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_frame.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.05 0.05 0.05 roughness 0.9 metalness 0.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_rubber.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.66 0.67 0.69 roughness 0.35 metalness 1.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_steel.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.78 0.78 0.76 roughness 0.6 metalness 0.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_wheel.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.965 0.78 0.2 roughness 0.5 metalness 0.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_accent.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.85 0.12 0.05 roughness 0.3 metalness 0.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_reflector.obj" } castShadows TRUE }
   ]
   name "trolley_c"
   boundingObject Transform { translation 0 0 0.1625 children [ Box { size 0.70 0.70 0.325 } ] }
@@ -1104,23 +1073,14 @@ DEF TROLLEY_D Solid {
   rotation 0 0 1 1.5708
   physicsBackend "newton"
   children [
-    Transform { translation 0 0 0.30 children [ Shape { appearance USE TROLLEY_STEEL geometry Box { size 0.70 0.70 0.05 } } ] }
-    Transform { translation 0 0 0.265 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.66 0.66 0.02 } } ] }
-    Transform { translation 0.245 0.245 0.34 children [ Shape { appearance USE TROLLEY_CLEAT geometry Box { size 0.06 0.06 0.03 } } ] }
-    Transform { translation 0.245 -0.245 0.34 children [ Shape { appearance USE TROLLEY_CLEAT geometry Box { size 0.06 0.06 0.03 } } ] }
-    Transform { translation -0.245 0.245 0.34 children [ Shape { appearance USE TROLLEY_CLEAT geometry Box { size 0.06 0.06 0.03 } } ] }
-    Transform { translation -0.245 -0.245 0.34 children [ Shape { appearance USE TROLLEY_CLEAT geometry Box { size 0.06 0.06 0.03 } } ] }
-    Transform { translation 0.27 0.27 0.185 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.04 0.07 0.13 } } ] }
-    Transform { translation 0.27 -0.27 0.185 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.04 0.07 0.13 } } ] }
-    Transform { translation -0.27 0.27 0.185 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.04 0.07 0.13 } } ] }
-    Transform { translation -0.27 -0.27 0.185 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.04 0.07 0.13 } } ] }
-    Transform { translation 0.27 0.27 0.06 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_WHEEL geometry Cylinder { radius 0.06 height 0.05 } } ] }
-    Transform { translation 0.27 -0.27 0.06 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_WHEEL geometry Cylinder { radius 0.06 height 0.05 } } ] }
-    Transform { translation -0.27 0.27 0.06 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_WHEEL geometry Cylinder { radius 0.06 height 0.05 } } ] }
-    Transform { translation -0.27 -0.27 0.06 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_WHEEL geometry Cylinder { radius 0.06 height 0.05 } } ] }
-    Transform { translation 0.525 0 0.25 children [ Shape { appearance USE TROLLEY_STEEL geometry Box { size 0.35 0.05 0.04 } } ] }
-    Transform { translation 0.70 0 0.21 children [ Shape { appearance USE TROLLEY_HITCH geometry Box { size 0.035 0.14 0.12 } } ] }
-    Transform { translation 0.70 0 0.27 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_HITCH geometry Cylinder { radius 0.028 height 0.03 } } ] }
+    # Tugger cart (projects/objects/factory/tugger_cart, Blender-built), visual only.
+    Shape { appearance PBRAppearance { baseColor 0.22 0.23 0.25 roughness 0.55 metalness 0.6 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_deck.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.1 0.27 0.52 roughness 0.45 metalness 0.2 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_frame.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.05 0.05 0.05 roughness 0.9 metalness 0.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_rubber.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.66 0.67 0.69 roughness 0.35 metalness 1.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_steel.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.78 0.78 0.76 roughness 0.6 metalness 0.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_wheel.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.965 0.78 0.2 roughness 0.5 metalness 0.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_accent.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.85 0.12 0.05 roughness 0.3 metalness 0.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_reflector.obj" } castShadows TRUE }
   ]
   name "trolley_d"
   boundingObject Transform { translation 0 0 0.1625 children [ Box { size 0.70 0.70 0.325 } ] }
@@ -1133,23 +1093,14 @@ DEF TROLLEY_E Solid {
   rotation 0 0 1 1.5708
   physicsBackend "newton"
   children [
-    Transform { translation 0 0 0.30 children [ Shape { appearance USE TROLLEY_STEEL geometry Box { size 0.70 0.70 0.05 } } ] }
-    Transform { translation 0 0 0.265 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.66 0.66 0.02 } } ] }
-    Transform { translation 0.245 0.245 0.34 children [ Shape { appearance USE TROLLEY_CLEAT geometry Box { size 0.06 0.06 0.03 } } ] }
-    Transform { translation 0.245 -0.245 0.34 children [ Shape { appearance USE TROLLEY_CLEAT geometry Box { size 0.06 0.06 0.03 } } ] }
-    Transform { translation -0.245 0.245 0.34 children [ Shape { appearance USE TROLLEY_CLEAT geometry Box { size 0.06 0.06 0.03 } } ] }
-    Transform { translation -0.245 -0.245 0.34 children [ Shape { appearance USE TROLLEY_CLEAT geometry Box { size 0.06 0.06 0.03 } } ] }
-    Transform { translation 0.27 0.27 0.185 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.04 0.07 0.13 } } ] }
-    Transform { translation 0.27 -0.27 0.185 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.04 0.07 0.13 } } ] }
-    Transform { translation -0.27 0.27 0.185 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.04 0.07 0.13 } } ] }
-    Transform { translation -0.27 -0.27 0.185 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.04 0.07 0.13 } } ] }
-    Transform { translation 0.27 0.27 0.06 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_WHEEL geometry Cylinder { radius 0.06 height 0.05 } } ] }
-    Transform { translation 0.27 -0.27 0.06 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_WHEEL geometry Cylinder { radius 0.06 height 0.05 } } ] }
-    Transform { translation -0.27 0.27 0.06 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_WHEEL geometry Cylinder { radius 0.06 height 0.05 } } ] }
-    Transform { translation -0.27 -0.27 0.06 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_WHEEL geometry Cylinder { radius 0.06 height 0.05 } } ] }
-    Transform { translation 0.525 0 0.25 children [ Shape { appearance USE TROLLEY_STEEL geometry Box { size 0.35 0.05 0.04 } } ] }
-    Transform { translation 0.70 0 0.21 children [ Shape { appearance USE TROLLEY_HITCH geometry Box { size 0.035 0.14 0.12 } } ] }
-    Transform { translation 0.70 0 0.27 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_HITCH geometry Cylinder { radius 0.028 height 0.03 } } ] }
+    # Tugger cart (projects/objects/factory/tugger_cart, Blender-built), visual only.
+    Shape { appearance PBRAppearance { baseColor 0.22 0.23 0.25 roughness 0.55 metalness 0.6 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_deck.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.1 0.27 0.52 roughness 0.45 metalness 0.2 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_frame.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.05 0.05 0.05 roughness 0.9 metalness 0.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_rubber.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.66 0.67 0.69 roughness 0.35 metalness 1.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_steel.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.78 0.78 0.76 roughness 0.6 metalness 0.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_wheel.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.965 0.78 0.2 roughness 0.5 metalness 0.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_accent.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.85 0.12 0.05 roughness 0.3 metalness 0.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_reflector.obj" } castShadows TRUE }
   ]
   name "trolley_e"
   boundingObject Transform { translation 0 0 0.1625 children [ Box { size 0.70 0.70 0.325 } ] }
@@ -1162,23 +1113,14 @@ DEF TROLLEY_F Solid {
   rotation 0 0 1 1.5708
   physicsBackend "newton"
   children [
-    Transform { translation 0 0 0.30 children [ Shape { appearance USE TROLLEY_STEEL geometry Box { size 0.70 0.70 0.05 } } ] }
-    Transform { translation 0 0 0.265 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.66 0.66 0.02 } } ] }
-    Transform { translation 0.245 0.245 0.34 children [ Shape { appearance USE TROLLEY_CLEAT geometry Box { size 0.06 0.06 0.03 } } ] }
-    Transform { translation 0.245 -0.245 0.34 children [ Shape { appearance USE TROLLEY_CLEAT geometry Box { size 0.06 0.06 0.03 } } ] }
-    Transform { translation -0.245 0.245 0.34 children [ Shape { appearance USE TROLLEY_CLEAT geometry Box { size 0.06 0.06 0.03 } } ] }
-    Transform { translation -0.245 -0.245 0.34 children [ Shape { appearance USE TROLLEY_CLEAT geometry Box { size 0.06 0.06 0.03 } } ] }
-    Transform { translation 0.27 0.27 0.185 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.04 0.07 0.13 } } ] }
-    Transform { translation 0.27 -0.27 0.185 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.04 0.07 0.13 } } ] }
-    Transform { translation -0.27 0.27 0.185 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.04 0.07 0.13 } } ] }
-    Transform { translation -0.27 -0.27 0.185 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.04 0.07 0.13 } } ] }
-    Transform { translation 0.27 0.27 0.06 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_WHEEL geometry Cylinder { radius 0.06 height 0.05 } } ] }
-    Transform { translation 0.27 -0.27 0.06 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_WHEEL geometry Cylinder { radius 0.06 height 0.05 } } ] }
-    Transform { translation -0.27 0.27 0.06 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_WHEEL geometry Cylinder { radius 0.06 height 0.05 } } ] }
-    Transform { translation -0.27 -0.27 0.06 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_WHEEL geometry Cylinder { radius 0.06 height 0.05 } } ] }
-    Transform { translation 0.525 0 0.25 children [ Shape { appearance USE TROLLEY_STEEL geometry Box { size 0.35 0.05 0.04 } } ] }
-    Transform { translation 0.70 0 0.21 children [ Shape { appearance USE TROLLEY_HITCH geometry Box { size 0.035 0.14 0.12 } } ] }
-    Transform { translation 0.70 0 0.27 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_HITCH geometry Cylinder { radius 0.028 height 0.03 } } ] }
+    # Tugger cart (projects/objects/factory/tugger_cart, Blender-built), visual only.
+    Shape { appearance PBRAppearance { baseColor 0.22 0.23 0.25 roughness 0.55 metalness 0.6 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_deck.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.1 0.27 0.52 roughness 0.45 metalness 0.2 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_frame.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.05 0.05 0.05 roughness 0.9 metalness 0.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_rubber.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.66 0.67 0.69 roughness 0.35 metalness 1.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_steel.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.78 0.78 0.76 roughness 0.6 metalness 0.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_wheel.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.965 0.78 0.2 roughness 0.5 metalness 0.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_accent.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.85 0.12 0.05 roughness 0.3 metalness 0.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_reflector.obj" } castShadows TRUE }
   ]
   name "trolley_f"
   boundingObject Transform { translation 0 0 0.1625 children [ Box { size 0.70 0.70 0.325 } ] }
@@ -1191,23 +1133,14 @@ DEF TROLLEY_G Solid {
   rotation 0 0 1 1.5708
   physicsBackend "newton"
   children [
-    Transform { translation 0 0 0.30 children [ Shape { appearance USE TROLLEY_STEEL geometry Box { size 0.70 0.70 0.05 } } ] }
-    Transform { translation 0 0 0.265 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.66 0.66 0.02 } } ] }
-    Transform { translation 0.245 0.245 0.34 children [ Shape { appearance USE TROLLEY_CLEAT geometry Box { size 0.06 0.06 0.03 } } ] }
-    Transform { translation 0.245 -0.245 0.34 children [ Shape { appearance USE TROLLEY_CLEAT geometry Box { size 0.06 0.06 0.03 } } ] }
-    Transform { translation -0.245 0.245 0.34 children [ Shape { appearance USE TROLLEY_CLEAT geometry Box { size 0.06 0.06 0.03 } } ] }
-    Transform { translation -0.245 -0.245 0.34 children [ Shape { appearance USE TROLLEY_CLEAT geometry Box { size 0.06 0.06 0.03 } } ] }
-    Transform { translation 0.27 0.27 0.185 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.04 0.07 0.13 } } ] }
-    Transform { translation 0.27 -0.27 0.185 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.04 0.07 0.13 } } ] }
-    Transform { translation -0.27 0.27 0.185 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.04 0.07 0.13 } } ] }
-    Transform { translation -0.27 -0.27 0.185 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.04 0.07 0.13 } } ] }
-    Transform { translation 0.27 0.27 0.06 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_WHEEL geometry Cylinder { radius 0.06 height 0.05 } } ] }
-    Transform { translation 0.27 -0.27 0.06 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_WHEEL geometry Cylinder { radius 0.06 height 0.05 } } ] }
-    Transform { translation -0.27 0.27 0.06 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_WHEEL geometry Cylinder { radius 0.06 height 0.05 } } ] }
-    Transform { translation -0.27 -0.27 0.06 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_WHEEL geometry Cylinder { radius 0.06 height 0.05 } } ] }
-    Transform { translation 0.525 0 0.25 children [ Shape { appearance USE TROLLEY_STEEL geometry Box { size 0.35 0.05 0.04 } } ] }
-    Transform { translation 0.70 0 0.21 children [ Shape { appearance USE TROLLEY_HITCH geometry Box { size 0.035 0.14 0.12 } } ] }
-    Transform { translation 0.70 0 0.27 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_HITCH geometry Cylinder { radius 0.028 height 0.03 } } ] }
+    # Tugger cart (projects/objects/factory/tugger_cart, Blender-built), visual only.
+    Shape { appearance PBRAppearance { baseColor 0.22 0.23 0.25 roughness 0.55 metalness 0.6 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_deck.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.1 0.27 0.52 roughness 0.45 metalness 0.2 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_frame.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.05 0.05 0.05 roughness 0.9 metalness 0.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_rubber.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.66 0.67 0.69 roughness 0.35 metalness 1.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_steel.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.78 0.78 0.76 roughness 0.6 metalness 0.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_wheel.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.965 0.78 0.2 roughness 0.5 metalness 0.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_accent.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.85 0.12 0.05 roughness 0.3 metalness 0.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_reflector.obj" } castShadows TRUE }
   ]
   name "trolley_g"
   boundingObject Transform { translation 0 0 0.1625 children [ Box { size 0.70 0.70 0.325 } ] }
@@ -1220,23 +1153,14 @@ DEF TROLLEY_H Solid {
   rotation 0 0 1 0.0
   physicsBackend "newton"
   children [
-    Transform { translation 0 0 0.30 children [ Shape { appearance USE TROLLEY_STEEL geometry Box { size 0.70 0.70 0.05 } } ] }
-    Transform { translation 0 0 0.265 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.66 0.66 0.02 } } ] }
-    Transform { translation 0.245 0.245 0.34 children [ Shape { appearance USE TROLLEY_CLEAT geometry Box { size 0.06 0.06 0.03 } } ] }
-    Transform { translation 0.245 -0.245 0.34 children [ Shape { appearance USE TROLLEY_CLEAT geometry Box { size 0.06 0.06 0.03 } } ] }
-    Transform { translation -0.245 0.245 0.34 children [ Shape { appearance USE TROLLEY_CLEAT geometry Box { size 0.06 0.06 0.03 } } ] }
-    Transform { translation -0.245 -0.245 0.34 children [ Shape { appearance USE TROLLEY_CLEAT geometry Box { size 0.06 0.06 0.03 } } ] }
-    Transform { translation 0.27 0.27 0.185 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.04 0.07 0.13 } } ] }
-    Transform { translation 0.27 -0.27 0.185 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.04 0.07 0.13 } } ] }
-    Transform { translation -0.27 0.27 0.185 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.04 0.07 0.13 } } ] }
-    Transform { translation -0.27 -0.27 0.185 children [ Shape { appearance USE TROLLEY_DARK geometry Box { size 0.04 0.07 0.13 } } ] }
-    Transform { translation 0.27 0.27 0.06 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_WHEEL geometry Cylinder { radius 0.06 height 0.05 } } ] }
-    Transform { translation 0.27 -0.27 0.06 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_WHEEL geometry Cylinder { radius 0.06 height 0.05 } } ] }
-    Transform { translation -0.27 0.27 0.06 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_WHEEL geometry Cylinder { radius 0.06 height 0.05 } } ] }
-    Transform { translation -0.27 -0.27 0.06 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_WHEEL geometry Cylinder { radius 0.06 height 0.05 } } ] }
-    Transform { translation 0.525 0 0.25 children [ Shape { appearance USE TROLLEY_STEEL geometry Box { size 0.35 0.05 0.04 } } ] }
-    Transform { translation 0.70 0 0.21 children [ Shape { appearance USE TROLLEY_HITCH geometry Box { size 0.035 0.14 0.12 } } ] }
-    Transform { translation 0.70 0 0.27 rotation 1 0 0 1.5708 children [ Shape { appearance USE TROLLEY_HITCH geometry Cylinder { radius 0.028 height 0.03 } } ] }
+    # Tugger cart (projects/objects/factory/tugger_cart, Blender-built), visual only.
+    Shape { appearance PBRAppearance { baseColor 0.22 0.23 0.25 roughness 0.55 metalness 0.6 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_deck.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.1 0.27 0.52 roughness 0.45 metalness 0.2 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_frame.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.05 0.05 0.05 roughness 0.9 metalness 0.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_rubber.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.66 0.67 0.69 roughness 0.35 metalness 1.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_steel.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.78 0.78 0.76 roughness 0.6 metalness 0.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_wheel.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.965 0.78 0.2 roughness 0.5 metalness 0.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_accent.obj" } castShadows TRUE }
+    Shape { appearance PBRAppearance { baseColor 0.85 0.12 0.05 roughness 0.3 metalness 0.0 } geometry Mesh { url "../../../../objects/factory/tugger_cart/meshes/tugger_cart_reflector.obj" } castShadows TRUE }
   ]
   name "trolley_h"
   boundingObject Transform { translation 0 0 0.1625 children [ Box { size 0.70 0.70 0.325 } ] }
@@ -1475,6 +1399,12 @@ DEF STAGING_ZONE_B Solid {
 # same. Local +Y is forward and the wheels touch the floor at z=0, so the
 # spawn rotation -pi points the nose (heading) south. See
 # projects/robots/omnisim/omnitug500/.
+# --tow kinematic: PINNED (2026-10-20). The bridge's default is now the
+# physical tow (the trolley a free body velocity-servoed to the hitch, its
+# cargo riding on friction). This line was tuned around the kinematic tow, and
+# on 300 sim-s A/B the physical tow left TROLLEY_D at PARK_SPOT_1 when tug_a
+# collected it (the outbound conveyor then hauled it 8.6 m, not 2.7 m) and the
+# line filled 2 boxes against 3. Port the park-row collection before unpinning.
 DEF TUG_A URDFRobot {
   url "../../../../robots/omnisim/omnitug500/urdf/omnitug500.urdf"
   translation -4.6 -4.6 0
@@ -1486,7 +1416,7 @@ DEF TUG_A URDFRobot {
   # three robots take the SAME quiet window, so a chat turn with the site
   # never leaves one robot parked long after its neighbours went back to
   # work.
-  controllerArgs [ "--robot" "omnitug500" "--port" "8766" "--name" "tug_a" "--pallets" "TROLLEY_PAYLOAD,TROLLEY_B,TROLLEY_C,TROLLEY_D,TROLLEY_E,TROLLEY_F,TROLLEY_G,TROLLEY_H" "--idle-loop" "dispatch" "--idle-resume-s" "12" "--idle-arm-port" "8765" "--idle-peer-port" "8767" ]
+  controllerArgs [ "--robot" "omnitug500" "--port" "8766" "--name" "tug_a" "--tow" "kinematic" "--pallets" "TROLLEY_PAYLOAD,TROLLEY_B,TROLLEY_C,TROLLEY_D,TROLLEY_E,TROLLEY_F,TROLLEY_G,TROLLEY_H" "--idle-loop" "dispatch" "--idle-resume-s" "12" "--idle-arm-port" "8765" "--idle-peer-port" "8767" ]
   window "omnilink_chat"
 }
 DEF TUG_B URDFRobot {
@@ -1497,7 +1427,7 @@ DEF TUG_B URDFRobot {
   supervisor TRUE
   controller "omnilink_mobile_bridge"
   # --idle-resume-s 12: see the note on the OmniArm 6's controllerArgs.
-  controllerArgs [ "--robot" "omnitug500" "--port" "8767" "--name" "tug_b" "--pallets" "TROLLEY_PAYLOAD,TROLLEY_B,TROLLEY_C,TROLLEY_D,TROLLEY_E,TROLLEY_F,TROLLEY_G,TROLLEY_H" "--idle-loop" "trolley_return" "--idle-resume-s" "12" "--idle-arm-port" "8765" "--idle-peer-port" "8766" ]
+  controllerArgs [ "--robot" "omnitug500" "--port" "8767" "--name" "tug_b" "--tow" "kinematic" "--pallets" "TROLLEY_PAYLOAD,TROLLEY_B,TROLLEY_C,TROLLEY_D,TROLLEY_E,TROLLEY_F,TROLLEY_G,TROLLEY_H" "--idle-loop" "trolley_return" "--idle-resume-s" "12" "--idle-arm-port" "8765" "--idle-peer-port" "8766" ]
   window "omnilink_chat"
 }
 

@@ -28,6 +28,7 @@ import math
 
 import pytest
 
+from omnisim_bridges import gate as gate_module
 from omnisim_bridges.gate import MAX_DISTANCE_M, check
 
 
@@ -311,6 +312,45 @@ def test_the_narrowed_rules_still_refuse_what_they_exist_for(utterance, frame, r
     assert rule in rules(check(utterance, [frame], surface="mobile")), utterance
 
 
+# ── A deferral that only governs a report back (crew demo, 2026-10-20) ──
+@pytest.mark.parametrize("utterance", [
+    "drive to the dock and tell me when you're there",
+    "Please bring the cart to the yellow pad in front of me, unhitch it, and "
+    "tell me the cart's world x, y when it's ready to load.",
+    "Once it is unhitched please tell me where it is. Drive to the pad now.",
+    "go to shipping; message me once you arrive",
+    "Please bring an empty cart to the yellow pad, unhitch it, and send me the cart centre's "
+    "world x, y once it's unhitched. I'll load red, blue and green onto it after that.",
+    "bring the cart over. I will load it after that.",
+    "Please hitch CART, bring it to shipping within Packer's reach, and message Packer "
+    "directly once it's parked and unhitched.",
+    "drive to the dock and let Sam know once you arrive",
+])
+def test_a_wait_that_only_governs_the_report_is_not_deferred(utterance):
+    assert not gate_module._is_deferred(utterance), utterance
+
+
+@pytest.mark.parametrize("utterance", [
+    "when the cart is loaded, drive to the dock",
+    "when the cart is loaded, drive to the dock and tell me",
+    "when it's loaded drive there and tell me",
+    "tell me the score, and when the cart is loaded drive to the dock",
+    "let me know when you're done, then go to the dock",
+    "go to the dock in 5 minutes and let me know",
+    "I'll need you to drive to the dock once the shift ends",
+    "we'll drive to the dock after lunch",
+    "send the cart to the dock once it is loaded",
+    "call the lift when you get there and drive in",
+])
+def test_a_report_back_does_not_launder_a_deferred_order(utterance):
+    assert gate_module._is_deferred(utterance), utterance
+
+
+def test_the_report_back_case_dispatches_end_to_end():
+    u = "drive forward 2 metres and tell me when you're done"
+    assert check(u, [F("drive_forward", distance=2.0)], surface="mobile") == [], u
+
+
 def test_a_drive_needs_a_distance():
     """Owner decision 2026-09-23: no distance, no drive -- the parser asks.
 
@@ -344,3 +384,34 @@ def test_corrections_polite_mind_and_inverted_conditions_are_orders(utterance, f
 ])
 def test_the_v3_narrowings_still_refuse_what_they_should(utterance, frame, rule):
     assert rule in rules(check(utterance, [frame], surface="mobile")), utterance
+
+
+# ── A wait defers only the action in its own sentence (campaign run 6) ──
+_RUN6 = ("The order 42 cart is loaded and I'm clear of it: red at world (-1.80, 0.00), blue at (-1.70, 0.00), "
+         "green at (-1.75, 0.10), measured after release. Please hitch it and take it to Packer at shipping.")
+
+
+@pytest.mark.parametrize("utterance,tool,deferred", [
+    (_RUN6, "attach_trolley", False),
+    (_RUN6, "go_to_place", False),
+    ("the parts were checked after loading. drive to the dock now.", "go_to_place", False),
+    ("after lunch, hitch the cart", "attach_trolley", True),
+    ("hitch the cart. do it after lunch.", "attach_trolley", True),
+    ("once the shift ends, drive forward 2 metres", "drive_forward", True),
+    ("send it forward 2 metres once the cart is loaded", "drive_forward", True),   # action never named: strict
+    ("once the shift ends, sort it out", "drive_forward", True),
+    ("after the meeting, frobnicate", "some_unlisted_tool", True),                 # no verb list: strict
+    # the verb inside the waiting clause is the CONDITION (campaign run 15)
+    ("Order 42: please bring an empty cart to the yellow pad in front of me, unhitch it, and tell me the cart "
+     "centre's world x, y in metres. I'll load red, blue and green once you confirm it's unhitched.",
+     "detach_trolley", False),
+    ("hitch the cart once the shift ends", "attach_trolley", True),
+    ("hitch the cart once you confirm it is unhitched and drive to the dock", "go_to_place", True),
+    # an unnamed tool: strict, unless a sentence with no wait states the order (showcase take 12)
+    ("The cart for order 42 is loaded. After release I measured red at world (-1.80, -0.002), blue at "
+     "(-1.70, -0.003) and green at (-1.75, 0.102), each resting at z 0.35. Please hitch it and take it to "
+     "Packer at shipping now.", "detach_trolley", False),
+    ("The cart is loaded. Once the shift ends, sort it out.", "drive_forward", True),   # a description is no order
+])
+def test_a_wait_defers_the_action_in_its_own_sentence(utterance, tool, deferred):
+    assert gate_module._deferred_for(utterance, tool) is deferred, utterance

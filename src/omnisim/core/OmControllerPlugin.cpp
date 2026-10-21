@@ -20,6 +20,7 @@
 #include "OmStandardPaths.hpp"
 
 #include <QtCore/QDir>
+#include <QtCore/QFileInfo>
 #include <QtCore/QString>
 #include <QtCore/QStringList>
 
@@ -42,17 +43,27 @@ static void searchPossibleControllerPlugins(QStringList &out, const QStringList 
   }
 }
 
+// Every "plugins" folder of the installation's default projects and of the extra projects, found once.
+static const QStringList &pluginFolders() {
+  static QStringList pluginsList;
+  static bool firstCall = true;
+  if (firstCall) {
+    firstCall = false;
+    OmFileUtil::searchDirectoryNameRecursively(pluginsList, "plugins", OmStandardPaths::projectsPath() + "default/");
+    OmFileUtil::searchDirectoryNameRecursively(pluginsList, "plugins", OmStandardPaths::resourcesProjectsPath());
+    foreach (const OmProject *extraProject, *OmProject::extraProjects())
+      OmFileUtil::searchDirectoryNameRecursively(pluginsList, "plugins", extraProject->path());
+  }
+  return pluginsList;
+}
+
 const QStringList &OmControllerPlugin::defaultList(Type type) {
   static QStringList lists[2];
   static bool firstCall = true;
   if (firstCall) {
     firstCall = false;
 
-    QStringList pluginsList;
-    OmFileUtil::searchDirectoryNameRecursively(pluginsList, "plugins", OmStandardPaths::projectsPath() + "default/");
-    OmFileUtil::searchDirectoryNameRecursively(pluginsList, "plugins", OmStandardPaths::resourcesProjectsPath());
-    foreach (const OmProject *extraProject, *OmProject::extraProjects())
-      OmFileUtil::searchDirectoryNameRecursively(pluginsList, "plugins", extraProject->path());
+    const QStringList &pluginsList = pluginFolders();
 
     searchPossibleControllerPlugins(lists[ROBOT_WINDOW], pluginsList, ROBOT_WINDOW);
     lists[ROBOT_WINDOW].sort();
@@ -61,6 +72,23 @@ const QStringList &OmControllerPlugin::defaultList(Type type) {
     lists[REMOTE_CONTROL].sort();
   }
   return lists[type];
+}
+
+QString OmControllerPlugin::defaultHtmlWindowFile(const QString &key, const QString &extension) {
+  if (key.isEmpty() || key.startsWith('<'))
+    return QString();
+  foreach (const QString &pluginPath, pluginFolders()) {
+    // Only the install's own folders: OmRobotWindow serves a window from anywhere else as a path
+    // relative to the CURRENT project, where an extra project's file is not.
+    if (!OmFileUtil::isLocatedInInstallationDirectory(pluginPath, true))
+      continue;
+    const QString path =
+      pluginPath + gTypeNames[ROBOT_WINDOW] + '/' + key + '/' + key + '.' + extension;
+    const QFileInfo file(path);
+    if (file.exists() && file.isFile() && file.isReadable())
+      return path;
+  }
+  return QString();
 }
 
 OmControllerPlugin::Type OmControllerPlugin::pluginSubDirectoryToType(const QString &pluginSubDirectory) {

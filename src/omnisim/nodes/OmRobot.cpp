@@ -471,7 +471,12 @@ void OmRobot::updateWindow() {
     if (key == "<none>")
       return;
     else if (!key.isEmpty() && key != "<generic>") {
-      const QString &absoluteFilePath = searchDynamicLibraryAbsolutePath(key, "robot_windows");
+      QString absoluteFilePath = searchDynamicLibraryAbsolutePath(key, "robot_windows");
+      // OmControllerPlugin::defaultList() names a library for EVERY shared plugin folder, built or not. An
+      // HTML-only window there (omnilink_chat, omnilink_launcher) has none, and the controller then tried to
+      // load the phantom file: "failed to load .../omnilink_launcher.dll library".
+      if (!absoluteFilePath.isEmpty() && !QFile::exists(absoluteFilePath) && !windowFile().isEmpty())
+        absoluteFilePath.clear();
       if (absoluteFilePath.isEmpty() && windowFile().isEmpty())  // not a HTML robot window
         warn(tr("The '") + key + tr("' robot window library has not been found."));
       else
@@ -1396,7 +1401,11 @@ QString OmRobot::windowFile(const QString &extension) const {
     }
   }
 
-  return "";
+  // Last, a window the installation shares with every world (resources/projects/plugins/robot_windows,
+  // e.g. omnilink_chat). Without it a world saved outside the install had no chat window at all: the
+  // robot warned "The 'omnilink_chat' robot window library has not been found." (XGO Mini2S clip lane,
+  // v9.2.6, 2026-10-20). A copy in the world's own project still wins, above.
+  return OmControllerPlugin::defaultHtmlWindowFile(window(), extension);
 }
 
 void OmRobot::showWindow() {  // show the Qt-based controller robot window (to be deprecated)
@@ -1526,8 +1535,11 @@ void OmRobot::fixMissingResources() const {
     OmLog::info(tr("The 'controller' field of the robot has been changed to \"<generic>\"."));
   }
 
-  if (window()[0] != '<' &&
-      windowFile() != (OmProject::current()->robotWindowPluginsPath() + window() + "/" + window() + ".html")) {
+  // A window the installation shares (OmControllerPlugin::defaultHtmlWindowFile) is still found from the
+  // relocated project, so it is not a missing resource.
+  const QString file = windowFile();
+  if (window()[0] != '<' && file != (OmProject::current()->robotWindowPluginsPath() + window() + "/" + window() + ".html") &&
+      file != OmControllerPlugin::defaultHtmlWindowFile(window(), "html")) {
     mWindow->blockSignals(true);
     mWindow->setValue("<generic>");
     mWindow->blockSignals(false);

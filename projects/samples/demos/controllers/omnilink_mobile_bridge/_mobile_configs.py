@@ -381,6 +381,10 @@ OMNITUG500 = {
     "floor_z": 0.0,
     # body is 1.259 m long -> rear coupling (trolley hitch dock) offset
     "rear_offset_m": 0.63,
+    # Linear acceleration limit for the integrated pose (m/s^2). drive_to's
+    # approach tapers at 1.5 m/s per metre (~0.9 m/s^2 at cruise), so this
+    # only shapes the start and the last 0.25 m/s brake (~2 cm).
+    "kin_accel_mps2": 1.5,
 }
 
 

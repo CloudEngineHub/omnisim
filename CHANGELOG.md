@@ -25,6 +25,135 @@ top of that foundation.
 ---
 
 
+## [v9.2.7] — 2026-10-21
+
+A URDF link with an impossible inertia keeps its declared centre of mass, a fixed-base wheeled robot no longer
+slides when its wheels turn, the OmniLink chat panel opens for a world saved anywhere, a quadruped's sit and stand
+replies report what was measured, and robots can message each other. Found running robot makers' published models
+(AgiBot G2, NORI A3, XGO Mini2S).
+
+### ⚠️ Behaviour changes — read before upgrading
+
+- **A `staticBase TRUE` wheeled robot stays where it was placed when its wheels turn.** Found 2026-10-20
+  while checking a lead from the STARTUP-08 NORI A3 lane. `URDFRobot { staticBase TRUE }` strips only the root
+  link's Physics, and Webots' kinematic differential-wheels mode (`OmKinematicDifferentialWheels`, inherited
+  from upstream) attached to any Robot without Physics that has two equal, equidistant cylinder wheels on
+  parallel axes. It then moved the whole robot by ω·r each step. Measured on public v9.2.6 and on the dev
+  tree with the wheels at 4 rad/s for 2 s: a staticBase NORI A3 slid **0.6096 m** (= 4 × 0.0762 m × 2 s,
+  z frozen), and the load log meanwhile reported its fixed links welded. A Robot without Physics whose wheels
+  carry Physics is a static base under `docs/reference/physics.md`, so the kinematic model is now refused
+  for it, with one log line naming the wheels. A Robot with no Physics anywhere keeps the kinematic mode.
+  Value-parsed hatch: `OMNISIM_KINEMATIC_WHEELS_WITH_PHYSICS=1` restores the slide. The lead itself (a
+  FLOATING ROS-style robot with a massless `base_footprint` root, partly welded) was a misreading. The
+  census line `N Solid(s) with Physics under physics-less ancestors attached to the static environment`
+  appears only for a static base. A floating robot folds its fixed sensor/caster links into `base_link` and
+  rolls freely (minimal URDF 0.374 m and NORI A3 0.365 m in the same drive, both builds). That line now
+  names the physics-less owner (`they hang under the physics-less Robot '<name>', a static base`) so it
+  cannot be misread that way again. Pins: `tests/test_static_base_kinematic_wheels.py` (engine-free) and
+  `tests/test_static_base_kinematic_wheels_engine.py` (staticBase stays within 1 mm, where the unfixed binary
+  slides its exact-axis test robot 0.4000 m; the hatch restores the slide; a floating base rolls with no weld line).
+- **A quadruped sit / stand is reported from what it measured, and "sit down" is an order.** Found on
+  public v9.2.6 by the XGO Mini2S clip lane (2026-10-20). Two defects. (1) The parser's `sit` rule was
+  `sit|sit down|lie down|crouch`: the first branch won, "Sit" explained 38% of "Sit down", so
+  "Sit down." went to the model, and "Sit down, then stand up." was then salvaged as an *address*
+  ("Sit down", like "Cart, stop!") and ran the stand alone at 0.95, saying nothing about the dropped
+  clause. Longest alternatives now come first (`sit`, `stand`), and the address salvage never strips
+  words any rule reads as an order, so an unread clause stays in `residue` and below the 0.8 acting
+  floor. (2) The quadruped bridge called a pose done the moment it switched the setpoint, so "Lie down,
+  then stand up." ran both legs in the same tick and replied "Sit. Stand." while the body never went
+  down (min 0.1332 m; 0.088 m when it really lies down). `act_sit` / `act_stand` now wait (`wait=True`
+  by default, never on the sim thread) until every leg joint is within 3° of its setpoint and the body
+  height is steady to 2 mm for 0.2 s of sim time, or 5 s of sim time passes, and return
+  `{commanded, achieved, error, settled, timed_out}` with the body height before and after. The reply
+  quotes it ("In the sit pose after <t> s: legs within <e> deg; body height <z0> -> <z1> m."), a
+  pose that did not settle is an error, and `get_robot_state` gains `last_pose` / `pose_settling`.
+  `is_busy()` stays true until the pose is measured, so the lockstep hold keeps stepping it. Pin:
+  `packages/omnisim-bridges/tests/test_quadruped_pose_and_sit_down.py`.
+- **The OmniLink chat panel opens for a world outside the install; `omnilink_chat` moved to
+  `resources/projects/plugins/robot_windows/`.** On v9.2.6 a world saved anywhere else warned "The
+  'omnilink_chat' robot window library has not been found." and had no panel (XGO Mini2S clip lane,
+  2026-10-20; `POST /prompt` worked). `OmRobot::windowFile()` looked for an HTML window only in the
+  world's own project and its PROTO projects. It now falls back to the install's shared plugin folders
+  (`OmControllerPlugin::defaultHtmlWindowFile`: resources/projects/... and projects/default/...; extra
+  projects are not searched, because only files inside the install are served from outside the current
+  project). A copy in the world's own project still wins. `updateWindow()` also stopped handing the
+  controller a robot-window library that was never built: `defaultList()` names one for every shared
+  plugin folder, so an HTML-only window there failed with "failed to load .../omnilink_launcher.dll
+  library". The same gap had broken the demo launcher's gallery (its window lived only in resources) and
+  `omnitug500_courier.omniworld` (a project with no chat copy). `scripts/packaging/files_core.txt` now
+  lists both shared HTML windows; v9.2.6 shipped neither in resources. ⚠️ The engine and the moved
+  folder go together: an engine built before this change finds the chat panel for no world. Pin:
+  `tests/test_robot_window_resolution.py`.
+- **A URDF link whose inertia tensor is rejected keeps its declared mass and centre of mass.** When a
+  link with mass declares a tensor that is not positive definite (an all-zero one included), violates
+  the triangle inequality on its principal moments (`a + b < c`, which MuJoCo refuses) or has a moment
+  below the 1e-9 kg·m² floor, the importer falls back to bounding-object inertia. That fallback also threw away the link's `<inertial><origin>`: it wrote `mass` and
+  `centerOfMass` but no `inertiaMatrix`, and the Newton registration passes a centre of mass only
+  alongside an explicit tensor, so the solver stepped the link with its COM at the link origin. The
+  warning did not say so. Found on AgiBot's G2 body xacro (`genie_sim_robot_model` @6d5b215, link
+  `body_link4`: declared COM (-0.071, 0, 0.030), stepped at (0, 0, 0)). Now the fallback block is
+  written `physics DEF URDF_INERTIA_FALLBACK Physics { ... }` and always carries the declared COM;
+  the Newton registration keeps the mass and COM and takes **only** the rotational inertia from the
+  bounding object, shifted to that COM. The warning ends with what was kept and what was replaced.
+  Measured on a passive pendulum (1 kg declared 0.1 m from a Y hinge, impossible tensor, released
+  horizontal): the engine before this change never moves it (gravity has no lever arm); now its 0.2 m tip drops
+  0.098 m by 100 ms and 0.195 m by 200 ms, a point-mass swing. A non-positive-definite and an
+  all-zero tensor give the same numbers (before, neither moved). An all-zero tensor on a link with mass
+  now warns; it used to fall back silently. On a massless frame it stays silent, as before. A link
+  with a massive fixed child was already right (the composite-inertia path carried the COM). Reach:
+  none of the 372 URDFs under `projects/`, `tests/benchmarks/` and `sim-to-real/` has a non-PD tensor on
+  a link with mass, and 10 links under `projects/` hit the 1e-9 floor. The offline converter
+  (`scripts/dev/urdf_import.py`) used to write the impossible tensor straight through; it now writes
+  the same marked block. `OMNISIM_URDF_INERTIA_FALLBACK_KEEP_COM=0` (value-parsed) restores the old
+  block and the COM at the link origin. Pins: `tests/dev/test_urdf_inertia_fallback_keeps_com.py`
+  (engine-free), `tests/test_newton_urdf_inertia_fallback_com.py` (the pendulum).
+
+### Fixed — OmniLink bridges
+
+- **A stop measures rest in simulated time, so it reports a speed in headless fast mode.** v9.2.6 counted
+  the mobile bridge's 0.30 s stop settling window in sim steps but still took the tail, span and speed
+  from each pose sample's wall-clock stamp. Faster than real time, 0.30 s of sim passed in a few wall
+  milliseconds and consecutive ticks shared a coarse `time.time()` stamp, so every stop answered "rest
+  unconfirmed: pose samples spanned no measurable interval". Found on the MAB HB50W package (3 of 3
+  headless runs on the installed v9.2.6; 9.2.5 reported 0.007 m/s over 0.31 s). The window, tail and span
+  now use the sim time the bridge already recorded per sample, measured from the sim instant of the halt.
+  The arm bridge had the same mix: it waited 0.30 s of wall time and divided joint motion by wall seconds,
+  so its rest rate was off by the real-time factor (a 0.01 rad/s creep read 0.11 at 10x, and at 0.1x the
+  stop measured nothing). It now stamps sim time on every joint sample, waits out the window in sim steps
+  and gives the rate per sim second. The quadruped's rates were already on sim time. Pins:
+  `packages/omnisim-bridges/tests/test_stop_rest_sim_clock.py` (both bridges at 10x, 1x and 0.1x real
+  time, with 15.6 ms wall-clock stamps).
+
+### Added — OmniLink bridges
+
+- **Robots can message each other.** Set `OMNILINK_CREW="Picker=8765,Tug=8766,Packer=8767"` (optionally
+  `OMNILINK_CREW_OPERATOR` and `OMNILINK_CREW_LOG=<jsonl>`) for every bridge in a world and each bridge gains a
+  `message_robot` tool (`packages/omnisim-bridges/src/omnisim_bridges/crew.py`, all four bridge kinds). A message
+  lands on the crewmate's own `/prompt` as `"Picker: …"`, always reaches its model (never the parser), and the
+  crewmate's gate vets whatever it then does. Fire-and-forget and rate-capped. Worked example:
+  `agents/omnilink_demos/crew_order/`. Pins: `packages/omnisim-bridges/tests/test_crew.py`, gate-parity cases.
+- **A towed trolley is a physical body.** `omnilink_mobile_bridge --pallets` now velocity-servos the trolley as a
+  free, acceleration-limited body instead of teleporting it and pinning its cargo, so parts ride on contact and
+  friction (give the cart a low `newtonFriction`, its cargo a higher one). `--tow kinematic` restores the old
+  path; the warehouse flagship pins it until its park-row collection is ported. Kinematic bases (OmniTug) ramp
+  their linear speed (`kin_accel_mps2`).
+- New assets: the OmniTug500 tug (meshes + URDF), kitting and tugger-cart factory props, a `film_camera`
+  controller, and the `warehouse_shift` demo.
+
+### Internal
+
+- ops-bench dev loop: runs on Claude with usage accounting, live context, a fast clock, failure probes and
+  replay; probes run in parallel and an episode's tail waits on the episode clock (evidence under
+  `tests/benchmarks/robot_ops/evidence/devloop/`).
+
+### Known issues (not caused by this release, still open)
+
+- `tests/test_newton_ik_slots.py::test_reachable_target_is_actually_solved` (unchanged since v9.2.3).
+- A few wall-clock-sensitive bridge tests (`test_edge_start`, `test_hold`, `test_runtime_clock`,
+  `test_step_budget`) can fail when the machine is heavily loaded; they fail the same way on v9.2.6.
+
+---
+
 ## [v9.2.6] — 2026-10-18
 
 Light grippers now hold a part by friction, a URDF robot's own root collider is in the solver by

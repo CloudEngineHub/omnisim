@@ -27,6 +27,44 @@ python tests/benchmarks/robot_ops/devloop/devloop.py run --key-file O:/omnilink-
 python tests/benchmarks/robot_ops/devloop/devloop.py report tests/benchmarks/robot_ops/evidence/devloop/<loop>
 ```
 
+### The fast path (2026-10-20)
+
+```bash
+# Model presets: gemini (default), claude (Opus 5.5), claude-fast (Sonnet 5.5, the inner loop)
+python tests/benchmarks/robot_ops/devloop/devloop.py run --preset claude-fast --key-file O:/omnilink-keys/omni_key.txt
+
+# Simulator-time clock: fast mode while OmniLink is idle, real time while it is busy (OmniLink only)
+python tests/benchmarks/robot_ops/devloop/devloop.py run --preset claude --sim-clock --key-file O:/omnilink-keys/omni_key.txt
+
+# One short probe per check OmniLink failed in a loop, all run at once (minutes, not a 30-minute shift)
+python tests/benchmarks/robot_ops/devloop/devloop.py failure-probes tests/benchmarks/robot_ops/evidence/devloop/<loop> --run --preset claude --sim-clock --key-file O:/omnilink-keys/omni_key.txt
+
+# Re-run a loop answering the model from that loop's recorded replies (no model cost; for non-prompt changes)
+python tests/benchmarks/robot_ops/devloop/devloop.py run --preset claude --replay-from tests/benchmarks/robot_ops/evidence/devloop/<loop> --key-file O:/omnilink-keys/omni_key.txt
+```
+
+- **`--sim-clock`** sets `OMNILINK_CLOCK=sim` (see `omnisim_bridges/runtime_clock.py`): the
+  runtime schedules on simulator time, the engine runs in FAST mode capped at
+  `--sim-clock-speed` (default 6x), and drops to real time whenever OmniLink is handling a
+  message or waiting on the model. Competitor arms are refused: their model calls run in the
+  benchmark process, where the runtime cannot slow the world for them.
+- **`failure-probes`** keeps each failed check, the steps it watches, the shift's opening and a
+  short lead-in, and squeezes chat-only gaps. The robot starts at home and everything else is
+  dropped, so a probe is a fast reproducer: confirm every fix on the full shift.
+- **`--replay-from`**: every OmniLink episode records its model replies
+  (`model_replies.jsonl`). Replay matches on the conversation with numbers rounded and the
+  per-turn liveContext left out, so a reply can come from a slightly different world.
+- **`confirm`** now runs the shifts of a wave side by side (`--max-engines`, default 9); the
+  judge has its own `--judge-engine` (default g1-engine) so a Claude run is judged by Gemini.
+
+Measured 2026-10-20 (Claude Opus 5.5, each job alone on the laptop): holdout_v2 on the sim clock
+19.3 min vs 32.5 min in real time (score 0.821 vs 0.769 in the paired real-time run; one repeat
+each). The shift is busy most of the time, and busy time runs at real time, so ~1.7x is the
+ceiling for a full shift. Eight failure probes of holdout_v1, four at a time: 6.6 min (they had
+run one after another, 19.3 min). A fix-and-check cycle on probes is therefore ~7 minutes.
+
+None of this changes Tier 3: a published result runs in real time, live model, all arms.
+
 Every run lands in `evidence/devloop/`. The Tier 2 report gives, per shift,
 OmniLink's score and unsafe count, the best stored competitor, the gap, and
 the check ids OmniLink fails that that competitor passes: the next thing to

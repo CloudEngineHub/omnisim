@@ -1093,9 +1093,14 @@ RULES: List[Rule] = [
        lambda m: {}, [ARM, QUADRUPED], "wave"),
 
     # ---- quadruped ---------------------------------------------------
-    _R("sit", r"\b(?:sit|sit down|lie down|crouch)\b", lambda m: {},
-       [QUADRUPED], "sit"),
-    _R("stand", r"\b(?:stand|stand up|get up|rise)\b", lambda m: {},
+    # ⚠️ LONGEST ALTERNATIVE FIRST. A regex alternation takes the first
+    # branch that matches, and `\b` is satisfied after "sit" in "sit down",
+    # so `sit|sit down` read "Sit" and left "down": 38% of the clause, under
+    # the gate. "Sit down." went to the model and "Sit down, then stand up."
+    # ran the stand alone (XGO Mini2S clip lane, v9.2.6, 2026-10-20).
+    _R("sit", r"\b(?:sit\s+down|sit|lie\s+down|crouch(?:\s+down)?)\b",
+       lambda m: {}, [QUADRUPED], "sit"),
+    _R("stand", r"\b(?:stand\s+up|stand|get\s+up|rise)\b", lambda m: {},
        [QUADRUPED], "stand"),
     _R("walk",
        r"\b(?:walk|trot|pace)\s*(?:forward|forwards|ahead)?\s*"
@@ -1919,6 +1924,14 @@ def _salvage(text: str, surface: str) -> Optional[Interpretation]:
     def address_stripped(sentence: str) -> Optional[Interpretation]:
         m = _ADDRESS.match(sentence)
         if not m or _NOT_AN_ADDRESS.match(m.group("who")):
+            return None
+        # ⚠️ An address is a NAME. Words a rule reads as an order, on any
+        # surface, are a clause, and stripping them drops it without a
+        # word: "Sit down, then stand up." was read as an address "Sit
+        # down" plus "then stand up", and ran the stand ALONE at 0.95
+        # (XGO Mini2S clip lane, v9.2.6, 2026-10-20). The plain parse
+        # already reported that clause as residue; this must not undo it.
+        if _best_match(m.group("who"), ANY) is not None:
             return None
         r = _interpret(m.group("rest"), surface)
         return r if r.executable and r.confidence >= _SURE else None

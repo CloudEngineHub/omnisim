@@ -129,6 +129,19 @@ WALK_VELOCITY_RAMP_S = 2.0     # accelerate from 0 to the config's walk_velocity
 COM_SHIFT_AMP_Y = 0.08
 SETTLE_HOLD_S = 1.5            # OmniQuad only: hold the `extend` pose before the ramp
 
+# A sit / stand is DONE when it is measured, not when its setpoint is switched.
+# Until 2026-10-20 `is_busy()` called the robot idle the moment the target
+# changed, so "Lie down, then stand up." ran both legs in the same tick and
+# replied "Sit. Stand." while the XGO Mini2S body never went below 0.1332 m
+# (it reaches 0.088 m when it really lies down). Settled = every leg joint
+# within POSE_TOL_RAD of its setpoint AND the body height steady to
+# POSE_Z_STEADY_M, both held for POSE_HOLD_S of sim time; POSE_SETTLE_MAX_S
+# of sim time without that is a timeout, reported as one.
+POSE_TOL_RAD = math.radians(3.0)
+POSE_Z_STEADY_M = 0.002
+POSE_HOLD_S = 0.2
+POSE_SETTLE_MAX_S = 5.0
+
 LEG_PHASES = {
     "front_right": 0.00,
     "rear_left":   0.25,
@@ -199,6 +212,13 @@ class QuadrupedBridge:
         # pose when it has one (OmniQuad), else the measured spawn pose.
         self.settle_from: Dict[Tuple[str, str], float] = {}
         self.last_tick_at = time.time()
+        # The measured sit / stand (POSE_* above): the setpoint each joint was
+        # last given, the pose being tracked, and the last verdict.
+        self._applied: Dict[Tuple[str, str], float] = {}
+        self.pose_seq = 0
+        self.pose_goal: Optional[Dict[str, Any]] = None
+        self.pose_result: Optional[Dict[str, Any]] = None
+        self._sim_thread: Optional[int] = None
 
         # Supervisor handles for walk-phase body translation + orientation lock.
         self.self_node = None
@@ -499,9 +519,157 @@ class QuadrupedBridge:
     def is_busy(self) -> bool:
         with self.lock:
             kind = self.motion[0]
+            # A sit / stand is busy until it is MEASURED settled (POSE_*):
+            # switching the setpoint is not arriving.
+            if self.pose_goal is not None:
+                return True
             if kind == "driver" and self.driver is not None:
                 return self.driver.busy() or self.driver.moving()
             return kind not in ("stop", "stand", "sit", "driver")
+
+    # ── Measured sit / stand ─────────────────────────────────────
+
+    def _begin_pose(self, pose: str) -> int:
+        """Start tracking `pose` ("sit" / "stand"); -> its seq. Any thread.
+        A pose still being tracked is reported superseded by this one."""
+        terminal = ("sit",) if pose == "sit" else ("stand", "driver")
+        with self.lock:
+            prev = self.pose_goal
+            if prev is not None:
+                self.pose_result = self._pose_verdict(prev, superseded=True)
+            self.pose_seq += 1
+            self.pose_goal = {"seq": self.pose_seq, "pose": pose,
+                              "terminal": terminal, "t0": self.sim_time,
+                              "z_start": None, "z_ref": None,
+                              "within_since": None, "err": None, "z": None}
+            return self.pose_seq
+
+    def _pose_error(self) -> Optional[float]:
+        """SIM THREAD. Largest |measured - setpoint| over the leg joints, or
+        None when no joint can be read."""
+        worst = None
+        for key, target in self._applied.items():
+            s = self.sensors.get(key)
+            if s is None:
+                continue
+            try:
+                v = float(s.getValue())
+            except Exception:
+                continue
+            if not math.isfinite(v):
+                continue
+            e = abs(v - target)
+            worst = e if worst is None else max(worst, e)
+        return worst
+
+    def _body_z(self) -> Optional[float]:
+        """SIM THREAD. The floating base's height, or None."""
+        if self.self_node is None:
+            return None
+        try:
+            return float(self.self_node.getPosition()[2])
+        except Exception:
+            return None
+
+    def _pose_verdict(self, g: Dict[str, Any], settled: bool = False,
+                      timed_out: bool = False, superseded: bool = False) -> dict:
+        """The measured result of pose goal `g`: {commanded, achieved, error,
+        settled} (docs/developer/tool-design-for-agents.md). Caller holds lock."""
+        err = g.get("err")
+        z0, z1 = g.get("z_start"), g.get("z")
+        out = {"accepted": True, "pose": g["pose"], "seq": g["seq"],
+               "commanded": {"pose": g["pose"]},
+               "achieved": {
+                   "joint_error_max_deg": None if err is None else round(math.degrees(err), 2),
+                   "body_z_start_m": None if z0 is None else round(z0, 4),
+                   "body_z_m": None if z1 is None else round(z1, 4),
+                   "body_dz_m": None if z0 is None or z1 is None else round(z1 - z0, 4)},
+               "error": err, "settled": bool(settled), "timed_out": bool(timed_out),
+               "settle_s": round(max(0.0, self.sim_time - g["t0"]), 3),
+               "sim_time_start": round(g["t0"], 6),
+               "sim_time_end": round(self.sim_time, 6)}
+        if superseded:
+            out["superseded"] = True
+            out["note"] = ("a later command took over before this pose settled; "
+                           "read get_robot_state for the live pose")
+        return out
+
+    def _track_pose(self, sim_t: float) -> None:
+        """SIM THREAD, after this tick's setpoints were applied."""
+        with self.lock:
+            g = self.pose_goal
+            kind = self.motion[0]
+        if g is None:
+            return
+        z = self._body_z()
+        err = self._pose_error()
+        with self.lock:
+            if self.pose_goal is not g:
+                return
+            if g["z_start"] is None:
+                g["z_start"] = z
+            g["z"], g["err"] = z, err
+            if kind not in g["terminal"] and kind != "pose_blend":
+                # stop / wave / walk took over: not this pose any more.
+                self.pose_result = self._pose_verdict(g, superseded=True)
+                self.pose_goal = None
+                return
+            arrived = kind in g["terminal"] and err is not None and err <= POSE_TOL_RAD
+            if arrived and z is not None and g["z_ref"] is not None \
+                    and abs(z - g["z_ref"]) > POSE_Z_STEADY_M:
+                arrived = False          # joints there, body still moving
+            if not arrived:
+                g["within_since"], g["z_ref"] = None, None
+            elif g["within_since"] is None:
+                g["within_since"], g["z_ref"] = sim_t, z
+            if g["within_since"] is not None and sim_t - g["within_since"] >= POSE_HOLD_S:
+                self.pose_result = self._pose_verdict(g, settled=True)
+                self.pose_goal = None
+            elif sim_t - g["t0"] > POSE_SETTLE_MAX_S:
+                self.pose_result = self._pose_verdict(g, timed_out=True)
+                self.pose_goal = None
+
+    def _await_pose(self, seq: int) -> dict:
+        """Block (NOT on the sim thread) until pose `seq` is measured."""
+        clock = getattr(self, "clock", None)
+        budget = clock.budget(POSE_SETTLE_MAX_S + 1.0) if clock is not None else None
+        deadline = time.time() + (POSE_SETTLE_MAX_S + 1.0) * 4.0
+        while True:
+            with self.lock:
+                res = self.pose_result
+                if res is not None and res.get("seq") == seq:
+                    return dict(res)
+                if self.pose_seq > seq:
+                    return {"accepted": True, "seq": seq, "settled": False,
+                            "superseded": True, "achieved": None, "error": None,
+                            "note": "a later command took over before this pose settled"}
+                g = self.pose_goal
+            if budget is not None and budget.stalled(self.last_tick_at):
+                return {"accepted": True, "seq": seq, "pose": g and g["pose"],
+                        "settled": False, "stalled": True, "achieved": None,
+                        "error": None, **budget.result(),
+                        "note": "the simulation stopped stepping; nothing could be measured"}
+            if (budget is not None and budget.expired()) or \
+                    (budget is None and time.time() > deadline):
+                with self.lock:
+                    if self.pose_goal is not None and self.pose_goal["seq"] == seq:
+                        out = self._pose_verdict(self.pose_goal, timed_out=True)
+                        return out
+                return {"accepted": True, "seq": seq, "settled": False,
+                        "timed_out": True, "achieved": None, "error": None}
+            time.sleep(0.02)
+
+    def _pose_reply(self, pose: str, wait: bool) -> dict:
+        seq = self._begin_pose(pose)
+        if wait and threading.get_ident() != self._sim_thread:
+            out = self._await_pose(seq)
+            out["pose"] = out.get("pose") or pose
+            return out
+        # Not waited (the sim thread cannot wait on itself): say so, never
+        # "done". The verdict lands in get_robot_state's `last_pose`.
+        return {"accepted": True, "pose": pose, "seq": seq, "settled": None,
+                "commanded": {"pose": pose}, "achieved": None, "error": None,
+                "note": "not waited for; read get_robot_state.last_pose"}
 
     # Longest a motion verb will wait, in sim seconds, whatever it asked.
     WAIT_MAX_S = 600.0
@@ -715,6 +883,7 @@ class QuadrupedBridge:
             m = self.motors[(leg, joint)]
             if m is not None:
                 m.setPosition(value)
+                self._applied[(leg, joint)] = value
 
     def _set_all(self, base: str = "stand", hip_y_delta: float = 0.0, knee_delta: float = 0.0,
                  hip_x_extra: float = 0.0) -> None:
@@ -791,6 +960,7 @@ class QuadrupedBridge:
         # mobile bridge records what threaded supervisor reads cost). It also
         # clears the staleness detector and files a rising-edge fault.
         telemetry_tick(self, sim_t)
+        self._sim_thread = threading.get_ident()
         with self.lock:
             kind, p = self.motion
             self.last_tick_at = time.time()
@@ -861,6 +1031,7 @@ class QuadrupedBridge:
         elif kind == "stop":
             # Do nothing -- last setpoints stay applied.
             pass
+        self._track_pose(sim_t)
 
         # Pin the floating base upright for every non-walk pose (walk runs its
         # own translation+rotation lock in _tick_walk). This is what keeps OmniQuad
@@ -1008,7 +1179,10 @@ class QuadrupedBridge:
         self._set_wheels(0.0)
         return {"halted_at": time.time()}
 
-    def act_stand(self) -> dict:
+    def act_stand(self, wait: bool = True) -> dict:
+        """Stand, and report the MEASURED pose ({commanded, achieved, error,
+        settled}) once it settles or times out. `wait=False` returns at once
+        with `settled: None` -- never a claim that it stood."""
         if self.driver is not None:
             self._halt_driver()
             with self.lock:
@@ -1016,7 +1190,7 @@ class QuadrupedBridge:
             if kind != "driver":
                 self._blend_to({leg: self._stand_target(leg) for leg in LEGS},
                                then="driver", dur=1.2)
-            return {"accepted": True, "pose": "stand"}
+            return self._pose_reply("stand", wait)
         with self.lock:
             # ⚠️ THE CACHED CLOCK, NOT `robot.getTime()`. This runs on an
             # HTTP worker, and the controller API is not thread-safe -- a
@@ -1024,18 +1198,19 @@ class QuadrupedBridge:
             # warehouse demo to ~0.2x realtime (MainThreadCalls).
             self.motion = ("stand", {"t0": self.sim_time})
         self._set_wheels(0.0)
-        return {"accepted": True, "pose": "stand"}
+        return self._pose_reply("stand", wait)
 
-    def act_sit(self) -> dict:
+    def act_sit(self, wait: bool = True) -> dict:
+        """Sit / lie down; measured like act_stand."""
         if self.driver is not None:
             self._halt_driver()
             self._blend_to({leg: self._pose(leg, "sit") for leg in LEGS},
                            then="sit", dur=1.5)
-            return {"accepted": True, "pose": "sit"}
+            return self._pose_reply("sit", wait)
         with self.lock:
             self.motion = ("sit", {})
         self._set_wheels(0.0)
-        return {"accepted": True, "pose": "sit"}
+        return self._pose_reply("sit", wait)
 
     def act_wave(self, duration_s: float = 6.0) -> dict:
         if self.driver is not None:
@@ -1104,6 +1279,10 @@ class QuadrupedBridge:
             "y": None if pos is None else pos[1],
             "z": None if pos is None else pos[2],
             "yaw": yaw,
+            # The last MEASURED sit / stand verdict, and whether one is still
+            # being tracked (`pose_settling`).
+            "last_pose": self.pose_result,
+            "pose_settling": self.pose_goal is not None,
             **self._locomotion_state(),
         }
 
@@ -1405,8 +1584,12 @@ def make_handler(bridge: QuadrupedBridge, relay: Any = None):
                     # result is a confident, exactly-parsed order the gate
                     # (inside route.execute) has already vetted on the
                     # "quadruped" rail; no model is called for it.
+                    # A CREWMATE's message (omnisim_bridges.crew) always reaches the model:
+                    # the parser would answer the sender, who never hears that answer,
+                    # and only the model can message back. The gate still vets it.
                     _early = (_shared_short_circuit(bridge, text, "quadruped")
-                              if _shared_short_circuit is not None else None)
+                              if _shared_short_circuit is not None
+                              and not body.get("crew") else None)
                     if _early is not None:
                         return self._json(200, _shared_stamp_via(shared_with_halt(
                             getattr(self, "_halted_first", None),
@@ -1567,6 +1750,12 @@ def setup_omnilink_relay(bridge: QuadrupedBridge, http_port: int = 8765) -> Opti
     try:
         agent_name = f"OmniSim-{bridge.robot_id}"
         tools = build_quadruped_tools(bridge)
+        # A crew channel when the world declares one (OMNILINK_CREW).
+        try:
+            from omnisim_bridges.crew import crew_tools
+            tools = list(tools) + crew_tools(bridge, http_port)
+        except Exception as e:
+            print(f"[crew] not registered: {e}", flush=True)
         if bridge.driver is not None:
             site = "; ".join(
                 f"{n}: {p['description'] or 'a place'}" for n, p in sorted(bridge.places.items()))

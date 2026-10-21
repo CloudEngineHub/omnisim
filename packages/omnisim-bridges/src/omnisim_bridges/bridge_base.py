@@ -54,6 +54,8 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, List, Optional
+
+from omnisim_bridges import runtime_clock
 from urllib.parse import parse_qs, urlparse
 
 from .events import EventRing, emit_gate_refusal
@@ -391,6 +393,11 @@ def telemetry_tick(bridge: Any, sim_time: Optional[float] = None) -> None:
     clock.tick(sim_time)
     _plain_set(bridge, "sim_time", clock.sim_time)
     _plain_set(bridge, "sim_step", clock.step)
+    # The runtime's shared clock: wall time normally; under the benchmark's
+    # OMNILINK_CLOCK=sim, simulator time, paced here (real time while the
+    # agent is busy, faster while nothing happens). See runtime_clock.
+    runtime_clock.publish(clock.sim_time)
+    runtime_clock.pace(clock.sim_time)
     detector = getattr(bridge, "fault_detector", None)
     if detector is not None:
         detector.clear_stale()

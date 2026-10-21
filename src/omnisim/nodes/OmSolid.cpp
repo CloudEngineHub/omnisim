@@ -3681,6 +3681,10 @@ void OmSolid::flushPendingNewtonRegistrations() {
   // Physics-bearing Solids under physics-less ancestors, welded to the world
   // this flush (weldedToStaticEnvironment).
   QStringList weldedToWorldNames;
+  // The topmost Solid above each welded one (a staticBase URDFRobot's Robot
+  // node), named in the census so the line cannot be read as a FLOATING robot
+  // being partly welded -- which is how it was misread on 2026-10-20.
+  QStringList weldedToWorldOwners;
   // Dynamic merge leaders that received their fixed children's colliders, how
   // many boundingObjects went onto them, and how many leaders took the
   // composite (leader + fixed children) inertia (2026-10-03).
@@ -4242,6 +4246,7 @@ void OmSolid::flushPendingNewtonRegistrations() {
     double ixx = 0, iyy = 0, izz = 0, ixy = 0, ixz = 0, iyz = 0;
     double cx = 0, cy = 0, cz = 0;
     bool hasCom = false;
+    bool urdfFallbackKeptCom = false;  // the URDF_INERTIA_FALLBACK branch below
     if (const OmPhysics *const phys = s->physics()) {
       const OmMFVector3 &im = phys->inertiaMatrix();
       if (im.size() >= 1) {
@@ -4435,6 +4440,33 @@ void OmSolid::flushPendingNewtonRegistrations() {
           const double k = mass / srcMass;
           ixx = srcIxx * k; iyy = srcIyy * k; izz = srcIzz * k;
           ixy = srcIxy * k; ixz = srcIxz * k; iyz = srcIyz * k;
+          // URDF INERTIA FALLBACK KEEPS ITS COM (2026-10-20). The importer marks a
+          // link whose declared tensor it rejected (not positive definite, triangle
+          // inequality, or a moment below its floor) DEF URDF_INERTIA_FALLBACK and
+          // always writes the declared centerOfMass; createOdeMass() has already
+          // translated the bounding object
+          // so mNativeInertia's c IS that COM, with the tensor about the Solid ORIGIN.
+          // Without this block the tensor about the origin was passed as if about a
+          // COM AT the origin and the declared offset was lost (AgiBot G2 body_link4
+          // stepped at (0, 0, 0) instead of (-0.071, 0, 0.030)). Shift the tensor to
+          // the COM (I_com = k*I_origin - m*(|c|^2 E - c c^T), the composite path's
+          // own formula) and pass the COM: the declared mass and COM are kept, only
+          // the rotational inertia comes from the bounding object. The importer's
+          // OMNISIM_URDF_INERTIA_FALLBACK_KEEP_COM=0 stops writing the marker.
+          if (useNative && s->physics() != nullptr && s->physics()->centerOfMass().size() == 1 &&
+              s->physics()->defName() == QLatin1String("URDF_INERTIA_FALLBACK")) {
+            const double ccx = s->mNativeInertia.cx(), ccy = s->mNativeInertia.cy(), ccz = s->mNativeInertia.cz();
+            const double c2 = ccx * ccx + ccy * ccy + ccz * ccz;
+            ixx -= mass * (c2 - ccx * ccx);
+            iyy -= mass * (c2 - ccy * ccy);
+            izz -= mass * (c2 - ccz * ccz);
+            ixy += mass * ccx * ccy;
+            ixz += mass * ccx * ccz;
+            iyz += mass * ccy * ccz;
+            cx = ccx; cy = ccy; cz = ccz;
+            hasCom = true;
+            urdfFallbackKeptCom = true;
+          }
           // Even the geometry-correct diagonal can be eig3-degenerate: a square bin
           // has Ixx==Iyy, and Izz is the largest so the diagonal is not descending --
           // newton's eig3 then resolves the tie / permutation to a rotated body_iquat
@@ -4455,7 +4487,8 @@ void OmSolid::flushPendingNewtonRegistrations() {
           // this branch at all when the wrapper exclusion above was lifted, so
           // this guard closes a hole that opened with that fix rather than
           // changing anything that shipped.
-          if (compoundOn && nPrims >= 2 && !isRobotBody &&
+          // Never on a URDF fallback link either: its axes are the link's own.
+          if (compoundOn && nPrims >= 2 && !isRobotBody && !urdfFallbackKeptCom &&
               ixy > -1e-9 && ixy < 1e-9 && ixz > -1e-9 && ixz < 1e-9 &&
               iyz > -1e-9 && iyz < 1e-9) {
             double hi = ixx, mid = iyy, lo = izz;
@@ -4493,9 +4526,17 @@ void OmSolid::flushPendingNewtonRegistrations() {
     if (idx >= 0 && weldedToStaticEnvironment(s)) {
       // physics.md: attached to the static environment with a fixed joint, at
       // its spawn pose, keeping its real mass for the joints hanging off it.
-      if (newton->weldBodyToWorld(idx) == 0)
+      if (newton->weldBodyToWorld(idx) == 0) {
         weldedToWorldNames.append(s->name().isEmpty() ? QString("<unnamed>") : s->name());
-      else
+        const OmSolid *top = s;
+        while (top->upperSolid() != nullptr)
+          top = top->upperSolid();
+        const QString owner = QString("%1 '%2'")
+                                .arg(dynamic_cast<const OmRobot *>(top) != nullptr ? "Robot" : "Solid")
+                                .arg(top->name().isEmpty() ? QString("<unnamed>") : top->name());
+        if (!weldedToWorldOwners.contains(owner))
+          weldedToWorldOwners.append(owner);
+      } else
         OmLog::warning(tr("Solid '%1' has Physics but no Solid above it does, so it should be attached to the "
                           "static environment (docs/reference/physics.md); the physics runtime could not weld it "
                           "and it stays FREE. Re-stage the Newton runtime bundle.")
@@ -4899,10 +4940,14 @@ void OmSolid::flushPendingNewtonRegistrations() {
                       .arg(nWorldStatic));
     if (!weldedToWorldNames.isEmpty())
       OmLog::info(QString("[OmNewtonBackend] %1 Solid(s) with Physics under physics-less ancestors attached to the "
-                          "static environment (physics.md): %2; OMNISIM_NEWTON_PHYSICSLESS_ANCESTOR_WELD=0 reverts")
+                          "static environment (physics.md): %2; they hang under the physics-less %3, a static base "
+                          "(e.g. URDFRobot staticBase TRUE), not a free one; "
+                          "OMNISIM_NEWTON_PHYSICSLESS_ANCESTOR_WELD=0 reverts")
                       .arg(weldedToWorldNames.size())
                       .arg(weldedToWorldNames.mid(0, 8).join(", ") +
-                           (weldedToWorldNames.size() > 8 ? QString(", ...") : QString())));
+                           (weldedToWorldNames.size() > 8 ? QString(", ...") : QString()))
+                      .arg(weldedToWorldOwners.mid(0, 4).join(", ") +
+                           (weldedToWorldOwners.size() > 4 ? QString(", ...") : QString())));
     if (staticBaseRootsWithColliders > 0)
       OmLog::info(QString("[OmNewtonBackend] staticBase root colliders: %1 boundingObject(s) attached to %2 "
                           "fixed robot root(s); OMNISIM_NEWTON_STATIC_BASE_COLLIDERS=0 reverts")

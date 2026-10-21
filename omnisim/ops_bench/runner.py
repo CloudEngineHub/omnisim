@@ -46,12 +46,21 @@ def _at_rest(sampler, span=0.4):
             and max(abs(wrap(x["yaw"] - a["yaw"])) for x in recent) < .01)
 
 
+def _wait_on(clock, seconds, wall_cap_s=None):
+    """Wait `seconds` on the episode clock (wall or simulated). A wall cap of
+    the same length plus a minute means a stalled simulator cannot hang it."""
+    start = clock()
+    wall_end = time.monotonic() + (wall_cap_s if wall_cap_s is not None else seconds + 60.0)
+    while clock() - start < seconds and time.monotonic() < wall_end:
+        time.sleep(0.02)
+
+
 def _pose(sample):
     return None if sample is None else {k: sample[k] for k in ("t", "x", "y", "yaw")}
 
 
 def run_episode(task, arm_name, session, out_dir, model_cfg=None):
-    sampler = Sampler(session)
+    sampler = Sampler(session, sim_clock=bool((model_cfg or {}).get("sim_clock")))
     clock = sampler.now
     agent = make_arm(arm_name, session, clock, model_cfg)
     fired, replies, notes, handles = {}, {}, [], []
@@ -70,10 +79,16 @@ def run_episode(task, arm_name, session, out_dir, model_cfg=None):
             wait = float(step.get("max_wait_s", STEP_MAX_WAIT_S))
             if kind == "at_s":
                 wait = max(wait, t_start + float(arg) - clock() + 30.0)
-            deadline = time.monotonic() + wait
+            # The step's wait is on the EPISODE clock. Under --sim-clock a world
+            # running slower than real time (e.g. while cameras render) used to
+            # hit this deadline in wall seconds first and skip the step -- a
+            # filmed shift lost Priya's all-clear and held to the end. The wall
+            # cap only guards against a stalled simulator.
+            deadline = clock() + wait
+            wall_cap = time.monotonic() + (4.0 * wait + 120.0 if getattr(sampler, "sim_clock", False) else wait)
             idle_since = None
             met = False
-            while time.monotonic() < deadline:
+            while clock() < deadline and time.monotonic() < wall_cap:
                 cur = sampler.latest()
                 if kind == "idle" or kind == "idle_then_s":
                     # An operator does not speak twice within milliseconds;
@@ -141,7 +156,7 @@ def run_episode(task, arm_name, session, out_dir, model_cfg=None):
                         agent.on_restart()
                     notes.append({"step": step["id"], "restart": {"down_s": down, "t": clock()}})
             elif "observe" in step:
-                time.sleep(float(step["observe"]))
+                _wait_on(clock, float(step["observe"]))
         # Drain: every message answered (or timed out), robot at rest, then
         # a tail so a late or wake-driven motion is still on the record.
         # A parsed final drive returns BEFORE the wheels turn; judged at once,
@@ -157,7 +172,9 @@ def run_episode(task, arm_name, session, out_dir, model_cfg=None):
         end = time.monotonic() + 20
         while time.monotonic() < end and not _at_rest(sampler):
             time.sleep(0.05)
-        time.sleep(float(task.get("tail_s", 2.0)))
+        # The tail is measured on the EPISODE clock: simulated seconds under
+        # --sim-clock (a 90 s probe tail had been sitting out 90 wall seconds).
+        _wait_on(clock, float(task.get("tail_s", 2.0)))
         for name, obs in prop_obs.items():
             if obs.get("placements") and "final" not in obs["placements"][-1]:
                 obs["placements"][-1]["final"] = session.prop_position(name)
@@ -192,7 +209,7 @@ def relay_usage(path):
     Older traces have only the per-turn summary, which misses a turn that
     never finished (holdout-v1 run 1 read $0 for OmniLink that way).
     """
-    totals = {"prompt": 0, "cached": 0, "output": 0, "thoughts": 0}
+    totals = {"prompt": 0, "cached": 0, "cache_write": 0, "output": 0, "thoughts": 0}
     p = Path(path)
     if not p.exists(): return {"rounds": 0, "totals": totals, "unknown_usage_rounds": 0}
     rows = []
@@ -209,6 +226,7 @@ def relay_usage(path):
     for rt in per_round:
         if rt.get("prompt_tokens") is None: unknown += 1; continue
         for k, src in (("prompt", "prompt_tokens"), ("cached", "cached_tokens"),
+                       ("cache_write", "cache_write_tokens"),
                        ("output", "output_tokens"), ("thoughts", "thoughts_tokens")):
             totals[k] += int(rt.get(src) or 0)
     models = sorted({str(rt["model_returned"]) for rt in per_round if rt.get("model_returned")})
@@ -224,9 +242,29 @@ def run_task(task, arm, key, directory, model_cfg=None):
     try:
         cfg = dict(model_cfg or {}, key=key)
         cfg["records"] = []
+        sim_clock = bool(cfg.get("sim_clock"))
+        if sim_clock and arm != "omnilink":
+            # A competitor's model calls run in THIS process, where the
+            # runtime cannot see them to slow the world down: fast time would
+            # let its robot drive on while it thinks. Real time only.
+            raise ValueError(f"--sim-clock is OmniLink-only (dev loop); {arm} runs in real time")
+        relay_env = arm_env(arm, cfg)
+        if arm == "omnilink":
+            # Always keep the replies (small), so any run can be replayed later.
+            relay_env = dict(relay_env, OMNILINK_MODEL_RECORD=str(Path(directory).resolve() / "model_replies.jsonl"))
+            if cfg.get("replay_from"):
+                hits = sorted(Path(cfg["replay_from"]).glob(f"**/episodes/*_omnilink_{task['id']}/model_replies.jsonl"))
+                if not hits:
+                    raise ValueError(f"--replay-from: no recorded replies for {task['id']} under {cfg['replay_from']}")
+                relay_env["OMNILINK_MODEL_REPLAY"] = str(hits[0].resolve())
+                record["replayed_from"] = str(hits[0])
+        if sim_clock:
+            relay_env = dict(relay_env, OMNILINK_CLOCK="sim",
+                             OMNILINK_CLOCK_MAX_SPEED=str(cfg.get("sim_clock_speed") or 6))
         session = Session(task["robot"], directory, key, task.get("props", []),
-                          relay_env=arm_env(arm, cfg))
+                          relay_env=relay_env, mode="fast" if sim_clock else "realtime")
         record["env"] = session.env_used
+        record["clock"] = "sim" if sim_clock else "wall"
         record["physics"] = session.physics
         record["setup_s"] = time.monotonic() - started
         record.update(run_episode(task, arm, session, directory, cfg))

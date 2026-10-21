@@ -359,7 +359,10 @@ def test_restored_history_carries_the_session_boundary_note(env) -> None:
     try:
         out = relay.dispatch_sync("Hi, are you there?", timeout_s=10)
         assert out.get("response") == "ok"
-        task = client.chats[0]["system_instruction"]["mainTask"]
+        si = client.chats[0]["system_instruction"]
+        # Per-turn notes travel as liveContext so the cached mainTask never changes.
+        assert "SESSION BOUNDARY" not in si["mainTask"]
+        task = si["liveContext"]
         assert "SESSION BOUNDARY" in task
         assert "restored from a PREVIOUS session" in task
         assert "Do NOT carry out, repeat, resume or continue" in task
@@ -376,8 +379,9 @@ def test_a_fresh_session_has_no_boundary_note(env) -> None:
     relay, _ = make_relay(env, client, memory=True)
     try:
         relay.dispatch_sync("Hi", timeout_s=10)
-        assert "SESSION BOUNDARY" not in (
-            client.chats[0]["system_instruction"]["mainTask"])
+        si = client.chats[0]["system_instruction"]
+        assert "SESSION BOUNDARY" not in si["mainTask"]
+        assert "SESSION BOUNDARY" not in si.get("liveContext", "")
     finally:
         relay.close()
 

@@ -461,9 +461,146 @@ _AVAILABILITY = re.compile(
     re.IGNORECASE)
 
 
+# A deferral that only governs TELLING someone something is not a deferred
+# order. "Drive to the dock and tell me when you're there" was refused as
+# deferred: `when you` matched anywhere in the sentence, though the only
+# thing waiting on the event is the report. Found 2026-10-20 by the crew demo
+# (agents/omnilink_demos/crew_order), where a robot asking a crewmate "bring
+# the cart over, unhitch it, and tell me where it is when it's ready" was
+# refused three times -- a person saying it gets the same refusal.
+#
+# Conservative by construction: the deferral is set aside only when a
+# report-back phrase governs it, with no action word between the two, and the
+# deferred clause itself carries no action word. "When the cart is loaded,
+# drive to the dock and tell me" stays deferred, and so does "tell me the
+# score, and when the cart's loaded drive to the dock". An action word missing
+# from _SEQUENCE_WORDS can only keep a refusal, never lift one. The TypeScript
+# mirror (omnilink api/_robot-gate.ts) has not been updated.
+# The recipient may be a NAME ("message Packer once it's parked", "tell Dana
+# when you're there" -- crew demo take 10, 2026-10-20), matched by its capital
+# so "call the lift" stays a call; `send` takes a pronoun only, because "send
+# the cart once it's loaded" is an action, not a report.
+# Case is spelled out ([Tt]ell) rather than flagged, so the TypeScript port
+# (api/_robot-gate.ts, no scoped flags there) can carry the identical pattern.
+_REPORT_BACK = re.compile(
+    r"\b(?:[Tt]ell|[Mm]essage|[Pp]ing|[Nn]otify|[Tt]ext|[Rr]adio|[Uu]pdate|[Cc]all|[Ss]end)\s+(?:[Mm]e|[Uu]s)\b|"
+    r"\b(?:[Tt]ell|[Mm]essage|[Pp]ing|[Nn]otify|[Tt]ext|[Rr]adio|[Uu]pdate)\s+[A-Z][a-z]+\b|"
+    r"\b[Ll]et\s+(?:[Mm]e|[Uu]s|[A-Z][a-z]+)\s+know\b|\b[Rr]eport\s+back\b")
+_ACTION_WORD = re.compile(r"\b(?:" + _SEQUENCE_WORDS + r")\b", re.IGNORECASE)
+_SENTENCES = re.compile(r"(?<!\d)[.!?;]|[.!?;](?!\d)")
+
+
+def _only_reports_wait(sentence: str, at: int) -> bool:
+    """True when the deferral starting at `at` governs only a report back."""
+    rest = sentence[at:]
+    back = list(_REPORT_BACK.finditer(sentence[:at]))
+    ahead = _REPORT_BACK.search(rest)
+    clause = rest[:ahead.start()] if ahead else rest
+    if _ACTION_WORD.search(clause):
+        return False
+    if back and not _ACTION_WORD.search(sentence[back[-1].end():at]):
+        return not _ACTION_WORD.search(rest)
+    return bool(ahead) and not _ACTION_WORD.search(rest[ahead.end():])
+
+
+# "Bring me the cart. I'll load it after that." The second sentence is the
+# SPEAKER's own plan, not an order to the robot, and its `after that` refused
+# the bring (crew demo, 2026-10-20). A sentence whose subject is "I" with a
+# future verb, and which addresses no one ("you"), is skipped. "I'll need you
+# to drive once the shift ends" addresses the robot and is still checked, and
+# "we'll" is not skipped: we includes the robot.
+_SPEAKER_PLAN = re.compile(r"^\s*i(?:'ll|\s+will|'m\s+going\s+to|\s+am\s+going\s+to)\b", re.IGNORECASE)
+_ADDRESSED = re.compile(r"\byou(?:r|'ll|'re)?\b", re.IGNORECASE)
+
+
+_CLAUSE_END = re.compile(r"[,:]")
+
+
+def _sentence_parts(utterance: str) -> List[Tuple[str, bool]]:
+    """Each sentence as (its text OUTSIDE any waiting clause, whether it holds
+    a real deferral). A waiting clause runs from its marker to the next comma
+    or colon, or the sentence end. Report-backs and the speaker's own plans
+    are set aside first, as before."""
+    text = _NOT_A_TRIGGER.sub(" then ", _words(utterance))
+    out = []
+    for sentence in _SENTENCES.split(text):
+        if _SPEAKER_PLAN.match(sentence) and not _ADDRESSED.search(sentence):
+            out.append((sentence, False))
+            continue
+        spans = []
+        for m in _DEFERRED.finditer(sentence):
+            # A time offset ("in 5 minutes") defers whatever it sits in,
+            # report or not; only a conjunction can govern a report alone.
+            if m.group(0).lower().startswith("in ") or not _only_reports_wait(sentence, m.start()):
+                end = _CLAUSE_END.search(sentence, m.end())
+                spans.append((m.start(), end.start() if end else len(sentence)))
+        outside, last = [], 0
+        for a, b in spans:
+            outside.append(sentence[last:a])
+            last = max(last, b)
+        outside.append(sentence[last:])
+        out.append((" ".join(outside), bool(spans)))
+    return out
+
+
 def _is_deferred(utterance: str) -> bool:
-    text = _words(utterance)
-    return bool(_DEFERRED.search(_NOT_A_TRIGGER.sub(" then ", text)))
+    return any(deferred for _, deferred in _sentence_parts(utterance))
+
+
+# A WAIT DEFERS THE ACTION IN ITS OWN SENTENCE. "...green at (-1.75, 0.10),
+# measured after release. Please hitch it and take it to Packer at shipping."
+# was refused as deferred (crew demo campaign run 6, 2026-10-20): `after
+# release` describes when the parts were measured, and the hitch is ordered in
+# the next sentence with no wait at all. Each tool names the verbs that can
+# express it; a deferral counts against that tool only when it shares a
+# sentence with one of them (or with a generic "do it" / "go ahead"). When no
+# sentence names the action at all, the wait may be governing it implicitly,
+# so the old whole-utterance rule stands. A tool with no verb list is judged
+# by the old rule too. Mirrored in OmniLink api/_robot-gate.ts.
+_MOVE_VERBS = ("go|drive|head|move|travel|return|come|bring|take|tow|haul|deliver|carry|back|reverse|"
+               "advance|proceed|roll|run|park|turn|rotate|spin|pivot|swivel|face|walk|fly|climb|descend|land|hover")
+_TOOL_VERBS = {
+    **{t: _MOVE_VERBS for t in ("drive_forward", "drive_to", "go_to_place", "set_velocity", "turn",
+                                "resume_last_order", "reset_to_home", "return_home", "walk", "takeoff",
+                                "land", "move_body", "hover")},
+    **{t: "hitch|attach|couple|connect|dock|grab|take|tow|bring|collect|fetch|haul|pick"
+       for t in ("attach_trolley", "grab_pallet")},
+    **{t: "unhitch|detach|uncouple|drop|release|leave|park|set" for t in ("detach_trolley", "release_pallet")},
+    **{t: "pick|grab|take|lift|collect|get|load|fetch|grasp" for t in ("pick", "grasp", "close_gripper")},
+    **{t: "place|put|drop|set|load|unload|pack|stack|deposit|release|open"
+       for t in ("place", "release", "open_gripper")},
+    **{t: "move|reach|go|position|raise|lower|swing|point|rotate|turn|wave"
+       for t in ("set_tcp_target", "set_tcp_pose", "set_joint_positions", "wave")},
+}
+_GENERIC_VERBS = "do|start|begin|proceed|continue|execute|go ahead|carry on"
+# A sentence that STATES AN ORDER: it opens with an action verb (an
+# imperative, optionally after "now"/"then"/"so"/"ok"), or it says please. A
+# description that merely contains a verb ("the cart is loaded") does not.
+_ANY_ACTION = re.compile(r"^\s*(?:(?:now|then|so|and|ok|okay)[\s,]+)?(?:%s)\b|\bplease\b" % "|".join(
+    sorted({v for vs in _TOOL_VERBS.values() for v in vs.split("|")} | set(_GENERIC_VERBS.split("|")))),
+    re.IGNORECASE)
+
+
+def _deferred_for(utterance: str, tool: str) -> bool:
+    """The verb must stand OUTSIDE the waiting clause: in "I'll load them once
+    you confirm it's unhitched" the unhitch is the CONDITION, not an order
+    (campaign run 15 refused an unhitch on it)."""
+    parts = _sentence_parts(utterance)
+    if not any(deferred for _, deferred in parts):
+        return False
+    verbs = _TOOL_VERBS.get(tool)
+    if verbs is None:
+        return True
+    names = re.compile(r"\b(?:%s|%s)(?:s|es|ed|d|ing)?\b" % (verbs, _GENERIC_VERBS), re.IGNORECASE)
+    if any(deferred and names.search(outside) for outside, deferred in parts):
+        return True
+    if any(names.search(outside) for outside, _ in parts):
+        return False
+    # This tool is never named. The wait may govern it implicitly -- unless the
+    # order is plainly stated in a sentence with NO wait: "...After release I
+    # measured them. Please hitch it and take it to Packer." refused an
+    # unhitch the model chose (showcase take 12, 2026-10-21) on `After release`.
+    return not any(not deferred and _ANY_ACTION.search(outside) for outside, deferred in parts)
 
 
 def _is_contradictory(utterance: str) -> bool:
@@ -949,7 +1086,7 @@ def check(utterance: str, frames: Sequence[Any],
             out.append(Rejection(tool, "reported_speech",
                                  "the utterance reports an order rather "
                                  "than giving one"))
-        if physical and deferred and not de_escalating:
+        if physical and deferred and not de_escalating and _deferred_for(u, tool):
             out.append(Rejection(tool, "deferred",
                                  "the order waits on an event that has not "
                                  "happened"))

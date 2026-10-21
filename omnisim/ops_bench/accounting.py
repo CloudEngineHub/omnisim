@@ -24,22 +24,42 @@ from __future__ import annotations
 from typing import Any, Dict, Optional, Tuple
 
 
+# Anthropic bills a 5-minute prompt-cache write at 1.25x the input rate.
+# Gemini and OpenAI caches have no write charge, so their writes are always 0.
+CACHE_WRITE_MULTIPLIER = 1.25
+
+
+def _usd(prompt: int, cached: int, cache_write: int, output: int, rates: Dict[str, float]) -> float:
+    cached = min(cached, prompt)
+    cache_write = min(cache_write, prompt - cached)
+    fresh = prompt - cached - cache_write
+    return (fresh * rates["input"] + cached * rates["cached"]
+            + cache_write * rates["input"] * CACHE_WRITE_MULTIPLIER + output * rates["output"]) / 1e6
+
+
 def request_cost(usage: Any, rates: Dict[str, float]) -> Optional[float]:
-    """Gemini `usageMetadata` or OpenAI-style `usage` -> USD, or None."""
+    """Gemini `usageMetadata`, Anthropic `usage` or OpenAI-style `usage` -> USD, or None."""
     if not isinstance(usage, dict):
         return None
     if "promptTokenCount" in usage:
         p = int(usage.get("promptTokenCount") or 0)
         c = int(usage.get("cachedContentTokenCount") or 0)
+        w = 0
         o = int(usage.get("candidatesTokenCount") or 0) + int(usage.get("thoughtsTokenCount") or 0)
+    elif "input_tokens" in usage:
+        # Anthropic: input_tokens excludes cache reads and writes; output includes thinking.
+        c = int(usage.get("cache_read_input_tokens") or 0)
+        w = int(usage.get("cache_creation_input_tokens") or 0)
+        p = int(usage.get("input_tokens") or 0) + c + w
+        o = int(usage.get("output_tokens") or 0)
     elif "prompt_tokens" in usage:
         p = int(usage.get("prompt_tokens") or 0)
         c = int(((usage.get("prompt_tokens_details") or {}).get("cached_tokens")) or 0)
+        w = 0
         o = int(usage.get("completion_tokens") or 0)
     else:
         return None
-    c = min(c, p)
-    return ((p - c) * rates["input"] + c * rates["cached"] + o * rates["output"]) / 1e6
+    return _usd(p, c, w, o, rates)
 
 
 def episode_cost(rec: Dict[str, Any], rates: Dict[str, float],
@@ -51,9 +71,8 @@ def episode_cost(rec: Dict[str, Any], rates: Dict[str, float],
     if rounds:
         t = ru.get("totals") or {}
         known = rounds - int(ru.get("unknown_usage_rounds") or 0)
-        cost = ((t.get("prompt", 0) - min(t.get("cached", 0), t.get("prompt", 0))) * rates["input"]
-                + min(t.get("cached", 0), t.get("prompt", 0)) * rates["cached"]
-                + (t.get("output", 0) + t.get("thoughts", 0)) * rates["output"]) / 1e6
+        cost = _usd(t.get("prompt", 0), t.get("cached", 0), t.get("cache_write", 0),
+                    t.get("output", 0) + t.get("thoughts", 0), rates)
         usd += cost
         if known:
             worst = max(worst, cost / known)

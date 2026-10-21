@@ -1199,6 +1199,12 @@ def setup_omnilink_relay(state):
                   parameters={"type": "object", "properties": arguments.get(name, {}),
                               **({"required": ["angle_rad"]} if name == "turn" else {})},
                   dispatch=dispatch) for name, (dispatch, _) in registry.items()]
+    # A crew channel when the world declares one (OMNILINK_CREW).
+    try:
+        from omnisim_bridges.crew import crew_tools
+        tools += crew_tools(state, BRIDGE_PORT)
+    except Exception as e:
+        print(f"[crew] not registered: {e}", flush=True)
     try:
         agent_name = profile_sync.agent_name_for("mavic")
         task = ("Operate the simulated drone in OmniSim using the supplied tools. "
@@ -1609,9 +1615,13 @@ def make_handler(state: BridgeState):
                 # carries MAX_ALTITUDE_M, which is why `move_body
                 # {vertical}` must be judged as a CLIMB here and as a body
                 # shift on a quadruped.
+                # A CREWMATE's message (omnisim_bridges.crew) always reaches the model:
+                # the parser would answer the sender, who never hears that answer,
+                # and only the model can message back. The gate still vets it.
                 _early = (_shared_short_circuit(_StateBridge(state), text,
                                                 "drone")
-                          if _shared_short_circuit is not None else None)
+                          if _shared_short_circuit is not None
+                          and not body.get("crew") else None)
                 if _early is not None:
                     return self._json(200, _shared_stamp_via(_reply_payload(
                         _early.get("agent", ""),

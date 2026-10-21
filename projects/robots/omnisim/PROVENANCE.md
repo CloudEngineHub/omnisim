@@ -29,10 +29,16 @@ repository, so provenance has to live in a file next to the geometry.
 packages, and none of their geometry is imported from, traced from, or derived
 from any manufacturer's product model.**
 
-Two forms, both generated here and both text:
+Three forms, all generated here and all text:
 
 * **Primitive solids** — `<box>`, `<cylinder>`, `<sphere>` declared inline in the
-  URDF (OmniArm 7, OmniTug 500, OmniQuad, the 140 mm gripper).
+  URDF (OmniArm 7, OmniQuad, the 140 mm gripper).
+* **Blender-scripted meshes** — the OmniTug 500's visuals (since 2026-10-20),
+  one `.obj` per material, built from primitives, bevels and extrusions by
+  [`omnitug500/meshes/build_meshes.py`](omnitug500/meshes/build_meshes.py) run in
+  stock Blender with `--factory-startup`. No file is imported into that scene.
+  Unlike the two generators below there is no byte-for-byte `--check`: rerun the
+  script and diff.
 * **Surfaces of revolution** — OmniArm 6's visual shells, emitted as `.obj` by
   [`scripts/dev/gen_omniarm_meshes.py`](../../../scripts/dev/gen_omniarm_meshes.py)
   from authored `(r, z)` profiles, with analytic per-vertex normals. Bare
@@ -55,7 +61,7 @@ python scripts/dev/gen_omnisim_robot_visuals.py --all   # the URDF visual blocks
 ```
 
 `--check` fails if the URDFs on disk have drifted from the authored spec.
-The OmniTug 500 URDF is authored directly (one link) and is not generated.
+The OmniTug 500 URDF is authored directly (one link, one mesh visual per material) and is not generated.
 
 ## Physical parameters
 

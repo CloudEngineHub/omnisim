@@ -34,7 +34,7 @@ import sys
 import threading
 import time
 from types import SimpleNamespace
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import pytest
 
@@ -511,21 +511,29 @@ def test_an_arm_stop_issued_during_a_hold_measures_its_rest() -> None:
     fake = SimpleNamespace(
         STOP_SETTLE_S=0.30, STOP_TAIL_FRAC=0.5, STOP_MIN_SPAN_S=0.04,
         WAIT_STALL_S=2.0, WAIT_POLL_S=0.02, lock=threading.RLock(),
-        _q_hist=[], joint_names=["j1"], last_tick_at=time.time() - 6.0)
+        _q_hist=[], joint_names=["j1"], last_tick_at=time.time() - 6.0,
+        sim_time=0.0, clock=SimClock(dt_s=0.032))
+    # The clock is what the shipped bridge has, and it makes the settling
+    # wait a STEP budget: with a wall-only wait a loaded machine delivered
+    # too few ticks inside 0.30 wall-s and the sim span fell under
+    # STOP_MIN_SPAN_S (seen once in seven runs, 2026-10-18).
     # Load BEFORE the world moves: parsing the controller takes long enough
     # that ticks started first would refresh `last_tick_at` and hide the bug.
     fn = _sb.load_method(_sb.ARM, "_stop_measure_rest",
                          {"time": time, "threading": threading,
-                          "Dict": Dict, "Any": Any, "List": List})
+                          "Dict": Dict, "Any": Any, "List": List,
+                          "Optional": Optional})
     t_halt = time.time()
 
     def _ticks():
         time.sleep(0.05)                     # the loop picks up the release
         for _ in range(20):
             time.sleep(0.02)
+            fake.clock.tick()
+            fake.sim_time = fake.clock.sim_time
             now = time.time()
-            with fake.lock:
-                fake._q_hist.append((now, [0.25]))
+            with fake.lock:                  # (wall_t, q, sim_t)
+                fake._q_hist.append((now, [0.25], fake.sim_time))
             fake.last_tick_at = now
     threading.Thread(target=_ticks, daemon=True).start()
     box: dict = {}

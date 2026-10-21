@@ -385,7 +385,7 @@ authoritative list of what is and is not vetted.
 - **A fixed-joint child part drifts off the robot.** A fixed-joint child link with collision geometry got a synthetic Physics block. This is fixed in the URDF importer (`emitLinkPhysics` with `allowSyntheticPhysics=false` for fixed-joint children) — make sure your `omnisim-bin` is built from a commit that includes that fix.
 - **`/list_robots` returns a different robot id than what's in your config.** The world's `controllerArgs ["--robot" "x"]` value must match the dict key in `_mobile_configs.py`.
 - **"Show Robot Window" missing from the context menu.** Left-click the robot first (which selects the root URDFRobot in the scene tree), *then* right-click. The 3D viewport's right-click selects the part under the cursor by default.
-- **Chat panel opens but is light-themed, not the OmniLink dark panel.** The plugin isn't in the project's plugins directory. Copy `projects/samples/demos/plugins/robot_windows/omnilink_chat/` if your demo lives elsewhere; the path is per-project for custom robot windows.
+- **"The 'omnilink_chat' robot window library has not been found." and no chat panel.** Your world is outside the OmniSim install and the engine predates 2026-10-20: it looked for the panel only in the world's own `plugins/robot_windows/`. The panel now ships in `resources/projects/plugins/robot_windows/omnilink_chat/` and every world finds it there; on an older engine, copy that folder into `<your project>/plugins/robot_windows/`. `POST /prompt` on the bridge works either way. A copy in your own project still wins, so a customised panel keeps working.
 
 ---
 

@@ -26,6 +26,13 @@ namespace OmControllerPlugin {
   // absolute filenames in the resources directory, the files doesn't exist necessarily
   const QStringList &defaultList(Type type);
 
+  // The HTML robot window `key` shared by the installation: the first existing
+  // `<plugins>/robot_windows/<key>/<key>.<extension>` among the plugin folders defaultList()
+  // searches that lie inside the installation directory (resources/projects/..., projects/default/...).
+  // Empty if there is none. A world outside the install has no copy of such a window in its own
+  // project, and only files inside the install are served to the browser from anywhere but that project.
+  QString defaultHtmlWindowFile(const QString &key, const QString &extension);
+
   Type pluginSubDirectoryToType(const QString &pluginSubDirectory);
 
 };  // namespace OmControllerPlugin

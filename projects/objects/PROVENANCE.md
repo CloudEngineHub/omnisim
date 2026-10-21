@@ -14,6 +14,14 @@ Sibling record for the material library these PROTOs draw on:
 
 ---
 
+## Meshes without a PROTO
+
+`factory/tugger_cart/meshes/` — a tugger cart's visual meshes, one `.obj` per material, built by
+`build_meshes.py` in the same directory (stock Blender, `--factory-startup`, no file imported).
+Original work, **Apache-2.0**, OmniLink, 2026-10-20. Used by worlds directly; no PROTO wraps it yet.
+
+---
+
 ## What ships here
 
 176 PROTOs across 43 category directories, 606 bundled texture images, and 165 PROTO preview

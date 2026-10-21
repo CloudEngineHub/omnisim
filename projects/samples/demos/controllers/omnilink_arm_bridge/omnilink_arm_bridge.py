@@ -1655,10 +1655,11 @@ class ArmBridge:
         # here, so the same fix: act_stop arms this deadline itself, and
         # ArmIdleLoop._blocked reads it.
         self.stop_hold_until = 0.0
-        # Joint samples taken by tick() (wall_t, q). The only honest basis
-        # for "did the arm actually come to rest": a commanded hold says
-        # nothing about whether the servos stopped tracking.
-        self._q_hist: List[Tuple[float, List[float]]] = []
+        # Joint samples taken by tick() (wall_t, q, sim_t). The only honest
+        # basis for "did the arm actually come to rest": a commanded hold
+        # says nothing about whether the servos stopped tracking. Rates are
+        # differenced on sim_t, index 2 -- never on the wall stamp.
+        self._q_hist: List[Tuple[float, List[float], float]] = []
         self.idle_loop: Optional["ArmIdleLoop"] = None
         # Optional warehouse LINE MASTER (see WarehouseLine). Armed by main()
         # alongside the idle pick loop; auto-disables itself in any world that
@@ -2531,7 +2532,10 @@ class ArmBridge:
             # can prove the arm stood still without issuing sensor reads of
             # its own (MainThreadCalls: threaded reads stall the step
             # exchange).
-            self._q_hist.append((self.last_tick_at, list(self.last_q)))
+            # index 2 is SIM time: a rad/s measured against the wall clock
+            # is wrong by whatever the sim is running at.
+            self._q_hist.append((self.last_tick_at, list(self.last_q),
+                                 self.sim_time))
             if len(self._q_hist) > self.Q_HIST_MAX:
                 del self._q_hist[:-self.Q_HIST_MAX]
             # D4: a joint pinned against its declared stop. This is the
@@ -3994,13 +3998,18 @@ class ArmBridge:
     # ── stop_robot ────────────────────────────────────────────────
 
     def _stop_measure_rest(self, t_halt: float,
-                           q_halt: List[float]) -> dict:
+                           q_halt: List[float],
+                           t_halt_sim: Optional[float] = None) -> dict:
         """Did the arm ACTUALLY come to rest? Answered from JOINT SAMPLES.
 
         `q` at the freeze instant was already measured, but a position read
         is not a rest verdict: it says where the arm WAS, not that it stopped
         moving. Stationary here means the joint vector stopped changing over
-        a real interval."""
+        a real interval.
+
+        `t_halt` is the WALL instant of the halt (liveness, and the no-clock
+        fallback wait); `t_halt_sim` is the SIM instant, and the window, the
+        tail and every rate below are taken on it."""
         blank: Dict[str, Any] = {
             "max_joint_radps": None, "joint": None,
             "over_s": None, "samples": 0, "moved_since_halt_rad": None,
@@ -4021,11 +4030,35 @@ class ArmBridge:
             blank["reason"] = ("the simulation is not stepping, so no joint "
                                "samples are being produced")
             return blank
+        # ⚠️ THE SETTLING WINDOW IS SIM STEPS AND THE RATES ARE SIM SECONDS
+        # (2026-10-18). This waited 0.30 WALL seconds and divided joint
+        # motion by wall seconds, so on a sim faster than realtime
+        # (headless --mode=fast) the rate was inflated by the realtime
+        # factor and below realtime a creeping joint read as still. The
+        # mobile bridge's twin mixed the two clocks outright and answered
+        # every fast-mode stop "rest unconfirmed". The sleep stays wall
+        # time -- it is how this HTTP thread yields -- but what it waits out
+        # is counted in steps, and only a frozen world ends it early.
+        if t_halt_sim is None:
+            t_halt_sim = float(getattr(self, "sim_time", 0.0))
+        clock = getattr(self, "clock", None)
+        budget = (clock.budget(self.STOP_SETTLE_S) if clock is not None
+                  else None)
         deadline = t_halt + self.STOP_SETTLE_S
-        while time.time() < deadline:
-            time.sleep(min(self.WAIT_POLL_S, max(0.0, deadline - time.time())))
+        wall_cap = time.time() + self.STOP_SETTLE_S * 8.0 + self.WAIT_STALL_S
+        while (budget.expired() if budget is not None
+               else time.time() >= deadline) is False:
+            if time.time() > wall_cap or (
+                    budget is not None and budget.stalled(self.last_tick_at)):
+                blank["reason"] = ("the simulation stopped stepping during "
+                                   "the settling window, so no rate could "
+                                   "be differenced")
+                return blank
+            time.sleep(self.WAIT_POLL_S if budget is not None else
+                       min(self.WAIT_POLL_S,
+                           max(0.0, deadline - time.time())))
         with self.lock:
-            after = [s for s in self._q_hist if s[0] >= t_halt]
+            after = [s for s in self._q_hist if s[2] >= t_halt_sim]
         if len(after) < 2:
             blank["samples"] = len(after)
             blank["reason"] = ("fewer than two joint samples arrived in the "
@@ -4039,11 +4072,11 @@ class ArmBridge:
         out["moved_since_halt_rad"] = max(
             [abs(last_q[i] - q_halt[i]) for i in range(n)] or [0.0])
         out["q_after_settle"] = list(last_q)
-        cut = t_halt + self.STOP_SETTLE_S * self.STOP_TAIL_FRAC
-        tail = [s for s in after if s[0] >= cut]
-        if len(tail) < 2 or (tail[-1][0] - tail[0][0]) < self.STOP_MIN_SPAN_S:
+        cut = t_halt_sim + self.STOP_SETTLE_S * self.STOP_TAIL_FRAC
+        tail = [s for s in after if s[2] >= cut]
+        if len(tail) < 2 or (tail[-1][2] - tail[0][2]) < self.STOP_MIN_SPAN_S:
             tail = after[-2:]
-        span = tail[-1][0] - tail[0][0]
+        span = tail[-1][2] - tail[0][2]
         if span < self.STOP_MIN_SPAN_S:
             out["reason"] = (f"joint samples spanned only {span:.3f}s, below "
                              f"the {self.STOP_MIN_SPAN_S:.2f}s needed to "
@@ -4134,6 +4167,9 @@ class ArmBridge:
         #   None  -> no hardware attached; there was nothing to stop
         hw_stopped = self._hw_fwd("stop")
         halted_at = time.time()
+        # The SIM instant of the halt: the rest measurement's window is taken
+        # on this clock, never on `halted_at` (see _stop_measure_rest).
+        halted_at_sim = float(self.sim_time)
         hold = self._stop_arm_hold() if operator else None
         # `q` here IS measured -- _read_q() reads the position sensors at the
         # instant the arm was frozen -- so it keeps the measurement-shaped key.
@@ -4157,7 +4193,7 @@ class ArmBridge:
                                                "and it does not hold the "
                                                "autonomy loop"}})
             return self._note_superseded(out, superseded)
-        m = self._stop_measure_rest(halted_at, q)
+        m = self._stop_measure_rest(halted_at, q, halted_at_sim)
         rate = m.get("max_joint_radps")
         stationary = None if rate is None else rate <= self.STOP_STILL_RADPS
         out.update({
@@ -8146,8 +8182,14 @@ def make_handler(bridge: ArmBridge, relay: Any = None):
                         # non-None result is a confident, exactly-parsed
                         # order the gate (inside route.execute) has already
                         # vetted on the "arm" rail; no model is called.
+                        # A CREWMATE's message (omnisim_bridges.crew) always
+                        # reaches the model: the parser would carry out "bring
+                        # the cart to my pick cell" and answer the sender, but
+                        # that answer never reaches it, and only the model can
+                        # message back. The gate still vets what the model does.
                         _early = (shared_short_circuit(bridge, text, "arm")
-                                  if shared_short_circuit is not None else None)
+                                  if shared_short_circuit is not None
+                                  and not body.get("crew") else None)
                         if _early is not None:
                             out = _reply_payload(
                                 _early.get("agent", ""),
@@ -9302,6 +9344,13 @@ def setup_omnilink_relay(bridge: ArmBridge, http_port: int = 8765) -> Optional[A
     try:
         agent_name = profile_sync.agent_name_for(bridge.robot_id)
         tools = build_arm_tools(bridge)
+        # A crew channel when the world declares one (OMNILINK_CREW): the
+        # robot can talk to its crewmates through their own /prompt doors.
+        try:
+            from omnisim_bridges.crew import crew_tools
+            tools = list(tools) + crew_tools(bridge, http_port)
+        except Exception as e:
+            print(f"[crew] not registered: {e}", flush=True)
         main_task = build_arm_main_task(bridge)
         relay = OmniLinkRelay(
             omni_key=get_omni_key(),

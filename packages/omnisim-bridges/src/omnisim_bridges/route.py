@@ -47,6 +47,8 @@ import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from omnisim_bridges import runtime_clock
+
 from . import gate as _gate
 from . import interpret as _i
 
@@ -206,6 +208,10 @@ def _describe(tool: str, args: Dict[str, Any], res: Any,
             detail = "rest unconfirmed"
         return said, "ok", detail, ""
 
+    if tool in ("sit", "stand", "reset_to_home") and "settled" in res \
+            and res.get("pose") in ("sit", "stand"):
+        return _measured_pose(tool, res)
+
     bits = ", ".join(f"{k}={v}" for k, v in args.items() if v is not None)
     said = f"{tool.replace('_', ' ').capitalize()}" + (f" ({bits})" if bits else "") + "."
     measured = _measured_motion(tool, res)
@@ -229,6 +235,39 @@ def _describe(tool: str, args: Dict[str, Any], res: Any,
         said += (" I ignored " + ", ".join(dropped)
                  + " - this robot's " + tool + " does not take it.")
     return said, "ok", bits or "ok", ""
+
+
+def _measured_pose(tool: str, res: Dict[str, Any]) -> Tuple[str, str, str, str]:
+    """Say what a sit / stand MEASURED. It used to echo the tool ("Sit.
+    Stand.") the moment the setpoint changed, over a body that never went
+    down (XGO Mini2S, v9.2.6, 2026-10-20). Not settled is an error."""
+    pose = str(res.get("pose") or ("sit" if tool == "sit" else "stand"))
+    name = {"sit": "the sit pose", "stand": "the standing pose"}.get(pose, pose)
+    ach = res.get("achieved") if isinstance(res.get("achieved"), dict) else {}
+    err = ach.get("joint_error_max_deg")
+    z0, z1 = ach.get("body_z_start_m"), ach.get("body_z_m")
+    body = (f"; body height {z0:.3f} -> {z1:.3f} m"
+            if isinstance(z0, (int, float)) and isinstance(z1, (int, float)) else "")
+    if res.get("superseded"):
+        return (f"I did not finish moving into {name}: a newer order or a stop "
+                f"took over first{body}.", "ok", "superseded", "")
+    settled = res.get("settled")
+    if settled is None:
+        return (f"I started moving into {name}; I did not wait to confirm it.",
+                "ok", "unconfirmed", "")
+    if res.get("stalled"):
+        return (f"I could not confirm {name}: the simulation stopped stepping.",
+                "err", "stalled", "")
+    if settled:
+        took = res.get("settle_s")
+        when = f" after {took:.2f} s" if isinstance(took, (int, float)) else ""
+        legs = f"legs within {err:.1f} deg" if isinstance(err, (int, float)) else "legs settled"
+        return (f"In {name}{when}: {legs}{body}.", "ok",
+                f"settled, max joint error {err} deg" if err is not None else "settled", "")
+    off = f": legs still {err:.1f} deg off" if isinstance(err, (int, float)) else ""
+    return (f"I did not reach {name}{off}{body}"
+            + (" (timed out)." if res.get("timed_out") else "."),
+            "err", f"not settled, max joint error {err} deg", "")
 
 
 def _measured_motion(tool: str, res: Dict[str, Any]
@@ -1504,7 +1543,7 @@ def answer_release(bridge: Any, text: str) -> Optional[Dict[str, Any]]:
         return None
     import time as _time
     held = bool(store.hold_active()) if hasattr(store, "hold_active") else False
-    stopped = float(getattr(bridge, "stop_hold_until", 0.0) or 0.0) > _time.time()
+    stopped = float(getattr(bridge, "stop_hold_until", 0.0) or 0.0) > runtime_clock.now()
     order = getattr(bridge, "_last_order", None)
     if not (held or stopped or order):
         return None

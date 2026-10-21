@@ -258,6 +258,10 @@ def regrade(out, suite_path):
 
 
 def main(argv=None):
+    # Robot replies carry characters a cp1252 console cannot encode ("−", "…");
+    # printing one crashed a crew take outright on 2026-10-20.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     p = argparse.ArgumentParser(description=__doc__)
     sub = p.add_subparsers(dest="command", required=True)
     v = sub.add_parser("validate"); v.add_argument("--suite", type=Path, default=DEFAULT_SUITE)
@@ -294,6 +298,15 @@ def main(argv=None):
                    help="Stop the run if the provider stays unhealthy this long")
     r.add_argument("--parallel", type=int, default=1,
                    help="Episodes of one task block run concurrently, in waves of this size")
+    r.add_argument("--sim-clock", action="store_true",
+                   help="DEV LOOP ONLY, OmniLink arm only: run the world in fast mode on simulator "
+                        "time, at real time while OmniLink is busy (omnisim_bridges.runtime_clock). "
+                        "Never for a published result")
+    r.add_argument("--sim-clock-speed", type=float, default=6.0,
+                   help="Cap on simulated seconds per wall second while OmniLink is idle")
+    r.add_argument("--replay-from", type=Path, default=None,
+                   help="DEV LOOP ONLY: answer OmniLink's model calls from the replies recorded in an "
+                        "earlier run's episodes when the conversation matches (omnisim_bridges.model_replay)")
     j = sub.add_parser("judge", help="Judge every `judged` check, then write graded.jsonl")
     j.add_argument("directories", nargs="+", type=Path)
     j.add_argument("--suite", type=Path, default=DEFAULT_SUITE)
@@ -314,6 +327,14 @@ def main(argv=None):
                    else os.environ.get("OMNI_KEY", "").strip())
             if not key: raise ValueError("Pass --key-file or set OMNI_KEY")
             cfg = {"engine": args.engine, "model": args.model, "max_requests": args.max_requests}
+            if args.sim_clock:
+                if set(args.arms) != {"omnilink"}:
+                    raise ValueError("--sim-clock is OmniLink-only: competitors run in real time")
+                cfg.update(sim_clock=True, sim_clock_speed=args.sim_clock_speed)
+            if args.replay_from:
+                if set(args.arms) != {"omnilink"}:
+                    raise ValueError("--replay-from is OmniLink-only")
+                cfg["replay_from"] = str(args.replay_from.resolve())
             if "codex_full" in args.arms:
                 if not args.codex_workspace:
                     raise ValueError("Codex needs --codex-workspace outside the benchmark repository")

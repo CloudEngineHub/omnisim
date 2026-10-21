@@ -38,6 +38,7 @@ import os
 import statistics
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -163,7 +164,8 @@ def cmd_run(args):
                            cwd=ROOT, capture_output=True, text=True).stdout.strip()
     meta = {"started": stamp, "git_head": head, "dirty_product": dirty.splitlines(),
             "shared_hash": shared_hash(), "shifts": shifts, "repeats": args.repeats,
-            "label": args.label, "model_delay_s": args.model_delay}
+            "label": args.label, "model_delay_s": args.model_delay,
+            "clock": "sim" if args.sim_clock else "wall"}
     (loop / "loop.json").write_text(json.dumps(meta, indent=1), encoding="utf-8")
     procs = []
     for shift in shifts:
@@ -174,6 +176,10 @@ def cmd_run(args):
                    "--engine", args.engine, "--model", args.model, "--rates", args.rates,
                    "--max-requests", "1000", "--cap-usd", str(args.cap_usd),
                    "--key-file", args.key_file, "--out", str(out)]
+            if args.sim_clock:
+                cmd += ["--sim-clock", "--sim-clock-speed", str(args.sim_clock_speed)]
+            if args.replay_from:
+                cmd += ["--replay-from", str(Path(args.replay_from) / f"{shift}-r{rep}")]
             log = open(loop / f"{shift}-r{rep}.log", "w", encoding="utf-8")
             procs.append((shift, out, subprocess.Popen(cmd, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
                                                        env=_env(args.model_delay))))
@@ -185,7 +191,7 @@ def cmd_run(args):
     for shift, out, _ in procs:
         if (out / "rows.jsonl").exists() and _has_judged(shift):
             subprocess.run([PY, "-m", "omnisim", "ops-bench", "judge", str(out),
-                            "--suite", SHIFTS[shift]["suite"], "--engine", args.engine,
+                            "--suite", SHIFTS[shift]["suite"], "--engine", args.judge_engine,
                             "--model", args.judge_model, "--key-file", args.key_file], cwd=ROOT)
     report(loop)
 
@@ -216,26 +222,43 @@ def cmd_confirm(args):
     # healthy provider (median <= --health-median-s over 5 probes).
     waves = [("omnilink", ["omnilink"] * args.omnilink_repeats),
              ("competitors", args.competitors.split(","))]
+    # Waves still run one KIND at a time (OmniLink, then competitors) so one
+    # provider slowdown cannot tilt the comparison inside a wave, but the
+    # shifts of a wave now run side by side up to --max-engines simulators:
+    # six sequential waves (about 1 h 45) become two.
+    for wave, arms in waves:
+        if not arms or arms == [""]:
+            continue
+        pending = list(shifts)
+        running = []
+        while pending or running:
+            while pending and sum(n for _, _, n in running) + len(arms) <= max(args.max_engines, len(arms)):
+                shift = pending.pop(0)
+                wout = loop / f"{shift}-r0" / wave
+                cmd = [PY, "-m", "omnisim", "ops-bench", "run", "--suite", SHIFTS[shift]["suite"],
+                       "--arms", *arms, "--parallel", str(len(arms)), "--repeats", "1", "--repeat-base", "0",
+                       "--engine", args.engine, "--model", args.model, "--rates", args.rates,
+                       "--max-requests", "1000", "--cap-usd", str(args.cap_usd),
+                       "--health-median-s", str(args.health_median_s), "--health-max-wait-h", "2",
+                       "--key-file", args.key_file, "--out", str(wout)]
+                print(f"confirm {loop.name}: {shift} / {wave}, {len(arms)} episodes "
+                      f"({', '.join(arms)})", flush=True)
+                log = open(loop / f"{shift}-r0-{wave}.log", "w", encoding="utf-8")
+                running.append((shift, subprocess.Popen(cmd, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
+                                                        env=_env(0)), len(arms)))
+            finished = [r for r in running if r[1].poll() is not None]
+            if not finished:
+                time.sleep(5)
+                continue
+            for shift, proc, n in finished:
+                running.remove((shift, proc, n))
+                wout = loop / f"{shift}-r0" / wave
+                if (wout / "rows.jsonl").exists() and _has_judged(shift):
+                    subprocess.run([PY, "-m", "omnisim", "ops-bench", "judge", str(wout),
+                                    "--suite", SHIFTS[shift]["suite"], "--engine", args.judge_engine,
+                                    "--model", args.judge_model, "--key-file", args.key_file], cwd=ROOT)
     for shift in shifts:
         out = loop / f"{shift}-r0"
-        for wave, arms in waves:
-            if not arms or arms == [""]:
-                continue
-            wout = out / wave
-            cmd = [PY, "-m", "omnisim", "ops-bench", "run", "--suite", SHIFTS[shift]["suite"],
-                   "--arms", *arms, "--parallel", str(len(arms)), "--repeats", "1", "--repeat-base", "0",
-                   "--engine", args.engine, "--model", args.model, "--rates", args.rates,
-                   "--max-requests", "1000", "--cap-usd", str(args.cap_usd),
-                   "--health-median-s", str(args.health_median_s), "--health-max-wait-h", "2",
-                   "--key-file", args.key_file, "--out", str(wout)]
-            print(f"confirm {loop.name}: {shift} / {wave}, {len(arms)} episodes at once "
-                  f"({', '.join(arms)})", flush=True)
-            with open(loop / f"{shift}-r0-{wave}.log", "w", encoding="utf-8") as log:
-                subprocess.run(cmd, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, env=_env(0))
-            if (wout / "rows.jsonl").exists() and _has_judged(shift):
-                subprocess.run([PY, "-m", "omnisim", "ops-bench", "judge", str(wout),
-                                "--suite", SHIFTS[shift]["suite"], "--engine", args.engine,
-                                "--model", args.judge_model, "--key-file", args.key_file], cwd=ROOT)
         comp = out / "competitors"
         if (comp / "rows.jsonl").exists():
             cmd_baseline(argparse.Namespace(shift=shift, dirs=[str(comp)], shared_hash=meta["shared_hash"],
@@ -253,16 +276,46 @@ def cmd_probes(args):
     stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     out = LOOPS / f"probes-{stamp}{('-' + args.label) if args.label else ''}"
     arms = args.arms.split(",")
-    cmd = [PY, "-m", "omnisim", "ops-bench", "run", "--suite", PROBES,
-           "--arms", *arms, "--parallel", str(len(arms)), "--engine", args.engine,
-           "--model", args.model, "--rates", args.rates, "--max-requests", "200",
-           "--cap-usd", str(args.cap_usd), "--key-file", args.key_file, "--out", str(out)]
+    suite = args.suite or PROBES
+    tasks = [t["id"] for t in json.loads((ROOT / suite).read_text(encoding="utf-8"))["tasks"]]
     if args.only:
-        cmd += ["--only", *args.only.split(",")]
-    print(f"probes {out.name}: arms {', '.join(arms)}"
+        wanted = set(args.only.split(","))
+        tasks = [t for t in tasks if t in wanted]
+
+    def command(task_out, only):
+        cmd = [PY, "-m", "omnisim", "ops-bench", "run", "--suite", suite,
+               "--arms", *arms, "--parallel", str(len(arms)), "--engine", args.engine,
+               "--model", args.model, "--rates", args.rates, "--max-requests", "200",
+               "--cap-usd", str(args.cap_usd), "--key-file", args.key_file, "--out", str(task_out),
+               "--only", *only]
+        if getattr(args, "sim_clock", False):
+            cmd += ["--sim-clock", "--sim-clock-speed", str(args.sim_clock_speed)]
+        if getattr(args, "replay_from", None):
+            cmd += ["--replay-from", str(args.replay_from)]
+        return cmd
+
+    # One ops-bench process per probe, `--parallel` engines at a time. ops-bench's
+    # own --parallel only runs ONE task's arms/repeats side by side, so a pack of
+    # probes used to run one after another (measured: 7 probes, 19 min).
+    width = max(1, (args.parallel or 4) // max(1, len(arms)))
+    print(f"probes {out.name}: {len(tasks)} probe(s), arms {', '.join(arms)}, {width} at a time"
           + (f", model slowed by {args.model_delay:g} s a round" if args.model_delay else ""), flush=True)
-    subprocess.run(cmd, cwd=ROOT, stdout=subprocess.DEVNULL if args.quiet else None,
-                   env=_env(args.model_delay))
+    out.mkdir(parents=True, exist_ok=False)
+    pending, running = list(tasks), []
+    while pending or running:
+        while pending and len(running) < width:
+            task = pending.pop(0)
+            task_out = out / "by_task" / task
+            task_out.parent.mkdir(parents=True, exist_ok=True)
+            log = open(out / f"{task}.log", "w", encoding="utf-8")
+            running.append(subprocess.Popen(command(task_out, [task]), cwd=ROOT, stdout=log,
+                                            stderr=subprocess.STDOUT, env=_env(args.model_delay)))
+        running = [p for p in running if p.poll() is None]
+        if running:
+            time.sleep(2)
+    with open(out / "rows.jsonl", "w", encoding="utf-8") as merged:
+        for f in sorted((out / "by_task").glob("*/rows.jsonl")):
+            merged.write(f.read_text(encoding="utf-8"))
     probes_report(out)
 
 
@@ -361,6 +414,44 @@ def report(loop: Path):
     return out
 
 
+def cmd_failure_probes(args):
+    """Turn every check OmniLink failed in a loop into a short probe, per shift,
+    and (with --run) run them all at once. Minutes instead of a 30-minute shift."""
+    import failure_probes as FP
+    loop = Path(args.loop)
+    meta = json.loads((loop / "loop.json").read_text(encoding="utf-8"))
+    shifts = meta.get("shifts") or list(SHIFTS)
+    suites = []
+    for shift in shifts:
+        rows = []
+        for d in sorted(loop.glob(f"{shift}-r*")):
+            for f in [d / "rows.jsonl", *d.glob("*/rows.jsonl")]:
+                if f.exists():
+                    rows += [json.loads(l) for l in f.read_text(encoding="utf-8").splitlines() if l.strip()]
+        skip = {int(x) for x in SHIFTS[shift]["drop"]}
+        suite = FP.build_suite(ROOT / SHIFTS[shift]["suite"], rows, skip)
+        if not suite["tasks"]:
+            print(f"{shift}: no failed checks to probe")
+            continue
+        out = loop / f"failure_probes_{shift}.json"
+        out.write_text(json.dumps(suite, indent=1), encoding="utf-8")
+        suites.append(out)
+        for t in suite["tasks"]:
+            po = t["probe_of"]
+            last = max(float(s["when"].get("at_s", 0)) for s in t["steps"] if "at_s" in s["when"])
+            print(f"{shift}: check {po['check']} ({t['checks'][0]['type']}): {po['kept_steps']}/{po['original_steps']} steps, "
+                  f"last step at {last / 60:.1f} min -> {out.name}")
+    if args.run:
+        for s in suites:
+            n = len(json.loads(s.read_text(encoding="utf-8"))["tasks"])
+            cmd_probes(argparse.Namespace(arms="omnilink", only="", key_file=args.key_file, engine=args.engine,
+                                          model=args.model, rates=args.rates, cap_usd=args.cap_usd,
+                                          label=f"fp-{s.stem.replace('failure_probes_', '')}", quiet=True,
+                                          model_delay=0.0, suite=str(s), parallel=min(n, args.max_engines),
+                                          sim_clock=args.sim_clock, sim_clock_speed=args.sim_clock_speed,
+                                          replay_from=None))
+
+
 def cmd_explain(args):
     """Why did OmniLink fail check N? The check, what the grader measured,
     and what OmniLink said and did in that check's window."""
@@ -398,7 +489,38 @@ def cmd_explain(args):
                         print(f"        acts: {acts}")
 
 
+# Model presets. The inner loop runs on a fast, cheaper model; `confirm` on the
+# model a published result would use. Rates are USD per million tokens:
+# input, cache read, output (Claude prices as of 2026-10).
+PRESETS = {
+    "gemini": {"engine": "g1-engine", "model": "gemini-3.5-flash", "rates": "1.5,0.15,9.0"},
+    "claude": {"engine": "g4-engine", "model": "claude-opus-5-5", "rates": "4.0,0.20,20.0"},
+    "claude-fast": {"engine": "g4-engine", "model": "claude-sonnet-5-5", "rates": "2.0,0.20,10.0"},
+}
+
+
+def _model_args(sp):
+    sp.add_argument("--preset", choices=list(PRESETS), default="gemini",
+                    help="engine, model and rates in one word; --engine/--model/--rates override it")
+    sp.add_argument("--engine", default=None)
+    sp.add_argument("--model", default=None)
+    sp.add_argument("--rates", default=None)
+
+
+def _resolve_model(a):
+    if getattr(a, "preset", None) is None:
+        return
+    p = PRESETS[a.preset]
+    for k in ("engine", "model", "rates"):
+        if getattr(a, k, None) is None:
+            setattr(a, k, p[k])
+
+
 def main(argv=None):
+    # Robot replies carry characters a cp1252 console cannot encode ("−", "…");
+    # printing one crashed a crew take outright on 2026-10-20.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     b = sub.add_parser("baseline", help="store competitor scores for a seen shift from evidence dirs")
@@ -410,12 +532,17 @@ def main(argv=None):
     r.add_argument("--shifts", default="all")
     r.add_argument("--repeats", type=int, default=1)
     r.add_argument("--key-file", required=True)
-    r.add_argument("--engine", default="g1-engine")
-    r.add_argument("--model", default="gemini-3.5-flash")
+    _model_args(r)
+    r.add_argument("--judge-engine", default="g1-engine",
+                   help="the reply judge's engine, independent of the arms' engine")
     r.add_argument("--judge-model", default="gemini-2.5-pro")
-    r.add_argument("--rates", default="1.5,0.15,9.0")
     r.add_argument("--cap-usd", type=float, default=6.0, help="per episode process")
     r.add_argument("--label", default="")
+    r.add_argument("--sim-clock", action="store_true",
+                   help="fast mode on simulator time, real time while OmniLink is busy (dev loop only)")
+    r.add_argument("--sim-clock-speed", type=float, default=6.0)
+    r.add_argument("--replay-from", default=None,
+                   help="answer OmniLink's model calls from an earlier run's recorded replies")
     r.add_argument("--model-delay", type=float, default=0.0,
                    help="slow every OmniLink model round by this many seconds (robustness probe)")
     c = sub.add_parser("confirm", help="OmniLink x N plus fresh full-tier baselines on every seen shift")
@@ -423,11 +550,12 @@ def main(argv=None):
     c.add_argument("--omnilink-repeats", type=int, default=3)
     c.add_argument("--competitors", default="plain_full,langgraph_full,lobster_full")
     c.add_argument("--key-file", required=True)
-    c.add_argument("--engine", default="g1-engine")
-    c.add_argument("--model", default="gemini-3.5-flash")
+    _model_args(c)
+    c.add_argument("--judge-engine", default="g1-engine")
     c.add_argument("--judge-model", default="gemini-2.5-pro")
-    c.add_argument("--rates", default="1.5,0.15,9.0")
     c.add_argument("--cap-usd", type=float, default=30.0, help="per shift wave")
+    c.add_argument("--max-engines", type=int, default=9,
+                   help="simulators running at once across shifts (this laptop: about 9 before it throttles)")
     c.add_argument("--health-median-s", type=float, default=8.0,
                    help="wait before each wave until the provider's median request time is at most this")
     c.add_argument("--label", default="")
@@ -435,11 +563,27 @@ def main(argv=None):
     q.add_argument("--arms", default="omnilink")
     q.add_argument("--only", default="")
     q.add_argument("--key-file", required=True)
-    q.add_argument("--engine", default="g1-engine")
-    q.add_argument("--model", default="gemini-3.5-flash")
-    q.add_argument("--rates", default="1.5,0.15,9.0")
+    _model_args(q)
+    q.add_argument("--suite", default=None, help="probe suite file (default: the standing probe pack)")
+    q.add_argument("--parallel", type=int, default=0, help="episodes at once (default: one per arm)")
+    fp = sub.add_parser("failure-probes", help="a short probe per check OmniLink failed in a loop")
+    fp.add_argument("loop")
+    fp.add_argument("--run", action="store_true", help="also run the probes, all at once")
+    fp.add_argument("--key-file", default="")
+    _model_args(fp)
+    fp.add_argument("--cap-usd", type=float, default=3.0)
+    fp.add_argument("--max-engines", type=int, default=4,
+                    help="probes at once; fast-clock engines each take a full core (8 at once took 20-30 min)")
+    fp.add_argument("--sim-clock", action="store_true",
+                   help="fast mode on simulator time, real time while OmniLink is busy (dev loop only)")
+    fp.add_argument("--sim-clock-speed", type=float, default=6.0)
     q.add_argument("--cap-usd", type=float, default=3.0)
     q.add_argument("--label", default="")
+    q.add_argument("--sim-clock", action="store_true",
+                   help="fast mode on simulator time, real time while OmniLink is busy (dev loop only)")
+    q.add_argument("--sim-clock-speed", type=float, default=6.0)
+    q.add_argument("--replay-from", default=None,
+                   help="answer OmniLink's model calls from an earlier run's recorded replies")
     q.add_argument("--quiet", action="store_true")
     q.add_argument("--model-delay", type=float, default=0.0,
                    help="slow every OmniLink model round by this many seconds (robustness probe)")
@@ -453,6 +597,7 @@ def main(argv=None):
     e.add_argument("shift", choices=list(SHIFTS))
     e.add_argument("checks", nargs="+")
     a = ap.parse_args(argv)
+    _resolve_model(a)
     if a.cmd == "baseline":
         cmd_baseline(a)
     elif a.cmd == "run":
@@ -461,6 +606,8 @@ def main(argv=None):
         cmd_confirm(a)
     elif a.cmd == "probes":
         cmd_probes(a)
+    elif a.cmd == "failure-probes":
+        cmd_failure_probes(a)
     elif a.cmd == "probes-report":
         probes_report(Path(a.dir))
     elif a.cmd == "explain":

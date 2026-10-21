@@ -93,6 +93,12 @@ struct UrdfInertial {
   double ixx = 0.0, ixy = 0.0, ixz = 0.0;
   double iyy = 0.0, iyz = 0.0, izz = 0.0;
   bool hasInertiaMatrix = false;
+  // An <inertia> WAS declared but is not positive definite (an all-zero tensor
+  // included), so it is not passed through. The values, for the warning
+  // emitLinkPhysics writes once it knows what the fallback kept.
+  bool declaredNotPositiveDefinite = false;
+  bool declaredNonZeroDiagonal = false;
+  QString declaredTensorText;
 };
 
 // Webots' updateMode requires the inertia tensor to be positive definite or it
@@ -245,6 +251,26 @@ bool urdfDebugEnabled() {
 // hatch in this engine must be.
 bool urdfUseInertiaEnabled() {
   const QString value = QString::fromUtf8(qgetenv("OMNISIM_URDF_USE_INERTIA")).trimmed().toLower();
+  if (value.isEmpty())
+    return true;
+  return value != "0" && value != "false" && value != "off" && value != "no";
+}
+
+// A declared tensor the importer REJECTS (not positive definite -- an all-zero
+// one included --, impossible, or vanishingly small) used to take the link's
+// declared centre of mass down with it. The bounding-object
+// fallback emitted mass + centerOfMass but no inertiaMatrix, and the Newton
+// registration passes a COM only alongside an explicit tensor -- so the solver
+// stepped the link with its COM at the link origin. Found 2026-10-20 on AgiBot
+// G2's body_link4 (declared COM (-0.071, 0, 0.030), stepped at (0, 0, 0)). The
+// fallback Physics is now marked DEF URDF_INERTIA_FALLBACK and always carries the
+// declared COM; OmSolid's Newton registration keys on the marker, keeps the mass
+// and COM, and takes ONLY the rotational inertia from the bounding object, about
+// that COM. OMNISIM_URDF_INERTIA_FALLBACK_KEEP_COM=0 (value-parsed) restores the
+// unmarked block and the COM at the link origin.
+bool urdfInertiaFallbackKeepsCom() {
+  const QString value =
+    QString::fromUtf8(qgetenv("OMNISIM_URDF_INERTIA_FALLBACK_KEEP_COM")).trimmed().toLower();
   if (value.isEmpty())
     return true;
   return value != "0" && value != "false" && value != "off" && value != "no";
@@ -629,14 +655,13 @@ UrdfLink parseLink(const QDomElement &elem, QHash<QString, UrdfMaterial> &materi
                             link.inertial.iyz, link.inertial.izz, io.roll, io.pitch, io.yaw);
           io.roll = io.pitch = io.yaw = 0.0;
         }
-      } else if (ixx > 0.0 || iyy > 0.0 || izz > 0.0) {
-        OmLog::warning(QObject::tr("URDF link '%1': inertia tensor is not positive definite "
-                                   "(ixx=%2 iyy=%3 izz=%4 ixy=%5 ixz=%6 iyz=%7); "
-                                   "falling back to bounding-object inertia.")
-                         .arg(link.name)
-                         .arg(ixx).arg(iyy).arg(izz)
-                         .arg(ixy).arg(ixz).arg(iyz),
-                       false, OmLog::PARSING);
+      } else {
+        // Warned by emitLinkPhysics, which knows what the fallback keeps.
+        link.inertial.declaredNotPositiveDefinite = true;
+        link.inertial.declaredNonZeroDiagonal = ixx > 0.0 || iyy > 0.0 || izz > 0.0;
+        link.inertial.declaredTensorText = QString("ixx=%1 iyy=%2 izz=%3 ixy=%4 ixz=%5 iyz=%6")
+                                             .arg(ixx).arg(iyy).arg(izz)
+                                             .arg(ixy).arg(ixz).arg(iyz);
       }
     }
   }
@@ -1544,9 +1569,9 @@ QString emitLinkPhysics(const UrdfLink &link, const QString &indent, bool allowS
     allowSyntheticPhysics && !link.inertial.present && (!supported.isEmpty() || bodyForFixedSubtree);
   if (link.inertial.present || needsSyntheticPhysics) {
     const double mass = link.inertial.present ? link.inertial.mass : 0.001;
-    out += indent + "physics Physics {\n";
-    out += indent + "  density -1\n";
-    out += indent + QString("  mass %1\n").arg(mass);
+    QString physicsBody;
+    physicsBody += indent + "  density -1\n";
+    physicsBody += indent + QString("  mass %1\n").arg(mass);
     // OmniSim refuses the custom inertiaMatrix unless mass > 0 AND a single-line
     // centerOfMass is present. So when we have a URDF tensor, emit the COM even
     // when the URDF origin is the link origin (0 0 0) — otherwise the tensor
@@ -1576,38 +1601,78 @@ QString emitLinkPhysics(const UrdfLink &link, const QString &indent, bool allowS
       !urdfInertiaSatisfiesTriangleInequality(link.inertial.ixx, link.inertial.ixy,
                                               link.inertial.ixz, link.inertial.iyy,
                                               link.inertial.iyz, link.inertial.izz, moments);
-    if (link.inertial.hasInertiaMatrix && urdfUseInertiaEnabled() && mass > 0.0) {
-      if (tensorTooSmall)
+    // The fallback replaces ONLY the rotational inertia: the declared mass and
+    // centre of mass are kept, and the marked block tells the Newton registration
+    // to take the tensor from the bounding object ABOUT that centre of mass (see
+    // urdfInertiaFallbackKeepsCom).
+    // A tensor parseLink already refused as not positive definite (an all-zero one
+    // included) is the third rejection, and drops the COM the same way (2026-10-20).
+    const bool tensorNotPd = link.inertial.present && link.inertial.declaredNotPositiveDefinite;
+    const bool tensorRejected =
+      link.inertial.present && urdfUseInertiaEnabled() && mass > 0.0 &&
+      ((link.inertial.hasInertiaMatrix && (tensorTooSmall || tensorImpossible)) || tensorNotPd);
+    const bool markFallback = tensorRejected && urdfInertiaFallbackKeepsCom();
+    // Not rejected (no mass, or OMNISIM_URDF_USE_INERTIA=0): the warning parseLink
+    // used to write, and still only for a tensor that is not all zero -- an all-zero
+    // tensor on a massless frame is a normal URDF idiom.
+    if (tensorNotPd && !tensorRejected && link.inertial.declaredNonZeroDiagonal)
+      OmLog::warning(QObject::tr("URDF link '%1': inertia tensor is not positive definite (%2); "
+                                 "falling back to bounding-object inertia.")
+                       .arg(link.name).arg(link.inertial.declaredTensorText),
+                     false, OmLog::PARSING);
+    if (tensorRejected) {
+      const QString consequence =
+        markFallback
+          ? QObject::tr("kept the declared mass (%1 kg) and centre of mass (%2 %3 %4); replaced only the "
+                        "rotational inertia, with the bounding object's tensor scaled to that mass and taken "
+                        "about that centre of mass.")
+              .arg(mass).arg(link.inertial.origin.x).arg(link.inertial.origin.y).arg(link.inertial.origin.z)
+          : QObject::tr("kept the declared mass (%1 kg); replaced the rotational inertia with the bounding "
+                        "object's AND dropped the declared centre of mass (%2 %3 %4) to the link origin "
+                        "(OMNISIM_URDF_INERTIA_FALLBACK_KEEP_COM=0).")
+              .arg(mass).arg(link.inertial.origin.x).arg(link.inertial.origin.y).arg(link.inertial.origin.z);
+      if (tensorNotPd)
+        OmLog::warning(QObject::tr("URDF link '%1': inertia tensor is not positive definite (%2); "
+                                   "falling back to bounding-object inertia: %3")
+                         .arg(link.name).arg(link.inertial.declaredTensorText).arg(consequence),
+                       false, OmLog::PARSING);
+      else if (tensorTooSmall)
         OmLog::warning(QObject::tr("URDF link '%1': inertia tensor has a principal moment below "
-                                   "%2 kg.m^2 (%3 %4 %5); falling back to bounding-object inertia.")
+                                   "%2 kg.m^2 (%3 %4 %5); falling back to bounding-object inertia: %6")
                          .arg(link.name).arg(kMinInertia)
-                         .arg(link.inertial.ixx).arg(link.inertial.iyy).arg(link.inertial.izz));
-      else if (tensorImpossible)
+                         .arg(link.inertial.ixx).arg(link.inertial.iyy).arg(link.inertial.izz)
+                         .arg(consequence));
+      else
         OmLog::warning(QObject::tr("URDF link '%1': inertia tensor violates the triangle inequality "
                                    "for principal moments (a+b >= c): principal moments are "
                                    "(%2 %3 %4). No rigid body has this tensor, and MuJoCo would "
-                                   "refuse the model; falling back to bounding-object inertia.")
-                         .arg(link.name).arg(moments[0]).arg(moments[1]).arg(moments[2]));
+                                   "refuse the model; falling back to bounding-object inertia: %5")
+                         .arg(link.name).arg(moments[0]).arg(moments[1]).arg(moments[2])
+                         .arg(consequence));
     }
     const bool hasUrdfInertia = link.inertial.present && link.inertial.hasInertiaMatrix && mass > 0.0
                                 && !tensorTooSmall && !tensorImpossible && urdfUseInertiaEnabled();
     const bool hasComOffset = link.inertial.present &&
                               (link.inertial.origin.x != 0.0 || link.inertial.origin.y != 0.0 ||
                                link.inertial.origin.z != 0.0);
-    if (hasUrdfInertia || hasComOffset) {
-      out += indent + QString("  centerOfMass [%1 %2 %3]\n")
-                          .arg(link.inertial.origin.x)
-                          .arg(link.inertial.origin.y)
-                          .arg(link.inertial.origin.z);
+    if (hasUrdfInertia || hasComOffset || markFallback) {
+      physicsBody += indent + QString("  centerOfMass [%1 %2 %3]\n")
+                                .arg(link.inertial.origin.x)
+                                .arg(link.inertial.origin.y)
+                                .arg(link.inertial.origin.z);
     }
     if (hasUrdfInertia) {
       // OmniSim inertiaMatrix layout: line 1 = [Ixx Iyy Izz], line 2 = [Ixy Ixz Iyz].
       // Same sign convention as URDF — both store the un-negated integrals.
-      out += indent + QString("  inertiaMatrix [\n");
-      out += indent + QString("    %1 %2 %3\n").arg(link.inertial.ixx).arg(link.inertial.iyy).arg(link.inertial.izz);
-      out += indent + QString("    %1 %2 %3\n").arg(link.inertial.ixy).arg(link.inertial.ixz).arg(link.inertial.iyz);
-      out += indent + QString("  ]\n");
+      physicsBody += indent + QString("  inertiaMatrix [\n");
+      physicsBody +=
+        indent + QString("    %1 %2 %3\n").arg(link.inertial.ixx).arg(link.inertial.iyy).arg(link.inertial.izz);
+      physicsBody +=
+        indent + QString("    %1 %2 %3\n").arg(link.inertial.ixy).arg(link.inertial.ixz).arg(link.inertial.iyz);
+      physicsBody += indent + QString("  ]\n");
     }
+    out += indent + (markFallback ? "physics DEF URDF_INERTIA_FALLBACK Physics {\n" : "physics Physics {\n");
+    out += physicsBody;
     out += indent + "}\n";
   }
   return out;

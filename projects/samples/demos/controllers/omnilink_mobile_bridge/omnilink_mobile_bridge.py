@@ -804,8 +804,14 @@ def _parse_args() -> argparse.Namespace:
                          "profile name and Axis robot_id. Defaults to "
                          "--robot. Use when multiple bases of the same "
                          "kind share a world (e.g. 4 Huskies in a swarm)."))
+    p.add_argument("--tow", choices=("physical", "kinematic"), default="physical",
+                   help=("How a docked trolley follows: 'physical' (default) "
+                         "velocity-servos it as a free body, so its cargo rides "
+                         "on contact and friction; 'kinematic' is the old pose "
+                         "write with cargo pinned to the deck."))
     p.add_argument("--pallets", default=None,
-                   help=("OPT-IN kinematic dock-and-carry: comma-separated "
+                   help=("OPT-IN dock-and-tow (physical by default, see "
+                         "--tow): comma-separated "
                          "DEF names of pallet Solids this tug may grab "
                          "(e.g. PALLET_PAYLOAD). Requires supervisor TRUE "
                          "on the Robot node. Omit for zero behaviour "
@@ -1170,6 +1176,7 @@ class MobileBridge:
         self.yaw_offset = float(cfg.get("forward_yaw_offset", 0.0))
         self.floor_z = float(cfg.get("floor_z", 0.0))
         self._kin_cmd = (0.0, 0.0)
+        self._kin_v = 0.0          # ramped linear speed actually integrated
         wheel_names = WHEEL_MOTORS[layout]
         self._wheel_names = wheel_names["left"] + wheel_names["right"]
         self.left_motors = [robot.getDevice(n) for n in wheel_names["left"]]
@@ -1439,7 +1446,8 @@ class MobileBridge:
         # idle_loop.leg=to_park, paused=False. This deadline is armed by
         # act_stop ITSELF and read by MavIdleLoop._blocked.
         self.stop_hold_until = 0.0
-        # Pose samples taken by tick() (wall_t, x, y, yaw). This is the ONLY
+        # Pose samples taken by tick() (wall_t, x, y, yaw, sim_t). Every rate
+        # differenced from them uses sim_t, index 4. This is the ONLY
         # honest basis for "did it actually come to rest": the base is
         # kinematic, so _command_velocity just stores a command that tick()
         # integrates into the pose write -- a commanded velocity of zero says
@@ -2010,16 +2018,16 @@ class MobileBridge:
             # being asked; applying it to a stop made the model read
             # paused=false immediately after halting the robot itself, which
             # is the reporting half of the same defect act_stop fixes.
-            stopped = time.time() < getattr(self, "stop_hold_until", 0.0)
+            stopped = runtime_clock.now() < getattr(self, "stop_hold_until", 0.0)
             loop["paused"] = (held or stopped
-                              or (time.time() - prev) < loop_obj.resume_s)
+                              or (runtime_clock.now() - prev) < loop_obj.resume_s)
             loop["paused_by"] = (
                 "operator hold" if held else
                 "operator stop" if stopped else
                 ("recent command" if loop["paused"] else ""))
             if stopped:
                 loop["resumes_in_s"] = round(
-                    self.stop_hold_until - time.time(), 1)
+                    self.stop_hold_until - runtime_clock.now(), 1)
         return st
 
     def describe_role(self) -> str:
@@ -3048,7 +3056,17 @@ class MobileBridge:
         # Kinematic bodies: integrate the commanded (v, w) into a pose write
         # (the same supervisor-drive method the robot's own controllers use).
         if self.kinematic:
-            v, w = self._kin_cmd
+            v_cmd, w = self._kin_cmd
+            # LINEAR ACCELERATION LIMIT (cfg kin_accel_mps2; 0 = none). The
+            # commanded speed used to land in one tick: 0 -> 0.6 m/s in 32 ms
+            # is ~19 m/s^2, which no real tug does and which throws anything
+            # resting on what it tows (crew demo, 2026-10-20). Yaw is NOT
+            # ramped: turns are open-loop pulses sized on the commanded rate.
+            a_max = float(self.cfg.get("kin_accel_mps2", 0.0) or 0.0)
+            v_prev = self._kin_v
+            v = (v_prev + clamp(v_cmd - v_prev, -a_max * dt_s, a_max * dt_s)
+                 if a_max > 0.0 else v_cmd)
+            self._kin_v = v
             if v != 0.0 or w != 0.0:
                 heading = wrap_pi(yaw + w * dt_s)
                 nx = x + v * math.cos(heading) * dt_s
@@ -3215,6 +3233,9 @@ class MobileBridge:
         cx = hx - hx_off * math.cos(psi)
         cy = hy - hx_off * math.sin(psi)
         carry["cx"], carry["cy"] = cx, cy
+        if self.tow_mode == "physical":
+            self._servo_trolley(carry, cx, cy, psi)
+            return
         # The pursuit math above runs EVERY tick (it is pure float work and
         # keeps the trailer path exact); only the supervisor WRITES are
         # decimated, so the cart still follows the same curve.
@@ -3243,6 +3264,76 @@ class MobileBridge:
                     rider["node"].resetPhysics()
                 except Exception:
                     pass
+
+    # ── Physical tow (the default since 2026-10-20) ───────────────────
+    # The kinematic tow above teleports the trolley every second tick and
+    # PINS each part on it every fourth, with resetPhysics zeroing their
+    # velocities: the cargo is carried by bookkeeping, not by the deck, and on
+    # camera the parts visibly hop. The physical tow leaves the trolley a free
+    # dynamic body and drives it with a VELOCITY SERVO onto the same
+    # follow-the-leader pose: feed-forward of the target's own motion plus a
+    # correction of the measured pose error, under an acceleration limit the
+    # cargo's friction can hold. Nothing is written to any pose; whatever
+    # rests on the deck rides on contact and friction alone, and can slide or
+    # fall if the tow is too violent. `--tow kinematic` restores the old path.
+    TOW_SERVO_TAU_S = 0.15       # s to close a pose error
+    TOW_ACCEL_MPS2 = 2.0         # deck acceleration limit (mu 0.35 holds to ~3.4)
+    TOW_ALPHA_RPS2 = 3.0         # deck yaw-acceleration limit
+    TOW_MAX_MPS = 1.2
+    tow_mode = "physical"
+
+    def _servo_trolley(self, carry: dict, cx: float, cy: float, psi: float) -> None:
+        dt = max(self.timestep / 1000.0, 1e-3)
+        node = carry["node"]
+        try:
+            p = node.getPosition()
+            R = node.getOrientation()
+            vel = node.getVelocity()
+        except Exception:
+            return
+        psi_act = math.atan2(R[3], R[0])
+        prev = carry.get("servo_target")
+        ff_x = ff_y = ff_w = 0.0
+        if prev is not None:
+            ff_x = (cx - prev[0]) / dt
+            ff_y = (cy - prev[1]) / dt
+            ff_w = wrap_pi(psi - prev[2]) / dt
+        carry["servo_target"] = (cx, cy, psi)
+        tau = self.TOW_SERVO_TAU_S
+        want_x = ff_x + (cx - p[0]) / tau
+        want_y = ff_y + (cy - p[1]) / tau
+        want_w = ff_w + wrap_pi(psi - psi_act) / tau
+        sp = math.hypot(want_x, want_y)
+        if sp > self.TOW_MAX_MPS:
+            want_x, want_y = want_x * self.TOW_MAX_MPS / sp, want_y * self.TOW_MAX_MPS / sp
+        # Acceleration limit against the velocity commanded last tick (not the
+        # measured one: contact noise would leak straight into the command).
+        vx0, vy0, w0 = carry.get("servo_cmd", (vel[0], vel[1], vel[5]))
+        dvx, dvy = want_x - vx0, want_y - vy0
+        dv = math.hypot(dvx, dvy)
+        lim = self.TOW_ACCEL_MPS2 * dt
+        if dv > lim:
+            dvx, dvy = dvx * lim / dv, dvy * lim / dv
+        vx, vy = vx0 + dvx, vy0 + dvy
+        w = w0 + clamp(want_w - w0, -self.TOW_ALPHA_RPS2 * dt, self.TOW_ALPHA_RPS2 * dt)
+        carry["servo_cmd"] = (vx, vy, w)
+        try:
+            # vz keeps whatever gravity and the floor make it; roll and pitch
+            # are held at zero, as a castered cart's frame is.
+            node.setVelocity([vx, vy, vel[2], 0.0, 0.0, w])
+        except Exception:
+            pass
+
+    def _stop_trolley(self, carry: dict) -> None:
+        """Physical tow: let the released trolley go. A cart is unhitched with
+        the tug parked, so the servo has already brought it to rest; zero its
+        planar velocity once (no pose write, no settle) and leave the rest to
+        friction. Runs on the caller's thread: it must not step the world."""
+        try:
+            vel = carry["node"].getVelocity()
+            carry["node"].setVelocity([0.0, 0.0, vel[2], 0.0, 0.0, 0.0])
+        except Exception:
+            pass
 
     # ── Towed-cart clearance telemetry (honest, self-verifying) ───────
     # A towed cart is POSE-WRITTEN, so an observer cannot tell from the deck
@@ -3460,6 +3551,26 @@ class MobileBridge:
         # PHYSICALLY in the basket (the trolley body's collider travelled
         # with it), so no ongoing pinning is needed.
         cx, cy, psi = carry["cx"], carry["cy"], carry["psi"]
+        if self.tow_mode == "physical":
+            # Nothing to settle: the cart and its cargo are where physics left
+            # them. Report the cart's MEASURED pose and what is aboard it now.
+            self._stop_trolley(carry)
+            try:
+                p = carry["node"].getPosition()
+                R = carry["node"].getOrientation()
+                cx, cy, psi = p[0], p[1], math.atan2(R[3], R[0])
+            except Exception:
+                pass
+            aboard = sorted(r["def"] for r in self._basket_riders((cx, cy, 0.0), psi))
+            with self.lock:
+                self._carry = None
+                self.carrying = None
+            self.queue_window(f"system:detached trolley {carry['def']} at "
+                              f"({cx:+.2f}, {cy:+.2f})")
+            return {"accepted": True, "released": carry["def"],
+                    "at": [round(cx, 3), round(cy, 3), 0.0],
+                    "yaw": round(psi, 3),
+                    "aboard": aboard, "measured": True}
         c, s = math.cos(psi), math.sin(psi)
         settled = []
         for rider in carry.get("riders", []):
@@ -3888,7 +3999,8 @@ class MobileBridge:
     # ── stop_robot ────────────────────────────────────────────────
 
     def _stop_measure_rest(self, t_halt: float,
-                           halt_pose: Tuple[float, float, float]) -> dict:
+                           halt_pose: Tuple[float, float, float],
+                           t_halt_sim: Optional[float] = None) -> dict:
         """Did the robot ACTUALLY come to rest? Answered from POSE SAMPLES.
 
         Never from v_linear/v_angular and never from the commanded velocity:
@@ -3896,7 +4008,11 @@ class MobileBridge:
         command, and the idle loop is free to put a fresh motion in the slot
         on the very next tick. Stationary here means THE POSE STOPPED
         CHANGING over a real interval, which is the only claim the tool is
-        entitled to make."""
+        entitled to make.
+
+        `t_halt` is the WALL instant of the halt (the no-clock fallback
+        wait); `t_halt_sim` is the SIM instant, and every window, span and
+        speed below is taken on it."""
         blank = {
             "speed_mps": None, "yaw_rate_radps": None,
             "over_s": None, "samples": 0,
@@ -3937,8 +4053,19 @@ class MobileBridge:
                                    "be differenced")
                 return blank
             time.sleep(self.WAIT_POLL_S)
+        # ⚠️ THE WINDOW, THE TAIL AND THE SPAN ARE SIM TIME (index 4), the
+        # same clock the settling budget above counts. Until 2026-10-18 they
+        # were the WALL stamp (index 0): the window was waited out in sim
+        # steps but differenced in wall seconds, so on a sim faster than
+        # realtime (headless --mode=fast) 0.30 s of sim passed in well under
+        # the 0.15 s wall tail, consecutive ticks shared a coarse
+        # time.time() stamp, and EVERY stop answered "spanned no measurable
+        # interval". Below realtime the same mix divided sim-time motion by
+        # wall seconds and under-reported a creeping base.
+        if t_halt_sim is None:
+            t_halt_sim = float(getattr(self, "sim_time", 0.0))
         with self.lock:
-            after = [s for s in self._pose_hist if s[0] >= t_halt]
+            after = [s for s in self._pose_hist if s[4] >= t_halt_sim]
         if len(after) < 2:
             blank["samples"] = len(after)
             blank["reason"] = ("fewer than two pose samples arrived in the "
@@ -3948,10 +4075,10 @@ class MobileBridge:
         # Residual speed over the TAIL of the window: a base that was still
         # decelerating when zero was commanded should not have its ramp
         # averaged into the answer.
-        cut = t_halt + self.STOP_SETTLE_S * self.STOP_TAIL_FRAC
-        tail = [s for s in after if s[0] >= cut]
-        if len(tail) < 2 or (tail[-1][0] - tail[0][0]) < self.STOP_MIN_SPAN_S:
-            tail = after[-2:] if (after[-1][0] - after[-2][0]) >= 1e-6 else []
+        cut = t_halt_sim + self.STOP_SETTLE_S * self.STOP_TAIL_FRAC
+        tail = [s for s in after if s[4] >= cut]
+        if len(tail) < 2 or (tail[-1][4] - tail[0][4]) < self.STOP_MIN_SPAN_S:
+            tail = after[-2:] if (after[-1][4] - after[-2][4]) >= 1e-6 else []
         out = dict(blank)
         out["samples"] = len(after)
         hx, hy, hyaw = halt_pose
@@ -3964,7 +4091,7 @@ class MobileBridge:
             out["reason"] = ("pose samples arrived but spanned no measurable "
                              "interval, so no speed could be differenced")
             return out
-        span = tail[-1][0] - tail[0][0]
+        span = tail[-1][4] - tail[0][4]
         if span < self.STOP_MIN_SPAN_S:
             out["reason"] = (f"pose samples spanned only {span:.3f}s, below "
                              f"the {self.STOP_MIN_SPAN_S:.2f}s needed to "
@@ -3988,7 +4115,7 @@ class MobileBridge:
         A stop is also never a trailing artefact of a resume, so it clears
         the post-resume exemption instead of being swallowed by it."""
         loop = self.idle_loop
-        now = time.time()
+        now = runtime_clock.now()
         self._resume_exempt_until = 0.0
         self.prev_external_cmd = self.last_external_cmd
         self.last_external_cmd = now
@@ -4074,6 +4201,9 @@ class MobileBridge:
             self.motion = ("idle", {})
         self._command_velocity(0.0, 0.0)
         halted_at = time.time()
+        # The SIM instant of the halt: the rest measurement's window is taken
+        # on this clock, never on `halted_at` (see _stop_measure_rest).
+        halted_at_sim = float(self.sim_time)
         hold = self._stop_arm_hold() if operator else None
         out: Dict[str, Any] = {
             "accepted": True,
@@ -4097,7 +4227,7 @@ class MobileBridge:
                                                "and it does not hold the "
                                                "autonomy loop"}})
             return out
-        m = self._stop_measure_rest(halted_at, halt_pose)
+        m = self._stop_measure_rest(halted_at, halt_pose, halted_at_sim)
         speed = m.get("speed_mps")
         stationary = (None if speed is None else
                       (speed <= self.STOP_STILL_MPS
@@ -4682,6 +4812,9 @@ class MobileBridge:
                     "bounds": {"half_x_m": self.SITE_HALF_X,
                                "half_y_m": self.SITE_HALF_Y}}
         if not self._compound:
+            joined = self._join_order_underway(tx, ty)
+            if joined is not None:
+                return joined
             conflict = self._order_conflict()
             if conflict:
                 return conflict
@@ -4693,6 +4826,38 @@ class MobileBridge:
             return self._drive_to_straight(tx, ty)
         finally:
             self._compound -= 1
+
+    JOIN_RADIUS_M = 0.15
+    JOIN_WAIT_S = 300.0
+
+    def _join_order_underway(self, gx: float, gy: float) -> Optional[dict]:
+        """The same destination, asked for again while the robot is already
+        driving there: JOIN that drive instead of replacing it.
+
+        Measured in the crew demo (take 10, 2026-10-20): Tug was towing the
+        cart to shipping when a crewmate repeated the request. The second
+        turn's drive_to superseded the first, the cart stopped 2.6 m short,
+        and the order was never packed. A person repeating "go to the dock"
+        to a robot already on its way means the same thing. This call waits
+        for the drive under way and returns where the robot actually ended
+        up. A DIFFERENT destination still goes through the ordinary path."""
+        last = getattr(self, "_last_order", None)
+        if not self._compound or not last or not last.get("goal_xy"):
+            return None
+        lx, ly = last["goal_xy"]
+        if math.hypot(gx - lx, gy - ly) > self.JOIN_RADIUS_M:
+            return None
+        t0 = time.monotonic()
+        while self._compound and time.monotonic() - t0 < self.JOIN_WAIT_S:
+            time.sleep(0.05)
+        x, y, _ = self._read_pose()
+        err = math.hypot(gx - x, gy - y)
+        tol = max(self.DRIVE_TOL_MIN_M, 0.1)
+        return {"accepted": True, "joined_order_underway": True,
+                "achieved_xy": [x, y], "error_m": err, "arrived": err <= tol,
+                "say": ("I was already on my way there, so I carried on with that drive "
+                        "rather than starting again."),
+                "note": "duplicate of the drive already under way: joined, not restarted"}
 
     def _note_order(self, kind: str, gx: float, gy: float, means: str) -> None:
         store = self.intents
@@ -5023,6 +5188,10 @@ class MobileBridge:
             return {"accepted": False, "refused": "unknown_place",
                     "error": f"refused: I don't know a place called {place!r}",
                     "say": f"I don't know where {place} is. Places I know: {known}."}
+        joined = self._join_order_underway(xy[0], xy[1])
+        if joined is not None:
+            joined["place"] = place
+            return joined
         conflict = self._order_conflict()
         if conflict:
             return conflict
@@ -5089,9 +5258,9 @@ class MobileBridge:
             return ""
         if self.intents is not None and self.intents.hold_active():
             return "operator hold"
-        if time.time() < self.stop_hold_until:
+        if runtime_clock.now() < self.stop_hold_until:
             return "operator stop"
-        if (time.time() - self.last_external_cmd) < loop.resume_s:
+        if (runtime_clock.now() - self.last_external_cmd) < loop.resume_s:
             return "recent command"
         return ""
 
@@ -8755,6 +8924,12 @@ from omnisim_bridges.access import connection_error, chat_config, reject_window_
 # near-identical handlers, each with its own fail-closed wrapper, is
 # how a gated bridge_base came to cover none of the bridges.
 from omnisim_bridges.bridge_base import serve_tool
+from omnisim_bridges import runtime_clock
+
+# POSTs that only read. Everything else is operator input, and while it is
+# being handled the benchmark's fast mode runs the world at real time.
+READ_ONLY_POSTS = ("/state", "/get_robot_state", "/list_robots",
+                   "/capabilities", "/read_sensor", "/list_sensors")
 
 
 def make_handler(bridge: MobileBridge, relay: Any = None):
@@ -8864,6 +9039,13 @@ def make_handler(bridge: MobileBridge, relay: Any = None):
                 self._error_response(e)
 
         def do_POST(self):
+            path = self.path.split("?", 1)[0].rstrip("/") or "/"
+            if path in READ_ONLY_POSTS or not runtime_clock.enabled():
+                return self._do_post()
+            with runtime_clock.busy():
+                return self._do_post()
+
+        def _do_post(self):
             try:
                 self._guard()
                 path = self.path.split("?", 1)[0].rstrip("/") or "/"
@@ -8872,8 +9054,7 @@ def make_handler(bridge: MobileBridge, relay: Any = None):
                 # Idempotent reads never claim a request id: replaying one is
                 # meaningless, and the duplicate-id guard exists to stop a
                 # retried COMMAND from executing twice.
-                if path not in ("/state", "/get_robot_state", "/list_robots",
-                                "/capabilities", "/read_sensor", "/list_sensors"):
+                if path not in READ_ONLY_POSTS:
                     request_ids.claim(path, request_id)
                 # /stop_robot is the escape hatch and must never queue behind a
                 # running motion. Sensor reads are exempt for a different
@@ -9180,8 +9361,14 @@ def make_handler(bridge: MobileBridge, relay: Any = None):
                         # a confident, exactly-parsed order that the gate
                         # (inside route.execute) has already vetted on the
                         # "mobile" rail; the model is not called for it.
+                        # A CREWMATE's message (omnisim_bridges.crew) always
+                        # reaches the model: the parser would carry out "bring
+                        # the cart to my pick cell" and answer the sender, but
+                        # that answer never reaches it, and only the model can
+                        # message back. The gate still vets what the model does.
                         _early = (shared_short_circuit(bridge, text, "mobile")
-                                  if shared_short_circuit is not None else None)
+                                  if shared_short_circuit is not None
+                                  and not body.get("crew") else None)
                         if _early is not None:
                             out = shared_reply_payload(
                                 _early.get("agent", ""),
@@ -10166,6 +10353,13 @@ def setup_omnilink_relay(bridge: MobileBridge, http_port: int = 8765) -> Optiona
     try:
         agent_name = profile_sync.agent_name_for(bridge.robot_id)
         tools = build_mobile_tools(bridge)
+        # A crew channel when the world declares one (OMNILINK_CREW): the
+        # robot can talk to its crewmates through their own /prompt doors.
+        try:
+            from omnisim_bridges.crew import crew_tools
+            tools = list(tools) + crew_tools(bridge, http_port)
+        except Exception as e:
+            print(f"[crew] not registered: {e}", flush=True)
         main_task = build_mobile_main_task(bridge)
         relay = OmniLinkRelay(
             omni_key=get_omni_key(),
@@ -10451,6 +10645,7 @@ def main() -> int:
     # this tug actually watches another one, and the idle loop that holds
     # peer_port is not constructed until further down.
     bridge.idle_peer_port = int(args.idle_peer_port or 0)
+    bridge.tow_mode = args.tow
     bridge.idle_arm_port = int(args.idle_arm_port or 0)
     relay = setup_omnilink_relay(bridge, http_port=args.port)
     if relay is not None and hasattr(relay, "cancel_inflight"):

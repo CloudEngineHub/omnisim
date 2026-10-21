@@ -53,4 +53,4 @@ card may point at an existing `.wbt` (the generated worlds do) but a new world i
 
 ## Why it lives here, not under `agents/`
 
-The launcher is an OmniSim **supervisor controller**, not an OmniLink agent — it speaks OmniSim's `wwiSendText` / `wwiReceiveText` to a side-panel Robot Window, not OmniLink HTTP. The closest parallel in the repo is [`omnilink_chat`](../../plugins/robot_windows/omnilink_chat/) (the chat console used by every chat demo); the launcher follows the same pattern.
+The launcher is an OmniSim **supervisor controller**, not an OmniLink agent — it speaks OmniSim's `wwiSendText` / `wwiReceiveText` to a side-panel Robot Window, not OmniLink HTTP. The closest parallel in the repo is [`omnilink_chat`](../../../../../resources/projects/plugins/robot_windows/omnilink_chat/) (the chat console used by every chat demo); the launcher follows the same pattern.

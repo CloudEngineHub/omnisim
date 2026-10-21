@@ -198,6 +198,14 @@ resources/projects/plugins/robot_windows/generic_window/
 resources/projects/plugins/robot_windows/generic_window/generic_window [dll]
 resources/projects/plugins/robot_windows/generic_window/Makefile
 resources/projects/plugins/robot_windows/generic_window/*pp
+resources/projects/plugins/robot_windows/omnilink_chat/
+resources/projects/plugins/robot_windows/omnilink_chat/*.html
+resources/projects/plugins/robot_windows/omnilink_chat/*.js
+resources/projects/plugins/robot_windows/omnilink_chat/*.css
+resources/projects/plugins/robot_windows/omnilink_launcher/
+resources/projects/plugins/robot_windows/omnilink_launcher/*.html
+resources/projects/plugins/robot_windows/omnilink_launcher/*.js
+resources/projects/plugins/robot_windows/omnilink_launcher/*.css
 resources/projects/worlds/
 resources/projects/worlds/empty.omniworld
 resources/templates/

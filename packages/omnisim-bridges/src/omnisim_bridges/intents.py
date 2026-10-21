@@ -81,6 +81,8 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from omnisim_bridges import runtime_clock
+
 __all__ = [
     "IntentStore",
     "DEFAULT_TTL_S",
@@ -128,7 +130,8 @@ _ALIASES = {
 
 
 def _now() -> float:
-    return time.time()
+    # The benchmark's sim clock when it is on, the wall clock otherwise.
+    return runtime_clock.now()
 
 
 def _env_flag(name: str, default: bool) -> bool:

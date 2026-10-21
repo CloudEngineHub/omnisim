@@ -427,6 +427,262 @@
       ]
     },
     {
+      "utterance": "drive forward 2 metres and tell me when you're there",
+      "tool": "drive_forward",
+      "args": {
+        "distance": 2
+      },
+      "surface": null,
+      "registered": false,
+      "rules": []
+    },
+    {
+      "utterance": "drive forward 2 metres, stop, and send me your x, y once you've stopped",
+      "tool": "drive_forward",
+      "args": {
+        "distance": 2
+      },
+      "surface": null,
+      "registered": false,
+      "rules": []
+    },
+    {
+      "utterance": "drive forward 2 metres. I'll load it after that.",
+      "tool": "drive_forward",
+      "args": {
+        "distance": 2
+      },
+      "surface": null,
+      "registered": false,
+      "rules": []
+    },
+    {
+      "utterance": "drive forward 2 metres; message me once you arrive",
+      "tool": "drive_forward",
+      "args": {
+        "distance": 2
+      },
+      "surface": null,
+      "registered": false,
+      "rules": []
+    },
+    {
+      "utterance": "once it's unhitched please tell me where it is. drive forward 2 metres now.",
+      "tool": "drive_forward",
+      "args": {
+        "distance": 2
+      },
+      "surface": null,
+      "registered": false,
+      "rules": []
+    },
+    {
+      "utterance": "when the cart is loaded, drive forward 2 metres and tell me",
+      "tool": "drive_forward",
+      "args": {
+        "distance": 2
+      },
+      "surface": null,
+      "registered": false,
+      "rules": [
+        "interrogative",
+        "deferred"
+      ]
+    },
+    {
+      "utterance": "tell me the score, and when the cart is loaded drive forward 2 metres",
+      "tool": "drive_forward",
+      "args": {
+        "distance": 2
+      },
+      "surface": null,
+      "registered": false,
+      "rules": [
+        "deferred"
+      ]
+    },
+    {
+      "utterance": "drive forward 2 metres in 5 minutes and let me know",
+      "tool": "drive_forward",
+      "args": {
+        "distance": 2
+      },
+      "surface": null,
+      "registered": false,
+      "rules": [
+        "deferred"
+      ]
+    },
+    {
+      "utterance": "I'll need you to drive forward 2 metres once the shift ends",
+      "tool": "drive_forward",
+      "args": {
+        "distance": 2
+      },
+      "surface": null,
+      "registered": false,
+      "rules": [
+        "deferred"
+      ]
+    },
+    {
+      "utterance": "we'll drive forward 2 metres after lunch",
+      "tool": "drive_forward",
+      "args": {
+        "distance": 2
+      },
+      "surface": null,
+      "registered": false,
+      "rules": [
+        "deferred"
+      ]
+    },
+    {
+      "utterance": "drive forward 2 metres and message Packer once you've stopped",
+      "tool": "drive_forward",
+      "args": {
+        "distance": 2
+      },
+      "surface": null,
+      "registered": false,
+      "rules": []
+    },
+    {
+      "utterance": "drive forward 2 metres and let Sam know when you're there",
+      "tool": "drive_forward",
+      "args": {
+        "distance": 2
+      },
+      "surface": null,
+      "registered": false,
+      "rules": []
+    },
+    {
+      "utterance": "send it forward 2 metres once the cart is loaded",
+      "tool": "drive_forward",
+      "args": {
+        "distance": 2
+      },
+      "surface": null,
+      "registered": false,
+      "rules": [
+        "deferred"
+      ]
+    },
+    {
+      "utterance": "call the lift when you get there and drive forward 2 metres",
+      "tool": "drive_forward",
+      "args": {
+        "distance": 2
+      },
+      "surface": null,
+      "registered": false,
+      "rules": [
+        "deferred"
+      ]
+    },
+    {
+      "utterance": "the parts were measured after release. please drive forward 2 metres now.",
+      "tool": "drive_forward",
+      "args": {
+        "distance": 2
+      },
+      "surface": null,
+      "registered": false,
+      "rules": []
+    },
+    {
+      "utterance": "drive forward 2 metres. do it after lunch.",
+      "tool": "drive_forward",
+      "args": {
+        "distance": 2
+      },
+      "surface": null,
+      "registered": false,
+      "rules": [
+        "deferred"
+      ]
+    },
+    {
+      "utterance": "after lunch, drive forward 2 metres",
+      "tool": "drive_forward",
+      "args": {
+        "distance": 2
+      },
+      "surface": null,
+      "registered": false,
+      "rules": [
+        "deferred"
+      ]
+    },
+    {
+      "utterance": "once the shift ends, sort it out. 2 metres forward.",
+      "tool": "drive_forward",
+      "args": {
+        "distance": 2
+      },
+      "surface": null,
+      "registered": false,
+      "rules": [
+        "deferred"
+      ]
+    },
+    {
+      "utterance": "drive forward 2 metres. I'll load it once you confirm you've driven.",
+      "tool": "drive_forward",
+      "args": {
+        "distance": 2
+      },
+      "surface": null,
+      "registered": false,
+      "rules": []
+    },
+    {
+      "utterance": "drive forward 2 metres once the shift ends",
+      "tool": "drive_forward",
+      "args": {
+        "distance": 2
+      },
+      "surface": null,
+      "registered": false,
+      "rules": [
+        "deferred"
+      ]
+    },
+    {
+      "utterance": "once you have driven, wait. then drive forward 2 metres.",
+      "tool": "drive_forward",
+      "args": {
+        "distance": 2
+      },
+      "surface": null,
+      "registered": false,
+      "rules": []
+    },
+    {
+      "utterance": "the cart is loaded. after release I measured it at x 2. please hitch it and take it forward 2 metres now.",
+      "tool": "turn",
+      "args": {
+        "angle_rad": 1.5708
+      },
+      "surface": null,
+      "registered": false,
+      "rules": []
+    },
+    {
+      "utterance": "the cart is loaded. once the shift ends, sort it out.",
+      "tool": "turn",
+      "args": {
+        "angle_rad": 1.5708
+      },
+      "surface": null,
+      "registered": false,
+      "rules": [
+        "deferred",
+        "invented_magnitude"
+      ]
+    },
+    {
       "utterance": "reverse 2 metres - sorry, ignore that",
       "tool": "drive_forward",
       "args": {

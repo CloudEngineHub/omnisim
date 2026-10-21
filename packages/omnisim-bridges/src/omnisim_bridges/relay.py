@@ -60,6 +60,8 @@ from dataclasses import dataclass, field
 from queue import Empty, Full, Queue
 from typing import Any, Callable, Dict, List, Optional
 
+from omnisim_bridges import model_replay, runtime_clock
+
 
 @dataclass
 class DispatchHandle:
@@ -394,6 +396,34 @@ RETRY_BACKOFF_S = float(os.environ.get("OMNILINK_RETRY_BACKOFF", "1.5"))
 # backoff spent both retries inside the window and turned one burst of
 # upstream 429s into a failed turn (measured 2026-09-25, gemini-3.5-flash).
 RETRY_HINT_CAP_S = float(os.environ.get("OMNILINK_RETRY_HINT_CAP", "15"))
+
+
+def normalize_usage(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Token counts from a provider's raw response, in one shape.
+
+    Gemini reports `usageMetadata`; Anthropic and OpenAI report `usage` in
+    different shapes. Anthropic's `input_tokens` EXCLUDES cache reads and
+    cache writes, so the prompt is their sum; writes are kept apart because
+    they are billed above the input rate. All counts are None when the
+    response carried no usage, which the cost estimate treats as unknown.
+    """
+    um = raw.get("usageMetadata")
+    if isinstance(um, dict) and um:
+        return {"prompt_tokens": um.get("promptTokenCount"), "cached_tokens": um.get("cachedContentTokenCount"),
+                "cache_write_tokens": 0, "output_tokens": um.get("candidatesTokenCount"),
+                "thoughts_tokens": um.get("thoughtsTokenCount")}
+    u = raw.get("usage")
+    if isinstance(u, dict) and "input_tokens" in u:
+        read = int(u.get("cache_read_input_tokens") or 0)
+        write = int(u.get("cache_creation_input_tokens") or 0)
+        return {"prompt_tokens": int(u.get("input_tokens") or 0) + read + write, "cached_tokens": read,
+                "cache_write_tokens": write, "output_tokens": u.get("output_tokens"), "thoughts_tokens": 0}
+    if isinstance(u, dict) and "prompt_tokens" in u:
+        return {"prompt_tokens": u.get("prompt_tokens"),
+                "cached_tokens": (u.get("prompt_tokens_details") or {}).get("cached_tokens"),
+                "cache_write_tokens": 0, "output_tokens": u.get("completion_tokens"), "thoughts_tokens": 0}
+    return {"prompt_tokens": None, "cached_tokens": None, "cache_write_tokens": None,
+            "output_tokens": None, "thoughts_tokens": None}
 
 
 def retry_wait_s(attempt: int, retry_after_s: Optional[float]) -> float:
@@ -2510,7 +2540,8 @@ class OmniLinkRelay:
                 return
             text, on_event, handle = item
             try:
-                self._dispatch_one(text, on_event, handle)
+                with runtime_clock.busy():
+                    self._dispatch_one(text, on_event, handle)
             except Exception as e:
                 traceback.print_exc()
                 try:
@@ -2541,7 +2572,10 @@ class OmniLinkRelay:
             text, on_event, handle = item
             self._active = handle
             try:
-                self._dispatch_one(text, on_event, handle)
+                # Under the benchmark's sim clock a turn runs the world at
+                # real time (runtime_clock); otherwise this is a no-op.
+                with runtime_clock.busy():
+                    self._dispatch_one(text, on_event, handle)
             except Exception as e:
                 err = f"{type(e).__name__}: {e}"
                 traceback.print_exc()
@@ -2608,7 +2642,7 @@ class OmniLinkRelay:
                 return
             data = self._post_chat(messages)
             if TRACE_PATH:
-                rt = dict(getattr(self, "_last_round_trace", None) or {})
+                rt = dict(self._get_round_trace() or {})
                 rt["round"] = turn
                 rounds.append(rt)
             if handle.is_cancelled():
@@ -3124,8 +3158,22 @@ class OmniLinkRelay:
         data = self._post_chat_once(messages)
         if TRACE_PATH:
             _trace({"kind": "round", "round_id": rid,
-                    **(getattr(self, "_last_round_trace", None) or {})})
+                    **(self._get_round_trace() or {})})
         return data
+
+    # The main worker and the aside workers run rounds at the same time. One
+    # shared slot for "this round's trace" let a round log a CONCURRENT
+    # round's fresh record (attempts 0, no usage): measured 2026-10-20, 3 of
+    # 6 rounds in an opening-barrage probe read as unknown usage and were
+    # charged at the most expensive request. Each thread keeps its own.
+    def _set_round_trace(self, rt: Dict[str, Any]) -> None:
+        tls = self.__dict__.setdefault("_round_trace_tls", threading.local())
+        tls.rt = rt
+        self._last_round_trace = rt
+
+    def _get_round_trace(self) -> Optional[Dict[str, Any]]:
+        tls = self.__dict__.get("_round_trace_tls")
+        return getattr(tls, "rt", None) if tls is not None else None
 
     def _post_chat_once(self, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Single chat round-trip through the OmniLink Python client.
@@ -3150,12 +3198,18 @@ class OmniLinkRelay:
             except Exception:
                 memory = ""
         boundary = self._session_boundary_note(messages)
+        # Memory and the session note change every turn, so they travel as
+        # liveContext, which the platform places AFTER the prompt-cache
+        # breakpoint. Inside mainTask they re-wrote the whole cached prompt
+        # on every request (measured on claude-opus-5-5, 2026-10-20: ~18.6K
+        # tokens written, 0 read, per request).
+        live_context = "\n\n".join(part for part in (memory, boundary) if part)
         system_instruction = {
-            "mainTask": (self.main_task + (("\n\n" + memory) if memory else "")
-                         + (("\n\n" + boundary) if boundary else "")),
+            "mainTask": self.main_task,
             "availableTools": self._tool_names,
             "availableToolDetails": self._tool_defs,
             "allowToolUse": True,
+            **({"liveContext": live_context} if live_context else {}),
         }
         rt: Dict[str, Any] = {}
         if TRACE_PATH:
@@ -3171,7 +3225,21 @@ class OmniLinkRelay:
                 rt["req_bytes"] = rt["msgs_bytes"] + rt["tooldefs_bytes"] + rt["task_bytes"]
             except Exception:
                 rt = {}
-            self._last_round_trace = rt
+            self._set_round_trace(rt)
+        replay_key = (model_replay.key(messages, system_instruction, self.engine, self.model)
+                      if model_replay.active() else None)
+        if replay_key is not None:
+            recorded = model_replay.lookup(replay_key)
+            if recorded is not None:
+                # Served from a recording: no model ran, so zero tokens --
+                # known, not unknown, so the cost estimate charges nothing.
+                if TRACE_PATH:
+                    rt.update(replayed=True, attempts=0, prompt_tokens=0, cached_tokens=0,
+                              cache_write_tokens=0, output_tokens=0, thoughts_tokens=0,
+                              n_tool_calls=len(recorded.get("toolCalls") or []))
+                return recorded
+            if TRACE_PATH:
+                rt["replayed"] = False
         for attempt in range(1 + max(0, CHAT_RETRIES)):
             try:
                 _t0 = time.perf_counter()
@@ -3202,11 +3270,7 @@ class OmniLinkRelay:
                     rt["attempts"] = attempt + 1
                     try:
                         rt["server_ms"] = ((data.get("debug") or {}).get("timing") or {}).get("totalMs")
-                        um = ((data.get("raw") or {}).get("usageMetadata") or {})
-                        rt["prompt_tokens"] = um.get("promptTokenCount")
-                        rt["cached_tokens"] = um.get("cachedContentTokenCount")
-                        rt["output_tokens"] = um.get("candidatesTokenCount")
-                        rt["thoughts_tokens"] = um.get("thoughtsTokenCount")
+                        rt.update(normalize_usage(data.get("raw") or {}))
                         # Which model answered: the platform may fall back
                         # to another engine after a failure.
                         _raw = data.get("raw") or {}
@@ -3217,6 +3281,8 @@ class OmniLinkRelay:
                         rt["memory_count"] = dbg_msgs.get("memoryCount")
                     except Exception:
                         pass
+                if replay_key is not None:
+                    model_replay.record(replay_key, data)
                 return data
             except OmniLinkAPIError as e:
                 # 4xx (auth, BYOK, bad request) won't self-heal — surface it

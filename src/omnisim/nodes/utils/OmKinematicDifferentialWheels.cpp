@@ -18,8 +18,39 @@
 
 #include "OmCylinder.hpp"
 #include "OmHingeJoint.hpp"
+#include "OmLog.hpp"
 #include "OmMotor.hpp"
 #include "OmRobot.hpp"
+#include "OmSolid.hpp"
+
+#include <algorithm>
+#include <cctype>
+#include <cstdlib>
+#include <string>
+
+// Webots' kinematic mode moves a Robot WITHOUT Physics by its wheel speeds. A
+// Robot without Physics whose wheel Solids DO carry Physics is not that robot:
+// under docs/reference/physics.md it is a static base (its physics-bearing
+// children attach to the static environment), and it is exactly what
+// `URDFRobot { staticBase TRUE }` produces, since the importer strips only the
+// root link's Physics. Until 2026-10-20 the kinematic model still attached to
+// it: a staticBase NORI A3 whose wheels were spun at 4 rad/s slid 0.61 m in 2 s
+// (exactly omega * r, z frozen) while its log reported the base welded. Value-
+// parsed hatch, default OFF: OMNISIM_KINEMATIC_WHEELS_WITH_PHYSICS=1 restores it.
+static std::string trimmedLower(const char *raw) {
+  std::string v = raw ? raw : "";
+  v.erase(std::remove_if(v.begin(), v.end(), [](unsigned char c) { return std::isspace(c); }), v.end());
+  std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return std::tolower(c); });
+  return v;
+}
+
+static bool kinematicWheelsWithPhysicsEnabled() {
+  static const bool on = [] {
+    const std::string v = trimmedLower(std::getenv("OMNISIM_KINEMATIC_WHEELS_WITH_PHYSICS"));
+    return !v.empty() && !(v == "0" || v == "false" || v == "off" || v == "no");
+  }();
+  return on;
+}
 
 OmKinematicDifferentialWheels::OmKinematicDifferentialWheels(OmRobot *robot, double wheelsRadius, double axleLength,
                                                              OmHingeJoint *leftJoint, OmHingeJoint *rightJoint) :
@@ -138,6 +169,16 @@ OmKinematicDifferentialWheels *OmKinematicDifferentialWheels::createKinematicDif
         robot->rotationMatrix().transposed() * (robot->position() - leftWheelCylinder->upperPose()->position());
       OmVector3 globalRightAnchor =
         robot->rotationMatrix().transposed() * (robot->position() - rightWheelCylinder->upperPose()->position());
+      // a static base, not a kinematic robot (see kinematicWheelsWithPhysicsEnabled)
+      if (!kinematicWheelsWithPhysicsEnabled() &&
+          (leftJoint->solidEndPoint()->physics() != nullptr || rightJoint->solidEndPoint()->physics() != nullptr)) {
+        OmLog::info(QString("Robot '%1' has no Physics but its wheels '%2' and '%3' do, so it is a static base "
+                            "(staticBase TRUE, docs/reference/physics.md): the kinematic differential-wheels mode is "
+                            "not applied and the base stays where it was placed; "
+                            "OMNISIM_KINEMATIC_WHEELS_WITH_PHYSICS=1 reverts")
+                      .arg(robot->name(), leftJoint->solidEndPoint()->name(), rightJoint->solidEndPoint()->name()));
+        return NULL;
+      }
       if (globalLeftAnchor.y() < globalRightAnchor.y())  // make sure the joint are not inverted
         return new OmKinematicDifferentialWheels(robot, leftWheelRadius, leftWheelDistance + rightWheelDistance, leftJoint,
                                                  rightJoint);

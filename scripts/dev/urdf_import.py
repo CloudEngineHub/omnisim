@@ -938,6 +938,41 @@ def rotate_vector_by_rpy(vector: tuple[float, float, float], rpy: tuple[float, f
     return normalize_vector(rotated)
 
 
+# DEF on the Physics block of a link whose declared tensor the importer rejected.
+# Mirrors urdfInertiaFallbackKeepsCom in OmUrdfImporter.cpp: OmSolid's Newton
+# registration keys on it to keep the declared mass and centre of mass and take
+# ONLY the rotational inertia from the bounding object, about that centre of mass.
+INERTIA_FALLBACK_DEF = "URDF_INERTIA_FALLBACK"
+# OmUrdfImporter.cpp kMinInertia: a principal moment below this is not emitted.
+MIN_INERTIA = 1e-9
+
+
+def inertia_fallback_keeps_com() -> bool:
+    """OMNISIM_URDF_INERTIA_FALLBACK_KEEP_COM, value-parsed, default ON (as in the engine)."""
+    value = os.environ.get("OMNISIM_URDF_INERTIA_FALLBACK_KEEP_COM", "").strip().lower()
+    return value not in ("0", "false", "off", "no")
+
+
+def inertia_rejection_reason(inertial: Inertial) -> str | None:
+    """Why the importer will NOT emit this link's declared tensor, or None.
+
+    Mirrors emitLinkPhysics in OmUrdfImporter.cpp: on a link with mass, a declared
+    tensor that is not positive definite (an all-zero one included), a PD tensor with
+    a moment below MIN_INERTIA, or one whose principal moments violate a + b >= c
+    (MuJoCo refuses such a body) falls back to bounding-object inertia.
+    """
+    if inertial.mass <= 0.0 or not inertial.inertia_declared:
+        return None
+    if not inertial.has_inertia_matrix:
+        return "not_positive_definite"
+    ixx, ixy, ixz, iyy, iyz, izz = inertia_in_link_frame(inertial)
+    if min(ixx, iyy, izz) < MIN_INERTIA:
+        return "too_small"
+    if inertia_violates_triangle_inequality(ixx, ixy, ixz, iyy, iyz, izz)[0]:
+        return "triangle_inequality"
+    return None
+
+
 def inertia_in_link_frame(inertial: Inertial) -> tuple[float, float, float, float, float, float]:
     """The declared tensor re-expressed in the link's axes: I' = R I R^T, R from the
     <inertial><origin rpy>. Mirrors rotateUrdfInertia in OmUrdfImporter.cpp, which does
@@ -1187,15 +1222,22 @@ def emit_link_physics_and_bounding(link: Link, indent: str) -> str:
     if link.surface_friction is not None:
         out.append(f"{indent}newtonFriction {link.surface_friction}" + chr(10))
     if link.inertial is not None:
-        out.append(f"{indent}physics Physics {{\n")
+        rejected = inertia_rejection_reason(link.inertial)
+        # Same marked block the engine importer writes for a rejected tensor: the
+        # declared mass and centre of mass are kept, and the engine takes only the
+        # rotational inertia from the bounding object, about that centre of mass.
+        mark_fallback = rejected is not None and inertia_fallback_keeps_com()
+        physics_def = f"DEF {INERTIA_FALLBACK_DEF} " if mark_fallback else ""
+        out.append(f"{indent}physics {physics_def}Physics {{\n")
         out.append(f"{indent}  density -1\n")
         out.append(f"{indent}  mass {link.inertial.mass}\n")
         # OmniSim requires centerOfMass when inertiaMatrix is set. Emit it
         # unconditionally when we have a URDF tensor, even when the URDF
-        # origin is (0 0 0).
-        has_urdf_inertia = link.inertial.has_inertia_matrix and link.inertial.mass > 0.0
+        # origin is (0 0 0) -- and on the fallback, which keeps the declared COM.
+        has_urdf_inertia = (link.inertial.has_inertia_matrix and link.inertial.mass > 0.0
+                            and rejected is None)
         has_com_offset = link.inertial.origin.xyz != (0.0, 0.0, 0.0)
-        if has_urdf_inertia or has_com_offset:
+        if has_urdf_inertia or has_com_offset or mark_fallback:
             cx, cy, cz = link.inertial.origin.xyz
             out.append(f"{indent}  centerOfMass [{cx} {cy} {cz}]\n")
         if has_urdf_inertia:
@@ -1421,6 +1463,9 @@ def build_report(robot: UrdfRobot) -> dict:
             if inert.inertia_declared and not inert.has_inertia_matrix:
                 link_notes.append(
                     "URDF inertia tensor is not positive definite; falling back to bounding-object-derived inertia."
+                    + (" The importer keeps the declared mass and centre of mass and replaces only the "
+                       "rotational inertia, with the bounding object's tensor about that centre of mass."
+                       if inert.mass > 0.0 and inertia_fallback_keeps_com() else "")
                 )
             # A tensor can be positive definite and still describe no physical
             # body. Checked independently of the PD gate so a valid-looking
@@ -1440,6 +1485,11 @@ def build_report(robot: UrdfRobot) -> dict:
                         f"a+b = {a + b:.9g} < c = {c:.9g} (short by {100.0 * (1.0 - (a + b) / c):.3f}%). "
                         "No rigid body can have this tensor; a product of inertia copied from a "
                         "moment of inertia is the usual cause. "
+                        + ("The importer keeps the declared mass and centre of mass and replaces only "
+                           "the rotational inertia, with the bounding object's tensor about that centre "
+                           "of mass. " if inert.has_inertia_matrix and inert.mass > 0.0
+                           and inertia_fallback_keeps_com() else "")
+                        +
                         f"For this diagonal, any |off-diagonal| <= {p_max:.6g} is admissible."
                     )
             # A tensor that disagrees with the link's OWN collision primitive by

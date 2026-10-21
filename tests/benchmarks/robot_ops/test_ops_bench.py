@@ -249,7 +249,7 @@ def test_relay_usage_counts_rounds_as_they_happen(tmp_path):
     p.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
     u = relay_usage(p)
     assert u["rounds"] == 2 and u["unknown_usage_rounds"] == 1
-    assert u["totals"] == {"prompt": 100, "cached": 40, "output": 5, "thoughts": 7}
+    assert u["totals"] == {"prompt": 100, "cached": 40, "cache_write": 0, "output": 5, "thoughts": 7}
 
 
 def test_relay_usage_reads_old_turn_summaries(tmp_path):
@@ -416,3 +416,79 @@ def test_the_oracle_reports_the_measured_visit_count():
     txt = o._reply_text({"count_visits_so_far": {"at": ["{x0+3}", "{y0}"], "radius": 0.4}},
                         {"pose0": (0.0, 0.0, 0.0), "sampler": S})
     assert txt == "2 times."
+
+
+def test_cost_accounting_reads_anthropic_usage_including_cache_writes():
+    # Measured gap 2026-10-20: every Claude request read as unknown usage ($0),
+    # because only Gemini and OpenAI usage shapes were parsed.
+    from omnisim.ops_bench.accounting import episode_cost, request_cost
+    rates = {"input": 4.0, "cached": 0.2, "output": 20.0}
+    usage = {"input_tokens": 1_000_000, "cache_read_input_tokens": 1_000_000,
+             "cache_creation_input_tokens": 1_000_000, "output_tokens": 100_000}
+    # fresh 4.0 + read 0.2 + write 4.0 * 1.25 + output 2.0
+    assert request_cost(usage, rates) == pytest.approx(4.0 + 0.2 + 5.0 + 2.0)
+    relay = {"relay_usage": {"rounds": 1, "unknown_usage_rounds": 0,
+                             "totals": {"prompt": 3_000_000, "cached": 1_000_000, "cache_write": 1_000_000,
+                                        "output": 100_000, "thoughts": 0}}}
+    assert episode_cost(relay, rates, 0.0)[0] == pytest.approx(4.0 + 0.2 + 5.0 + 2.0)
+
+
+def test_relay_normalizes_every_provider_usage_shape():
+    from omnisim_bridges.relay import normalize_usage
+    assert normalize_usage({"usageMetadata": {"promptTokenCount": 10, "cachedContentTokenCount": 4,
+                                              "candidatesTokenCount": 3, "thoughtsTokenCount": 2}}) == {
+        "prompt_tokens": 10, "cached_tokens": 4, "cache_write_tokens": 0, "output_tokens": 3, "thoughts_tokens": 2}
+    assert normalize_usage({"usage": {"input_tokens": 5, "cache_read_input_tokens": 7,
+                                      "cache_creation_input_tokens": 2, "output_tokens": 9}}) == {
+        "prompt_tokens": 14, "cached_tokens": 7, "cache_write_tokens": 2, "output_tokens": 9, "thoughts_tokens": 0}
+    assert normalize_usage({"usage": {"prompt_tokens": 8, "completion_tokens": 3,
+                                      "prompt_tokens_details": {"cached_tokens": 2}}})["cached_tokens"] == 2
+    assert normalize_usage({})["prompt_tokens"] is None
+
+
+def test_failure_probes_cut_a_valid_short_scenario_for_every_check(tmp_path):
+    """Every non-judged check of every seen shift becomes a loadable probe that
+    keeps the check verbatim, keeps the steps it watches (and the step that
+    starts a distance-triggered one), and is much shorter than the shift."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent / "devloop"))
+    import failure_probes as FP
+    for name in ("shift_dev_v1", "shift_holdout_v1", "shift_holdout_v2"):
+        path = Path(__file__).parent / "suites" / f"{name}.json"
+        task = json.loads(path.read_text(encoding="utf-8"))["tasks"][0]
+        rows = [{"arm": "omnilink", "reasons": [f"{i}:{c['type']}:x" for i, c in enumerate(task["checks"])]}]
+        suite = FP.build_suite(path, rows)
+        out = tmp_path / f"{name}.json"
+        out.write_text(json.dumps(suite), encoding="utf-8")
+        load_suite(out)
+        assert suite["tasks"], name
+        shift_end = max(s["when"]["at_s"] for s in task["steps"] if "at_s" in s["when"])
+        for p in suite["tasks"]:
+            i = p["probe_of"]["check"]
+            assert p["checks"] == [task["checks"][i]]
+            kept = [s["id"] for s in p["steps"]]
+            assert kept == [s["id"] for s in task["steps"] if s["id"] in kept]   # order preserved
+            for ref in FP._referenced_steps(task["checks"][i], {s["id"] for s in task["steps"]}):
+                assert ref in kept
+            for j, s in enumerate(p["steps"]):
+                if "moved" in s["when"]:
+                    orig = [t["id"] for t in task["steps"]]
+                    assert orig[orig.index(s["id"]) - 1] in kept
+            ats = [s["when"]["at_s"] for s in p["steps"] if "at_s" in s["when"]]
+            assert ats == sorted(ats)
+        lengths = [max(s["when"]["at_s"] for s in p["steps"] if "at_s" in s["when"]) for p in suite["tasks"]]
+        assert sorted(lengths)[len(lengths) // 2] < shift_end / 2, (name, lengths, shift_end)
+
+
+def test_episode_waits_follow_the_episode_clock():
+    """Under --sim-clock the tail is simulated seconds: a clock running 50x
+    real time finishes a 5 s wait in ~0.1 s of wall time."""
+    import time as _t
+    from omnisim.ops_bench.runner import _wait_on
+    t0 = _t.monotonic()
+    fast = lambda: (_t.monotonic() - t0) * 50.0
+    _wait_on(fast, 5.0)
+    assert _t.monotonic() - t0 < 1.0
+    t1 = _t.monotonic()
+    _wait_on(lambda: 0.0, 100.0, wall_cap_s=0.2)   # a stalled clock cannot hang it
+    assert _t.monotonic() - t1 < 1.0

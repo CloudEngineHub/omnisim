@@ -269,25 +269,44 @@ class Session:
 
 
 class Sampler:
-    """Continuous pose trace at ~30 ms wall intervals, from the robot's /state."""
+    """Continuous pose trace at ~30 ms wall intervals, from the robot's /state.
 
-    def __init__(self, session, period=0.03):
-        self.session, self.period = session, period
+    With `sim_clock`, the episode's clock is SIMULATOR time: every trigger,
+    fired step and sample time is in simulated seconds since the first
+    sample, matching a runtime that runs on OMNILINK_CLOCK=sim. Polling is
+    faster (10 ms wall) because the world can run several times real time.
+    """
+
+    def __init__(self, session, period=0.03, sim_clock=False):
+        self.session, self.sim_clock = session, sim_clock
+        self.period = 0.01 if sim_clock else period
         self.t0 = time.monotonic()
+        self.sim0 = None
         self.samples, self.errors = [], []
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def now(self):
+        if self.sim_clock:
+            last = self.samples[-1] if self.samples else None
+            return 0.0 if last is None else last["t"]
         return time.monotonic() - self.t0
+
+    def _sample_t(self, st):
+        if not self.sim_clock:
+            return self.now()
+        sim = float(st.get("sim_time") or 0.0)
+        if self.sim0 is None:
+            self.sim0 = sim
+        return sim - self.sim0
 
     def _run(self):
         misses = 0
         while not self._stop.wait(self.period):
             try:
                 st = self.session.state()
-                self.samples.append({"t": self.now(), "sim": st.get("sim_time"),
+                self.samples.append({"t": self._sample_t(st), "sim": st.get("sim_time"),
                                      "x": st["x"], "y": st["y"], "yaw": st["yaw"],
                                      "mode": st.get("mode")})
                 misses = 0
